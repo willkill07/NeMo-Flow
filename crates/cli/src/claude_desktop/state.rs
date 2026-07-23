@@ -40,6 +40,7 @@ pub(super) struct DesktopState {
     pub(super) proxy_token: String,
     pub(super) upstream_proxy: Option<UpstreamProxy>,
     pub(super) gateway_fingerprint: String,
+    pub(super) max_hook_payload_bytes: usize,
     pub(super) configuration_fingerprint: String,
     pub(super) certificate: CertificateState,
     pub(super) settings: SettingsPatch,

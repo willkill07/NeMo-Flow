@@ -107,6 +107,30 @@ async fn transparent_mcp_requires_the_wrapper_gateway_url() {
     );
 }
 
+#[tokio::test]
+async fn desktop_mcp_fails_before_managed_gateway_acquisition_when_sidecar_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing_state = temp.path().join("missing-desktop-state.json");
+    let _environment = crate::test_support::EnvScope::set(&[
+        (
+            "NEMO_RELAY_CLAUDE_DESKTOP_STATE",
+            Some(missing_state.as_os_str()),
+        ),
+        (crate::configuration::TRANSPARENT_RUN_ENV, None),
+        (crate::configuration::GATEWAY_URL_ENV, None),
+        ("XDG_CONFIG_HOME", Some(temp.path().as_os_str())),
+    ]);
+    let server_args = crate::server::GatewayOverrides {
+        bind: Some("192.0.2.1:47632".parse().unwrap()),
+        ..Default::default()
+    };
+
+    let error = run(&server_args).await.unwrap_err().to_string();
+
+    assert!(error.contains("missing-desktop-state.json"), "{error}");
+    assert!(!error.contains("loopback bind"), "{error}");
+}
+
 #[test]
 fn bounded_mcp_reader_accepts_the_limit_and_preserves_following_frames() {
     let mut input = vec![b'a'; MAX_MCP_FRAME_BYTES - 1];

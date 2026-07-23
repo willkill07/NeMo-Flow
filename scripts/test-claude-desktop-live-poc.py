@@ -12,6 +12,7 @@ disposable release-gate account with Claude closed.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -194,6 +195,56 @@ def configure_observability(path: Path, output_root: Path) -> None:
     path.write_text(rendered, encoding="utf-8")
 
 
+def toml_snapshot_value(snapshot: FileSnapshot) -> dict[str, object]:
+    if snapshot.data is None:
+        return {}
+    try:
+        value = tomllib.loads(snapshot.data.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise PocFailure(f"invalid TOML in {snapshot.path}: {error}") from error
+    return value
+
+
+def without_poc_observability(config: dict[str, object], output_root: Path) -> dict[str, object]:
+    expected = tomllib.loads(observability_component(output_root))["components"][0]
+    stripped = copy.deepcopy(config)
+    components = stripped.get("components")
+    if components is None:
+        return stripped
+    if not isinstance(components, list):
+        raise PocFailure("Relay plugin configuration has a non-array components value")
+    matches = [index for index, component in enumerate(components) if component == expected]
+    if len(matches) > 1:
+        raise PocFailure("Relay plugin configuration contains duplicate live POC observability components")
+    if matches:
+        components.pop(matches[0])
+    if not components:
+        stripped.pop("components")
+    return stripped
+
+
+def dynamic_registry_without_poc(snapshot: FileSnapshot) -> dict[str, object]:
+    if snapshot.data is None:
+        return {"schema_version": 1, "records": []}
+    try:
+        value = json.loads(snapshot.data)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise PocFailure(f"invalid JSON in {snapshot.path}: {error}") from error
+    if not isinstance(value, dict) or not isinstance(value.get("records"), list):
+        raise PocFailure(f"{snapshot.path} is not a supported Relay dynamic plugin registry")
+    stripped = copy.deepcopy(value)
+    stripped["records"] = [
+        record
+        for record in stripped["records"]
+        if not (
+            isinstance(record, dict)
+            and isinstance(record.get("metadata"), dict)
+            and record["metadata"].get("id") == PLUGIN_ID
+        )
+    ]
+    return stripped
+
+
 def settings_snapshot() -> tuple[FileSnapshot, FileSnapshot]:
     settings = Path.home() / ".claude" / "settings.json"
     return (
@@ -368,8 +419,11 @@ def assert_oauth_rewrite(claude: str, workspace: Path, environment: Mapping[str,
     )
     output = result.stdout or ""
     if REWRITTEN_MARKER not in output or ORIGINAL_MARKER in output:
+        diagnostics = (result.stderr or "").strip()
+        suffix = f"; stderr: {diagnostics!r}" if diagnostics else ""
         raise PocFailure(
-            f"the real Claude response did not expose the Relay request rewrite; received {output.strip()!r}"
+            "the real Claude response did not expose the Relay request rewrite; "
+            f"exit code {result.returncode}, stdout {output.strip()!r}{suffix}"
         )
 
 
@@ -403,8 +457,10 @@ def assert_pre_tool_guardrail(relay: Path, sentinel: Path, environment: Mapping[
         input_text=hook_payload(sentinel),
         timeout=15,
     )
-    if result.returncode == 0:
-        raise PocFailure("the sentinel PreToolUse hook was not rejected")
+    if result.returncode != 2:
+        raise PocFailure(
+            f"the sentinel PreToolUse hook returned {result.returncode}, not Claude's blocking exit code 2"
+        )
     if sentinel.exists():
         raise PocFailure("the sentinel tool unexpectedly executed")
 
@@ -553,8 +609,10 @@ def assert_fail_closed_without_sidecar(
         input_text=hook_payload(sentinel),
         timeout=15,
     )
-    if hook.returncode == 0:
-        raise PocFailure("PreToolUse did not fail closed while the sidecar was stopped")
+    if hook.returncode != 2:
+        raise PocFailure(
+            f"PreToolUse returned {hook.returncode}, not Claude's blocking exit code 2, while the sidecar was stopped"
+        )
 
     result = run(
         [
@@ -562,7 +620,7 @@ def assert_fail_closed_without_sidecar(
             "-p",
             "Reply exactly DIRECT_FALLBACK_SUCCEEDED if you receive this request.",
             "--output-format",
-            "text",
+            "json",
             "--no-session-persistence",
             "--tools",
             "",
@@ -571,26 +629,78 @@ def assert_fail_closed_without_sidecar(
         capture=True,
         cwd=workspace,
         environment=environment,
+        input_text="",
         timeout=60,
     )
-    if result.returncode == 0 or "DIRECT_FALLBACK_SUCCEEDED" in (result.stdout or ""):
+    output = result.stdout or ""
+    if "DIRECT_FALLBACK_SUCCEEDED" in output:
         raise PocFailure("Claude completed inference after the protected sidecar was stopped")
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        if result.returncode == 0:
+            raise PocFailure(
+                "Claude returned success without a structured result after the protected sidecar was stopped"
+            )
+    else:
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        used_tokens = isinstance(usage, dict) and any(
+            isinstance(usage.get(name), int) and usage[name] > 0
+            for name in (
+                "input_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+                "output_tokens",
+            )
+        )
+        completed_inference = isinstance(payload, dict) and (
+            bool(payload.get("result"))
+            or bool(payload.get("modelUsage"))
+            or (isinstance(payload.get("num_turns"), int) and payload["num_turns"] > 0)
+            or (isinstance(payload.get("duration_api_ms"), int) and payload["duration_api_ms"] > 0)
+            or used_tokens
+        )
+        if completed_inference:
+            raise PocFailure("Claude completed inference after the protected sidecar was stopped")
+
+    with socket.socket() as connection:
+        connection.settimeout(0.5)
+        if connection.connect_ex(("127.0.0.1", 47632)) == 0:
+            raise PocFailure("Claude started a standalone Relay gateway after the protected sidecar was stopped")
 
 
 def restore_plugin_configuration(
     baseline: tuple[FileSnapshot, FileSnapshot],
     expected: tuple[FileSnapshot, FileSnapshot] | None,
     relay: Path,
+    observability_root: Path,
 ) -> None:
     if expected is not None and all(snapshot.unchanged() for snapshot in expected):
         for snapshot in baseline:
             snapshot.restore()
         return
     run([relay, "plugins", "remove", PLUGIN_ID], check=False)
-    raise PocFailure(
-        "Relay plugin configuration changed concurrently; removed the POC plugin through the CLI "
-        "instead of overwriting those edits"
-    )
+    errors: list[str] = []
+    current_toml = FileSnapshot.capture(baseline[0].path)
+    try:
+        if without_poc_observability(toml_snapshot_value(current_toml), observability_root) != toml_snapshot_value(
+            baseline[0]
+        ):
+            raise PocFailure("unrelated Relay component configuration changed during the POC")
+        baseline[0].restore()
+    except PocFailure as error:
+        errors.append(str(error))
+
+    current_registry = FileSnapshot.capture(baseline[1].path)
+    try:
+        if dynamic_registry_without_poc(current_registry) != dynamic_registry_without_poc(baseline[1]):
+            raise PocFailure("unrelated dynamic plugin registry state changed during the POC")
+        baseline[1].restore()
+    except PocFailure as error:
+        errors.append(str(error))
+
+    if errors:
+        raise PocFailure("; ".join(errors))
 
 
 @dataclass
@@ -609,8 +719,11 @@ class PocRun:
     install_root: Path
     service_definition_baseline: FileSnapshot
     service_registration_baseline: bool
+    terminal_plugin_preexisting: bool
+    terminal_relay: Path | None
     plugin_expected: tuple[FileSnapshot, FileSnapshot] | None = None
     desktop_installed: bool = False
+    terminal_plugin_migrated: bool = False
     plugin_registered: bool = False
     succeeded: bool = False
 
@@ -626,6 +739,8 @@ class PocRun:
             user_config / ".dynamic-plugins.json",
         )
         install_root = desktop_install_root()
+        terminal_plugin_preexisting = (install_root.parent / "claude-code.json").is_file()
+        terminal_relay = shutil.which("nemo-relay") if terminal_plugin_preexisting else None
         return cls(
             repo=repo,
             work=work,
@@ -641,6 +756,8 @@ class PocRun:
             install_root=install_root,
             service_definition_baseline=FileSnapshot.capture(service_definition_path(install_root)),
             service_registration_baseline=service_is_registered(),
+            terminal_plugin_preexisting=terminal_plugin_preexisting,
+            terminal_relay=Path(terminal_relay) if terminal_relay else None,
         )
 
     def execute(self) -> None:
@@ -658,6 +775,21 @@ class PocRun:
             raise PocFailure(f"remove stale Claude Desktop integration files at {self.install_root} before the POC")
         if self.service_definition_baseline.data is not None or self.service_registration_baseline:
             raise PocFailure("remove the existing Claude Desktop Relay login service before the POC")
+        if self.terminal_plugin_preexisting and self.terminal_relay is None:
+            raise PocFailure("the pre-existing Claude Code plugin cannot be restored because nemo-relay is not on PATH")
+        if self.terminal_relay is not None:
+            baseline_doctor = run(
+                [self.terminal_relay, "doctor", "--plugin", "claude-code", "--json"],
+                check=False,
+                capture=True,
+                cwd=self.workspace,
+            )
+            if baseline_doctor.returncode != 0:
+                raise PocFailure(
+                    "repair the pre-existing Claude Code plugin before the POC so its exact CLI "
+                    "generation can be restored afterward:\n"
+                    + (baseline_doctor.stderr or baseline_doctor.stdout or "unknown doctor failure").strip()
+                )
         assert_no_user_observability(self.plugin_paths[0])
         run(["cargo", "build", "-p", "nemo-relay-cli", "--bin", "nemo-relay"], cwd=self.repo)
         dry_run = run(
@@ -693,6 +825,7 @@ class PocRun:
     def install_desktop(self) -> None:
         run([self.relay, "install", "claude-desktop"], cwd=self.workspace)
         self.desktop_installed = True
+        self.terminal_plugin_migrated = self.terminal_plugin_preexisting
         doctor = run(
             [self.relay, "doctor", "--plugin", "claude-desktop", "--json"],
             capture=True,
@@ -750,6 +883,7 @@ Afterward, quit Claude Desktop completely before typing PASS.
     def cleanup(self) -> list[str]:
         errors: list[str] = []
         self.uninstall_desktop(errors)
+        self.restore_terminal_plugin(errors)
         self.restore_plugin(errors)
         self.verify_restoration(errors)
         return errors
@@ -772,11 +906,54 @@ Afterward, quit Claude Desktop completely before typing PASS.
             return
         self.desktop_installed = False
 
+    def restore_terminal_plugin(self, errors: list[str]) -> None:
+        if self.desktop_installed or not self.terminal_plugin_migrated:
+            return
+        if self.terminal_relay is None:
+            errors.append("pre-existing Claude Code plugin has no baseline nemo-relay executable")
+            return
+        restore = run(
+            [
+                self.terminal_relay,
+                "install",
+                "claude-code",
+                "--force",
+                "--skip-doctor",
+            ],
+            check=False,
+            capture=True,
+            cwd=self.workspace,
+        )
+        if restore.returncode != 0:
+            errors.append(
+                "failed to restore the pre-existing Claude Code plugin generation: "
+                + (restore.stderr or restore.stdout or "unknown failure").strip()
+            )
+            return
+        doctor = run(
+            [self.terminal_relay, "doctor", "--plugin", "claude-code", "--json"],
+            check=False,
+            capture=True,
+            cwd=self.workspace,
+        )
+        if doctor.returncode != 0:
+            errors.append(
+                "restored Claude Code plugin generation is unhealthy: "
+                + (doctor.stderr or doctor.stdout or "unknown failure").strip()
+            )
+            return
+        self.terminal_plugin_migrated = False
+
     def restore_plugin(self, errors: list[str]) -> None:
         if not self.plugin_registered:
             return
         try:
-            restore_plugin_configuration(self.plugin_baseline, self.plugin_expected, self.relay)
+            restore_plugin_configuration(
+                self.plugin_baseline,
+                self.plugin_expected,
+                self.relay,
+                self.observability_root,
+            )
             self.plugin_registered = False
         except PocFailure as error:
             errors.append(str(error))
@@ -839,8 +1016,13 @@ def main() -> int:
 
     try:
         poc.execute()
-    finally:
+    except (PocFailure, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
         cleanup_errors = poc.cleanup()
+        print(f"POC workspace retained at {poc.work}", file=sys.stderr)
+        if cleanup_errors:
+            raise PocFailure(f"{error}; cleanup also failed: {'; '.join(cleanup_errors)}") from error
+        raise
+    cleanup_errors = poc.cleanup()
     poc.finish(cleanup_errors)
     return 0
 

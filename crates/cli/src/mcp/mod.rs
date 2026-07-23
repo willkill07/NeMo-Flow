@@ -41,32 +41,16 @@ pub(crate) async fn run(server_args: &GatewayOverrides) -> Result<ExitCode, CliE
         let bootstrap_fingerprint =
             crate::configuration::transparent_gateway_fingerprint(&gateway_url);
         let lease = gateway::GatewayLease::borrow(gateway_url, bootstrap_fingerprint).await?;
-        log::info!(
-            target: "nemo_relay.mcp",
-            event = "gateway_acquired",
-            mode = "borrowed";
-            "MCP gateway acquired"
-        );
-        let frames = transport::spawn_stdin_reader()?;
-        return match session::run(lease, frames, tokio::io::stdout()).await {
-            Ok(()) => {
-                log::info!(
-                    target: "nemo_relay.mcp",
-                    event = "mcp_session_closed";
-                    "MCP session closed"
-                );
-                Ok(ExitCode::SUCCESS)
-            }
-            Err(error) => {
-                log::error!(
-                    target: "nemo_relay.mcp",
-                    event = "mcp_session_failed",
-                    error_kind = error.log_kind();
-                    "MCP session failed"
-                );
-                Err(error)
-            }
-        };
+        return serve(lease, "transparent_borrowed").await;
+    }
+    if let Some((gateway_url, bootstrap_fingerprint)) =
+        crate::claude_desktop::mcp_gateway().map_err(CliError::Launch)?
+    {
+        // Claude Desktop owns both the persistent gateway and its fail-closed lifecycle. An MCP
+        // child may authenticate and monitor that exact generation, but it must never create or
+        // recover a standalone gateway when the registered sidecar is unavailable.
+        let lease = gateway::GatewayLease::borrow(gateway_url, bootstrap_fingerprint).await?;
+        return serve(lease, "claude_desktop_borrowed").await;
     }
     // Starting the MCP process is the lifecycle boundary. Acquire the shared gateway before
     // reading protocol frames so hosts can rely on process startup rather than their individual
@@ -75,10 +59,14 @@ pub(crate) async fn run(server_args: &GatewayOverrides) -> Result<ExitCode, CliE
         .await?
         .acquire()
         .await?;
+    serve(lease, "managed").await
+}
+
+async fn serve(lease: gateway::GatewayLease, mode: &'static str) -> Result<ExitCode, CliError> {
     log::info!(
         target: "nemo_relay.mcp",
         event = "gateway_acquired",
-        mode = "managed";
+        mode = mode;
         "MCP gateway acquired"
     );
     let frames = transport::spawn_stdin_reader()?;

@@ -29,7 +29,7 @@ pub(super) trait DesktopOperations {
         install_root: &Path,
     ) -> Result<(), String>;
     fn relay_binary(&self) -> Result<PathBuf, String>;
-    fn persistent_gateway_identity(&self) -> Result<(String, String), String>;
+    fn persistent_gateway_identity(&self) -> Result<(String, String, usize), String>;
     fn settings_path(&self) -> Result<PathBuf, String>;
     fn plugin_exists(&self, marketplace_dir: &Path) -> bool;
     fn install_plugin(
@@ -102,7 +102,7 @@ impl DesktopOperations for SystemOperations {
         Ok(executable.canonicalize().unwrap_or(executable))
     }
 
-    fn persistent_gateway_identity(&self) -> Result<(String, String), String> {
+    fn persistent_gateway_identity(&self) -> Result<(String, String, usize), String> {
         super::persistent_gateway_identity()
     }
 
@@ -111,7 +111,7 @@ impl DesktopOperations for SystemOperations {
     }
 
     fn plugin_exists(&self, marketplace_dir: &Path) -> bool {
-        crate::installation::marketplace::persisted_state_exists(
+        crate::installation::marketplace::installation_exists(
             CodingAgent::ClaudeCode,
             marketplace_dir,
         )
@@ -123,7 +123,8 @@ impl DesktopOperations for SystemOperations {
         force: bool,
         skip_doctor: bool,
     ) -> Result<(), String> {
-        crate::installation::marketplace::install(
+        let relay = self.relay_binary()?;
+        crate::installation::marketplace::install_with_relay(
             CodingAgent::ClaudeCode,
             InstallRequest {
                 install_dir: Some(marketplace_dir.to_path_buf()),
@@ -131,6 +132,7 @@ impl DesktopOperations for SystemOperations {
                 dry_run: false,
                 skip_doctor,
             },
+            &relay,
         )
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -214,7 +216,7 @@ impl DesktopOperations for SystemOperations {
     }
 
     fn plugin_checks(&self, marketplace_dir: Option<&Path>) -> Result<Vec<DoctorCheck>, String> {
-        super::plugin_checks(marketplace_dir)
+        super::plugin_checks(marketplace_dir, &self.relay_binary()?)
     }
 
     fn open_deep_link(&self, platform: Platform, url: &str) -> Result<(), String> {
@@ -222,10 +224,21 @@ impl DesktopOperations for SystemOperations {
     }
 
     fn post_install_doctor(&self, marketplace_dir: &Path) -> Result<(), String> {
-        if super::doctor_report_with(self, Some(marketplace_dir))?.ok {
+        let report =
+            super::doctor_report_with_verifying_install(self, Some(marketplace_dir), true)?;
+        if report.ok {
             Ok(())
         } else {
-            Err("Claude Desktop doctor checks failed after installation".into())
+            let failed = report
+                .checks
+                .iter()
+                .filter(|check| !check.ok)
+                .map(|check| format!("{} ({})", check.name, check.details))
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(format!(
+                "Claude Desktop doctor checks failed after installation: {failed}"
+            ))
         }
     }
 }

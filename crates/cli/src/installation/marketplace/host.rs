@@ -82,6 +82,8 @@ pub(super) fn run_host_marketplace_removal(
 pub(crate) struct HostRegistrationReport {
     pub(crate) host_plugin_registered: bool,
     pub(crate) host_marketplace_registered: bool,
+    pub(crate) host_plugin_root: Option<PathBuf>,
+    pub(crate) host_marketplace_root: Option<PathBuf>,
 }
 
 impl HostRegistrationReport {
@@ -133,6 +135,8 @@ pub(super) fn host_registration_report(
         return Ok(HostRegistrationReport {
             host_plugin_registered: true,
             host_marketplace_registered: true,
+            host_plugin_root: None,
+            host_marketplace_root: None,
         });
     }
     require_host_cli(host, options, runner)?;
@@ -143,9 +147,14 @@ pub(crate) fn claude_registration_report(
     options: &PluginInstallOptions,
     runner: &dyn CommandRunner,
 ) -> Result<HostRegistrationReport, String> {
+    let (host_plugin_registered, host_plugin_root) = claude_plugin_registration(options, runner)?;
+    let (host_marketplace_registered, host_marketplace_root) =
+        claude_marketplace_registration(options, runner)?;
     Ok(HostRegistrationReport {
-        host_plugin_registered: claude_plugin_registered(options, runner)?,
-        host_marketplace_registered: claude_marketplace_registered(options, runner)?,
+        host_plugin_registered,
+        host_marketplace_registered,
+        host_plugin_root,
+        host_marketplace_root,
     })
 }
 
@@ -156,13 +165,15 @@ pub(crate) fn codex_registration_report(
     Ok(HostRegistrationReport {
         host_plugin_registered: codex_plugin_registered(options, runner)?,
         host_marketplace_registered: codex_marketplace_registered(options, runner)?,
+        host_plugin_root: None,
+        host_marketplace_root: None,
     })
 }
 
-fn claude_plugin_registered(
+fn claude_plugin_registration(
     options: &PluginInstallOptions,
     runner: &dyn CommandRunner,
-) -> Result<bool, String> {
+) -> Result<(bool, Option<PathBuf>), String> {
     let output = run_capture_command(
         "claude",
         &["plugin".into(), "list".into(), "--json".into()],
@@ -170,15 +181,21 @@ fn claude_plugin_registered(
         runner,
     )?;
     let plugins = parse_json_command_output("claude plugin list --json", output)?;
-    Ok(plugins
+    let entry = plugins
         .as_array()
-        .is_some_and(|plugins| plugins.iter().any(plugin_entry_matches)))
+        .and_then(|plugins| plugins.iter().find(|entry| plugin_entry_matches(entry)));
+    Ok((
+        entry.is_some(),
+        entry
+            .and_then(|entry| string_field(entry, "installPath"))
+            .map(PathBuf::from),
+    ))
 }
 
-fn claude_marketplace_registered(
+fn claude_marketplace_registration(
     options: &PluginInstallOptions,
     runner: &dyn CommandRunner,
-) -> Result<bool, String> {
+) -> Result<(bool, Option<PathBuf>), String> {
     let output = run_capture_command(
         "claude",
         &[
@@ -191,9 +208,19 @@ fn claude_marketplace_registered(
         runner,
     )?;
     let marketplaces = parse_json_command_output("claude plugin marketplace list --json", output)?;
-    Ok(marketplaces
-        .as_array()
-        .is_some_and(|marketplaces| marketplaces.iter().any(marketplace_entry_matches)))
+    let entry = marketplaces.as_array().and_then(|marketplaces| {
+        marketplaces
+            .iter()
+            .find(|entry| marketplace_entry_matches(entry))
+    });
+    Ok((
+        entry.is_some(),
+        entry
+            .and_then(|entry| {
+                string_field(entry, "path").or_else(|| string_field(entry, "installLocation"))
+            })
+            .map(PathBuf::from),
+    ))
 }
 
 fn codex_plugin_registered(

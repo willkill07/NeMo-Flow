@@ -1493,6 +1493,29 @@ fn relay_identity_prefers_the_path_resolved_executable() {
 }
 
 #[test]
+fn pinned_relay_identity_overrides_the_path_resolved_executable() {
+    let dir = tempdir().unwrap();
+    let delegate = MockRunner::default()
+        .with_current_executable("/opt/nemo-relay/current/nemo-relay")
+        .with_executable("nemo-relay", "/opt/nemo-relay/stale/nemo-relay");
+    let runner =
+        PinnedRelayCommandRunner::new(Path::new("/opt/nemo-relay/desktop/nemo-relay"), &delegate);
+
+    let relay = require_relay(&options(dir.path()), &runner).unwrap();
+    validate_relay_hook_forward(&relay, &options(dir.path()), &runner).unwrap();
+    validate_relay_mcp(&relay, &options(dir.path()), &runner).unwrap();
+
+    assert_eq!(relay, PathBuf::from("/opt/nemo-relay/desktop/nemo-relay"));
+    assert_eq!(
+        delegate.quiet_commands(),
+        vec![
+            "/opt/nemo-relay/desktop/nemo-relay hook-forward --help",
+            "/opt/nemo-relay/desktop/nemo-relay mcp --help",
+        ]
+    );
+}
+
+#[test]
 fn codex_mcp_env_vars_include_approved_dynamic_and_config_references_only() {
     let config = json!({
         "components": [{
@@ -1817,6 +1840,8 @@ fn host_command_helpers_cover_dry_run_missing_failure_and_reporting() {
         HostRegistrationReport {
             host_plugin_registered: false,
             host_marketplace_registered: true,
+            host_plugin_root: None,
+            host_marketplace_root: None,
         }
         .to_json()["host_plugin_registered"],
         json!(false)
@@ -2838,6 +2863,121 @@ fn claude_force_install_migrates_a_legacy_hook_only_plugin() {
         serde_json::from_str::<Value>(&std::fs::read_to_string(&layout.plugin_manifest).unwrap())
             .unwrap();
     assert_eq!(installed["mcpServers"], json!("./.mcp.json"));
+}
+
+#[test]
+fn claude_force_install_migrates_a_registered_relay_legacy_cache() {
+    let dir = tempdir().unwrap();
+    let layout = PluginLayout::new(CodingAgent::ClaudeCode, dir.path());
+    let cache_root = dir
+        .path()
+        .join("claude-cache/nemo-relay-local/nemo-relay-plugin/0.4.0");
+    std::fs::create_dir_all(cache_root.join(".claude-plugin")).unwrap();
+    write_json(
+        &cache_root.join(".claude-plugin/plugin.json"),
+        &json!({
+            "name": PLUGIN_NAME,
+            "repository": "https://github.com/NVIDIA/NeMo-Relay",
+            "version": "0.4.0"
+        }),
+    )
+    .unwrap();
+    let plugin_list = json!([{
+        "id": format!("{PLUGIN_NAME}@{MARKETPLACE_NAME}"),
+        "installPath": cache_root
+    }])
+    .to_string();
+    let marketplace_list = json!([{
+        "name": MARKETPLACE_NAME,
+        "path": layout.marketplace_root
+    }])
+    .to_string();
+    let runner = MockRunner::default()
+        .with_executable("nemo-relay", "/bin/nemo-relay")
+        .with_executable("claude", "/bin/claude")
+        .with_capture_output("/bin/claude plugin list --json", plugin_list)
+        .with_capture_output(
+            "/bin/claude plugin marketplace list --json",
+            marketplace_list,
+        );
+    let setup_runner = MockSetupRunner::default();
+    let options = PluginInstallOptions {
+        force: true,
+        ..options(dir.path())
+    };
+
+    install_host(CodingAgent::ClaudeCode, &options, &runner, &setup_runner).unwrap();
+
+    InstallGeneration::capture(layout.generation_fence.clone()).unwrap();
+    assert!(layout.mcp_config.is_file());
+    assert!(layout.state_path.is_file());
+}
+
+#[test]
+fn claude_force_install_rejects_ambiguous_registered_legacy_caches() {
+    for (repository, marketplace_matches) in [
+        ("https://example.com/foreign/plugin", true),
+        ("https://github.com/NVIDIA/NeMo-Relay", false),
+    ] {
+        let dir = tempdir().unwrap();
+        let layout = PluginLayout::new(CodingAgent::ClaudeCode, dir.path());
+        let cache_root = dir.path().join("claude-cache/nemo-relay-plugin/0.4.0");
+        std::fs::create_dir_all(cache_root.join(".claude-plugin")).unwrap();
+        write_json(
+            &cache_root.join(".claude-plugin/plugin.json"),
+            &json!({
+                "name": PLUGIN_NAME,
+                "repository": repository,
+                "version": "0.4.0"
+            }),
+        )
+        .unwrap();
+        let marketplace_root = if marketplace_matches {
+            layout.marketplace_root.clone()
+        } else {
+            dir.path().join("foreign-marketplace")
+        };
+        let runner = MockRunner::default()
+            .with_executable("nemo-relay", "/bin/nemo-relay")
+            .with_executable("claude", "/bin/claude")
+            .with_capture_output(
+                "/bin/claude plugin list --json",
+                json!([{
+                    "id": format!("{PLUGIN_NAME}@{MARKETPLACE_NAME}"),
+                    "installPath": cache_root
+                }])
+                .to_string(),
+            )
+            .with_capture_output(
+                "/bin/claude plugin marketplace list --json",
+                json!([{
+                    "name": MARKETPLACE_NAME,
+                    "path": marketplace_root
+                }])
+                .to_string(),
+            );
+        let setup_runner = MockSetupRunner::default();
+        let options = PluginInstallOptions {
+            force: true,
+            ..options(dir.path())
+        };
+
+        let error =
+            install_host(CodingAgent::ClaudeCode, &options, &runner, &setup_runner).unwrap_err();
+
+        assert!(
+            error.contains("MCP generation marker is missing"),
+            "{error}"
+        );
+        assert!(error.contains("close all Claude Code clients"), "{error}");
+        assert!(
+            error.contains("claude plugin uninstall nemo-relay-plugin"),
+            "{error}"
+        );
+        assert!(runner.commands().is_empty());
+        assert!(setup_runner.calls().is_empty());
+        assert_no_install_stage(dir.path());
+    }
 }
 
 #[test]

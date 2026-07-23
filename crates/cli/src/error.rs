@@ -100,6 +100,15 @@ impl CliError {
         }
     }
 
+    /// Whether a command hook must use the host-standard blocking exit code.
+    ///
+    /// Guardrail decisions and fail-closed delivery failures both need exit code 2. Claude Code
+    /// treats other non-zero hook exits as non-blocking errors and would otherwise continue with
+    /// the prompt or tool call.
+    pub(crate) fn requires_blocking_hook_exit(&self) -> bool {
+        self.guardrail_rejection_reason().is_some() || matches!(self, Self::HookDelivery { .. })
+    }
+
     pub(crate) fn as_plugin_lifecycle_error_context(
         &self,
     ) -> Option<PluginLifecycleErrorContext<'_>> {

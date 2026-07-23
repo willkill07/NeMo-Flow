@@ -19,6 +19,7 @@ fn test_state(root: &Path) -> DesktopState {
         proxy_token: "secret".into(),
         upstream_proxy: None,
         gateway_fingerprint: "gateway".into(),
+        max_hook_payload_bytes: crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
         configuration_fingerprint: "configuration".into(),
         certificate: CertificateState {
             root_der: certificate_root.join("root-ca.der"),

@@ -558,6 +558,30 @@ async fn control_surface_rejects_wrong_auth_and_returns_fenced_health() {
 }
 
 #[tokio::test]
+async fn control_health_fails_closed_when_live_configuration_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = test_state(temp.path(), "stale-proxy-test");
+    let tls = super::super::certificate::server_config(temp.path(), &state.certificate).unwrap();
+    let (shutdown_tx, _) = watch::channel(false);
+    let runtime = Runtime::new(state, tls, shutdown_tx.clone())
+        .unwrap()
+        .with_configuration_verifier(|| Err("configuration fingerprint changed".into()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(serve(listener, runtime));
+
+    let response = raw_control_request(address, "relay:secret").await;
+    assert!(
+        response.starts_with("HTTP/1.1 503"),
+        "unexpected health response: {response}"
+    );
+    assert!(!response.contains("fingerprint"));
+
+    shutdown_tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn proxy_rejects_malformed_connect_requests_before_tunneling() {
     let temp = tempfile::tempdir().unwrap();
     let state = test_state(temp.path(), "connect-validation");
@@ -892,6 +916,7 @@ fn test_state(root: &std::path::Path, generation: &str) -> DesktopState {
         proxy_token: "secret".into(),
         upstream_proxy: None,
         gateway_fingerprint: "gateway".into(),
+        max_hook_payload_bytes: crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
         configuration_fingerprint: "configuration".into(),
         certificate,
         settings: super::super::settings::SettingsPatch::default(),

@@ -31,18 +31,26 @@ pub(crate) async fn hook_forward(command: HookForwardRequest) -> Result<(), CliE
     validate_optional_json("session metadata", command.session_metadata.as_deref())?;
     let fail_closed =
         command.fail_closed || std::env::var("NEMO_RELAY_FAIL_CLOSED").ok().as_deref() == Some("1");
-    if should_validate_claude_desktop(&command)
-        && let Err(error) = crate::claude_desktop::validate_hook_environment()
-    {
-        // A missing or modified fail-closed marker is itself a Desktop protection failure. Do not
-        // let that same missing marker downgrade the hook to the direct integration's fail-open
-        // behavior.
-        return handle_hook_error(CliError::Launch(error), true);
-    }
+    let desktop_gateway = if should_validate_claude_desktop(&command) {
+        match crate::claude_desktop::hook_gateway() {
+            Ok(gateway) => gateway,
+            Err(error) => {
+                // A missing or modified fail-closed marker is itself a Desktop protection failure.
+                // Do not let that same missing marker downgrade the hook to the direct
+                // integration's fail-open behavior.
+                return handle_hook_error(CliError::Launch(error), true);
+            }
+        }
+    } else {
+        None
+    };
     let destination = hook_destination(&command);
-    let persistent = match persistent_gateway(&destination) {
-        Ok(persistent) => persistent,
-        Err(error) => return handle_hook_error(error, fail_closed),
+    let persistent = match desktop_gateway {
+        Some(gateway) => Some(gateway),
+        None => match persistent_gateway(&destination) {
+            Ok(persistent) => persistent,
+            Err(error) => return handle_hook_error(error, fail_closed),
+        },
     };
     let transparent_gateway = match command
         .transparent_run
@@ -152,7 +160,9 @@ fn handle_hook_error(error: CliError, fail_closed: bool) -> Result<(), CliError>
             error_kind = error.log_kind();
             "Hook delivery failed"
         );
-        Err(error)
+        Err(CliError::HookDelivery {
+            source: Box::new(error),
+        })
     } else {
         log::warn!(
             target: "nemo_relay.hook",

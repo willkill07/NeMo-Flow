@@ -1912,6 +1912,7 @@ fn managed_bootstrap_environment_is_not_forwarded_from_codex() {
             "NEMO_RELAY_BOOTSTRAP_STATE_DIR".to_string(),
             "NEMO_RELAY_BOOTSTRAP_SHUTDOWN_TOKEN".to_string(),
             "NEMO_RELAY_CLAUDE_DESKTOP_LIVE_POC".to_string(),
+            "NEMO_RELAY_CLAUDE_DESKTOP_STATE".to_string(),
         ],
         None,
     );
@@ -1921,6 +1922,11 @@ fn managed_bootstrap_environment_is_not_forwarded_from_codex() {
         !names
             .iter()
             .any(|name| name == "NEMO_RELAY_CLAUDE_DESKTOP_LIVE_POC")
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|name| name == "NEMO_RELAY_CLAUDE_DESKTOP_STATE")
     );
 }
 

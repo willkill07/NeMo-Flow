@@ -46,6 +46,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 type BoxStream = Box<dyn AsyncStream>;
+type ConfigurationVerifier = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 #[derive(Clone)]
 pub(super) struct Runtime {
@@ -55,6 +56,7 @@ pub(super) struct Runtime {
     gateway_client: Client,
     gateway_base: String,
     shutdown: watch::Sender<bool>,
+    configuration_verifier: Option<ConfigurationVerifier>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -96,7 +98,16 @@ impl Runtime {
             gateway_client,
             gateway_base,
             shutdown,
+            configuration_verifier: None,
         })
+    }
+
+    pub(super) fn with_configuration_verifier(
+        mut self,
+        verifier: impl Fn() -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        self.configuration_verifier = Some(Arc::new(verifier));
+        self
     }
 }
 
@@ -310,6 +321,20 @@ fn control_request(request: Request<Incoming>, runtime: &Runtime) -> Response<Bo
     }
     match (request.method(), request.uri().path()) {
         (&Method::GET, HEALTH_PATH) => {
+            if let Some(verifier) = runtime.configuration_verifier.as_ref()
+                && verifier().is_err()
+            {
+                log::error!(
+                    target: "nemo_relay.gateway",
+                    event = "desktop_configuration_changed",
+                    error_kind = "configuration";
+                    "Claude Desktop sidecar configuration changed"
+                );
+                return text_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Claude Desktop Relay configuration changed",
+                );
+            }
             let health = Health {
                 service: "nemo-relay-claude-desktop".into(),
                 version: env!("CARGO_PKG_VERSION").into(),

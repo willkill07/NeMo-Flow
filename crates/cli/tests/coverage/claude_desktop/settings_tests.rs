@@ -153,6 +153,21 @@ fn preparation_rejects_custom_gateway_and_conflicting_proxy_case_variants() {
     .unwrap();
     assert!(unique_case_insensitive_string(&env, "HTTPS_PROXY").is_err());
 
+    let canonical_base_url = serde_json::from_value::<Map<String, Value>>(json!({
+        "anthropic_base_url": "https://API.ANTHROPIC.COM:443/"
+    }))
+    .unwrap();
+    prepare_with_process_env(
+        &temp.path().join("canonical-settings.json"),
+        "http://nemo-relay:secret@127.0.0.1:47633",
+        &temp.path().join("canonical-state.json"),
+        &temp.path().join("root.pem"),
+        "macos",
+        None,
+        &canonical_base_url,
+    )
+    .unwrap();
+
     let inherited_base_url = serde_json::from_value::<Map<String, Value>>(json!({
         "anthropic_base_url": "http://127.0.0.1:47632"
     }))
@@ -291,6 +306,11 @@ fn policy_rejects_case_variant_base_url_and_anthropic_no_proxy_bypass() {
     let mut env = prepared.value["env"].as_object().unwrap().clone();
     assert!(validate_environment_policy(&env, &prepared.patch).is_ok());
 
+    env.insert(
+        "anthropic_base_url".into(),
+        json!("https://api.anthropic.com"),
+    );
+    assert!(validate_environment_policy(&env, &prepared.patch).is_ok());
     env.insert(
         "anthropic_base_url".into(),
         json!("https://gateway.example"),

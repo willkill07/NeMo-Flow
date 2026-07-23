@@ -31,9 +31,10 @@ use assets::{
     write_plugin_marketplace, write_plugin_marketplace_for_generation,
 };
 use host::{
-    CommandRunner, RealCommandRunner, host_registration_report, require_host_cli, require_relay,
-    run_host_marketplace_registration, run_host_marketplace_removal, run_host_plugin_registration,
-    run_host_plugin_removal, validate_relay_hook_forward, validate_relay_mcp,
+    CommandOutput, CommandRunner, HostRegistrationReport, RealCommandRunner,
+    host_registration_report, require_host_cli, require_relay, run_host_marketplace_registration,
+    run_host_marketplace_removal, run_host_plugin_registration, run_host_plugin_removal,
+    validate_relay_hook_forward, validate_relay_mcp,
 };
 use setup::{
     HostPluginSetupRunner, PluginSetupRunner, run_plugin_doctor_json,
@@ -137,9 +138,37 @@ pub(crate) fn collect_marketplace_readiness(
     collect_host_plugin_readiness(host, options, runner, &setup_runner)
 }
 
+pub(crate) fn collect_marketplace_readiness_with_relay(
+    host: impl MarketplaceHost,
+    options: &PluginInstallOptions,
+    relay: &Path,
+) -> HostPluginReadiness {
+    let delegate = RealCommandRunner;
+    let runner = PinnedRelayCommandRunner::new(relay, &delegate);
+    collect_marketplace_readiness(host, options, &runner)
+}
+
 pub(crate) fn install(
     host: impl MarketplaceHost,
     command: InstallRequest,
+) -> Result<ExitCode, CliError> {
+    install_with_runner(host, command, &RealCommandRunner)
+}
+
+pub(crate) fn install_with_relay(
+    host: impl MarketplaceHost,
+    command: InstallRequest,
+    relay: &Path,
+) -> Result<ExitCode, CliError> {
+    let delegate = RealCommandRunner;
+    let runner = PinnedRelayCommandRunner::new(relay, &delegate);
+    install_with_runner(host, command, &runner)
+}
+
+fn install_with_runner(
+    host: impl MarketplaceHost,
+    command: InstallRequest,
+    runner: &dyn CommandRunner,
 ) -> Result<ExitCode, CliError> {
     let host_name = host.install_arg();
     log::info!(
@@ -164,7 +193,7 @@ pub(crate) fn install(
         dry_run: command.dry_run,
         skip_doctor: command.skip_doctor,
     };
-    let result = run_for_host(host, &options, install_host);
+    let result = run_for_host_with_runner(host, &options, install_host, runner);
     match &result {
         Ok(_) => log::info!(
             target: "nemo_relay.installation",
@@ -252,7 +281,7 @@ pub(crate) fn doctor_marketplace_integration(
 fn run_for_host<H, F>(
     host: H,
     options: &PluginInstallOptions,
-    mut action: F,
+    action: F,
 ) -> Result<ExitCode, CliError>
 where
     H: MarketplaceHost,
@@ -264,9 +293,67 @@ where
     ) -> Result<(), String>,
 {
     let runner = RealCommandRunner;
+    run_for_host_with_runner(host, options, action, &runner)
+}
+
+fn run_for_host_with_runner<H, F>(
+    host: H,
+    options: &PluginInstallOptions,
+    mut action: F,
+    runner: &dyn CommandRunner,
+) -> Result<ExitCode, CliError>
+where
+    H: MarketplaceHost,
+    F: FnMut(
+        H,
+        &PluginInstallOptions,
+        &dyn CommandRunner,
+        &dyn PluginSetupRunner,
+    ) -> Result<(), String>,
+{
     let setup_runner = HostPluginSetupRunner::new(host);
-    action(host, options, &runner, &setup_runner).map_err(CliError::Install)?;
+    action(host, options, runner, &setup_runner).map_err(CliError::Install)?;
     Ok(ExitCode::SUCCESS)
+}
+
+struct PinnedRelayCommandRunner<'a> {
+    relay: PathBuf,
+    delegate: &'a dyn CommandRunner,
+}
+
+impl<'a> PinnedRelayCommandRunner<'a> {
+    fn new(relay: &Path, delegate: &'a dyn CommandRunner) -> Self {
+        Self {
+            relay: relay.to_path_buf(),
+            delegate,
+        }
+    }
+}
+
+impl CommandRunner for PinnedRelayCommandRunner<'_> {
+    fn current_executable(&self) -> Result<PathBuf, String> {
+        Ok(self.relay.clone())
+    }
+
+    fn resolve_executable(&self, command: &str) -> Result<Option<PathBuf>, String> {
+        if command == RELAY_COMMAND {
+            Ok(Some(self.relay.clone()))
+        } else {
+            self.delegate.resolve_executable(command)
+        }
+    }
+
+    fn run(&self, program: &Path, args: &[String]) -> Result<i32, String> {
+        self.delegate.run(program, args)
+    }
+
+    fn run_quiet(&self, program: &Path, args: &[String]) -> Result<i32, String> {
+        self.delegate.run_quiet(program, args)
+    }
+
+    fn run_capture(&self, program: &Path, args: &[String]) -> Result<CommandOutput, String> {
+        self.delegate.run_capture(program, args)
+    }
 }
 
 pub(crate) fn doctor_marketplace_report(
@@ -284,6 +371,16 @@ pub(crate) fn default_marketplace_install_dir() -> PathBuf {
 
 pub(crate) fn persisted_state_exists(host: impl MarketplaceHost, install_dir: &Path) -> bool {
     state_path(host, install_dir).exists()
+}
+
+pub(crate) fn installation_exists(host: impl MarketplaceHost, install_dir: &Path) -> bool {
+    if persisted_state_exists(host, install_dir) {
+        return true;
+    }
+    let options = plugin_doctor_options(Some(install_dir.to_path_buf()));
+    host_registration_report(host, &options, &RealCommandRunner).is_ok_and(|registration| {
+        registration.host_plugin_registered || registration.host_marketplace_registered
+    })
 }
 
 fn install_host(
@@ -1071,6 +1168,57 @@ fn legacy_plugin_without_mcp(
     Ok(manifest.get("mcpServers").is_none())
 }
 
+fn registered_relay_legacy_plugin_without_mcp(
+    host: impl MarketplaceHost,
+    layout: &PluginLayout,
+    registration: &HostRegistrationReport,
+) -> Result<bool, String> {
+    if !host.accepts_legacy_hook_only_plugin()
+        || !registration.host_plugin_registered
+        || !registration.host_marketplace_registered
+    {
+        return Ok(false);
+    }
+    let Some(plugin_root) = registration.host_plugin_root.as_deref() else {
+        return Ok(false);
+    };
+    let Some(marketplace_root) = registration.host_marketplace_root.as_deref() else {
+        return Ok(false);
+    };
+    if !selected_paths_match(marketplace_root, &layout.marketplace_root)
+        || !legacy_plugin_without_mcp(host, plugin_root)?
+    {
+        return Ok(false);
+    }
+    let manifest_path = plugin_manifest_path(host, plugin_root);
+    let raw = fs::read_to_string(&manifest_path).map_err(|error| {
+        format!(
+            "failed to inspect registered legacy plugin manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest = serde_json::from_str::<Value>(&raw).map_err(|error| {
+        format!(
+            "failed to inspect registered legacy plugin manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(
+        manifest.get("name").and_then(Value::as_str) == Some(PLUGIN_NAME)
+            && manifest.get("repository").and_then(Value::as_str)
+                == Some("https://github.com/NVIDIA/NeMo-Relay"),
+    )
+}
+
+fn selected_paths_match(left: &Path, right: &Path) -> bool {
+    left == right
+        || left
+            .canonicalize()
+            .ok()
+            .zip(right.canonicalize().ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
 fn uninstall_host_with_setup_override(
     host: impl MarketplaceHost,
     options: &PluginInstallOptions,
@@ -1700,7 +1848,9 @@ fn prepare_plugin_install(
         || marketplace_registered;
     let generation_retirement = if previous_install_exists {
         if !previous_generation_fence.exists() {
-            if legacy_plugin_without_mcp(host, &previous_plugin_root)? {
+            if legacy_plugin_without_mcp(host, &previous_plugin_root)?
+                || registered_relay_legacy_plugin_without_mcp(host, layout, &registration)?
+            {
                 None
             } else {
                 return Err(missing_generation_fence_error(

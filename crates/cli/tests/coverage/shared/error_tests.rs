@@ -80,3 +80,19 @@ fn log_kinds_cover_every_operational_error_class() {
         assert_eq!(error.log_kind(), expected);
     }
 }
+
+#[test]
+fn hook_blocking_exit_covers_policy_and_fail_closed_delivery_errors_only() {
+    assert!(CliError::GuardrailRejected("blocked".into()).requires_blocking_hook_exit());
+    assert!(
+        CliError::Flow(FlowError::GuardrailRejected("blocked".into()))
+            .requires_blocking_hook_exit()
+    );
+    assert!(
+        CliError::HookDelivery {
+            source: Box::new(CliError::Launch("sidecar unavailable".into())),
+        }
+        .requires_blocking_hook_exit()
+    );
+    assert!(!CliError::Launch("ordinary launch failure".into()).requires_blocking_hook_exit());
+}

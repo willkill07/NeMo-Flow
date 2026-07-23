@@ -16,6 +16,8 @@ struct FakeOperations {
     healthy: Cell<bool>,
     doctor_healthy: Cell<bool>,
     write_service_logs: Cell<bool>,
+    mutate_provider_backup_on_install: Cell<bool>,
+    mutate_settings_on_install: Cell<bool>,
     failure: RefCell<Option<String>>,
     calls: RefCell<Vec<String>>,
 }
@@ -37,6 +39,8 @@ impl FakeOperations {
             healthy: Cell::new(true),
             doctor_healthy: Cell::new(true),
             write_service_logs: Cell::new(false),
+            mutate_provider_backup_on_install: Cell::new(false),
+            mutate_settings_on_install: Cell::new(false),
             failure: RefCell::new(None),
             calls: RefCell::new(Vec::new()),
         }
@@ -105,11 +109,12 @@ impl DesktopOperations for FakeOperations {
         Ok(self.relay_binary.clone())
     }
 
-    fn persistent_gateway_identity(&self) -> Result<(String, String), String> {
+    fn persistent_gateway_identity(&self) -> Result<(String, String, usize), String> {
         self.step("gateway_identity")?;
         Ok((
             "test-gateway-fingerprint".into(),
             self.anthropic_base_url.borrow().clone(),
+            crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
         ))
     }
 
@@ -130,6 +135,35 @@ impl DesktopOperations for FakeOperations {
         _skip_doctor: bool,
     ) -> Result<(), String> {
         self.step("install_plugin")?;
+        if self.mutate_provider_backup_on_install.get() {
+            let backup = crate::filesystem::backup_path(&self.settings_path);
+            if let Some(parent) = backup.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(backup, b"{\"rewritten\":true}\n").map_err(|error| error.to_string())?;
+        }
+        if self.mutate_settings_on_install.get() {
+            let mut settings = if self.settings_path.exists() {
+                crate::agents::shared::host::read_json_object(&self.settings_path)?
+            } else {
+                serde_json::Value::Object(serde_json::Map::new())
+            };
+            let env = settings
+                .as_object_mut()
+                .expect("test settings are an object")
+                .entry("env")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| "test Claude env settings are not an object".to_string())?;
+            env.insert(
+                "ANTHROPIC_BASE_URL".into(),
+                serde_json::Value::String(format!("http://{GATEWAY_BIND}")),
+            );
+            let mut bytes =
+                serde_json::to_vec_pretty(&settings).map_err(|error| error.to_string())?;
+            bytes.push(b'\n');
+            crate::filesystem::atomic_write_private(&self.settings_path, &bytes)?;
+        }
         self.plugin_present.set(true);
         Ok(())
     }
@@ -395,16 +429,22 @@ fn desktop_ports_are_fixed_loopback_endpoints() {
 }
 
 #[test]
-fn hook_environment_is_optional_before_install_and_fail_closed_after_install() {
+fn hook_and_mcp_environments_are_optional_before_install_and_fail_closed_after_install() {
     let fixture = LifecycleFixture::new(platform::Platform::Linux, false);
-    validate_hook_environment().unwrap();
+    assert!(hook_gateway().unwrap().is_none());
+    assert!(mcp_gateway().unwrap().is_none());
 
     install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
-    assert!(
-        validate_hook_environment()
-            .unwrap_err()
-            .contains("effective state marker is missing")
-    );
+    let error = match hook_gateway() {
+        Err(error) => error,
+        Ok(_) => panic!("installed protection without an effective state marker must fail"),
+    };
+    assert!(error.contains("effective state marker is missing"));
+    let error = match mcp_gateway() {
+        Err(error) => error,
+        Ok(_) => panic!("installed protection without an effective state marker must fail"),
+    };
+    assert!(error.contains("effective state marker is missing"));
 }
 
 #[test]
@@ -424,6 +464,23 @@ fn doctor_json_exposes_effective_protection_and_named_checks() {
     assert_eq!(value["integration"], "claude-desktop");
     assert_eq!(value["effective_protection"], true);
     assert_eq!(value["checks"][0]["name"], "sidecar_identity");
+}
+
+#[test]
+fn post_install_verification_accepts_only_its_current_install_journal() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
+    let installed = fixture.installed_state();
+    fixture.write_journal("install", "verifying", &installed.generation, None);
+
+    assert!(transaction_journal_status(&installed, false).is_err());
+    assert_eq!(
+        transaction_journal_status(&installed, true).unwrap(),
+        "current installation generation is being verified"
+    );
+
+    fixture.write_journal("install", "verifying", "different-generation", None);
+    assert!(transaction_journal_status(&installed, true).is_err());
 }
 
 #[test]
@@ -459,11 +516,63 @@ fn preexisting_terminal_plugin_returns_to_direct_gateway_on_uninstall() {
     let fixture = LifecycleFixture::new(platform::Platform::Windows, true);
     install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
     assert!(fixture.installed_state().plugin_preexisting);
+    let stops_before = fixture.operations.call_count("stop_direct_gateway");
 
     uninstall_with(&fixture.operations, fixture.uninstall_request()).unwrap();
     assert!(fixture.operations.called("restart_direct_gateway"));
+    assert_eq!(
+        fixture.operations.call_count("stop_direct_gateway"),
+        stops_before + 1
+    );
     assert!(!fixture.operations.called("uninstall_plugin"));
     assert!(fixture.operations.plugin_present.get());
+}
+
+#[test]
+fn preexisting_terminal_plugin_preserves_its_provider_backup_exactly() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, true);
+    let settings = br#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:47632"}}"#;
+    let provider_backup = b"{\n  \"provider-backup-sentinel\": true\n}\n";
+    std::fs::create_dir_all(fixture.operations.settings_path.parent().unwrap()).unwrap();
+    std::fs::write(&fixture.operations.settings_path, settings).unwrap();
+    let backup_path = crate::filesystem::backup_path(&fixture.operations.settings_path);
+    std::fs::write(&backup_path, provider_backup).unwrap();
+    fixture
+        .operations
+        .mutate_provider_backup_on_install
+        .set(true);
+
+    install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
+    assert_eq!(std::fs::read(&backup_path).unwrap(), provider_backup);
+
+    uninstall_with(&fixture.operations, fixture.uninstall_request()).unwrap();
+    assert_eq!(std::fs::read(&backup_path).unwrap(), provider_backup);
+}
+
+#[test]
+fn failed_desktop_install_restores_the_provider_backup_exactly() {
+    let fixture = LifecycleFixture::new(platform::Platform::Linux, true);
+    let settings = br#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:47632"}}"#;
+    let provider_backup = b"{ \"provider-backup-sentinel\" : true }\n";
+    std::fs::create_dir_all(fixture.operations.settings_path.parent().unwrap()).unwrap();
+    std::fs::write(&fixture.operations.settings_path, settings).unwrap();
+    let backup_path = crate::filesystem::backup_path(&fixture.operations.settings_path);
+    std::fs::write(&backup_path, provider_backup).unwrap();
+    fixture
+        .operations
+        .mutate_provider_backup_on_install
+        .set(true);
+    fixture.operations.fail_once("post_install_doctor");
+
+    let error =
+        install_with(&fixture.operations, fixture.install_request(false, false)).unwrap_err();
+
+    assert!(error.contains("injected post_install_doctor failure"));
+    assert_eq!(std::fs::read(&backup_path).unwrap(), provider_backup);
+    assert_eq!(
+        std::fs::read(&fixture.operations.settings_path).unwrap(),
+        settings
+    );
 }
 
 #[test]
@@ -499,6 +608,26 @@ fn install_failure_rolls_back_settings_trust_service_and_plugin() {
     assert!(fixture.operations.called("uninstall_plugin"));
     assert!(!fixture.operations.plugin_present.get());
     assert!(!fixture.marketplace_dir.join("claude-desktop").exists());
+}
+
+#[test]
+fn force_upgrade_failure_reapplies_protection_after_plugin_reinstall() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
+    let installed = fixture.installed_state();
+    fixture.operations.mutate_settings_on_install.set(true);
+    fixture.operations.fail_once("post_install_doctor");
+
+    let error =
+        install_with(&fixture.operations, fixture.install_request(true, false)).unwrap_err();
+
+    assert!(error.contains("injected post_install_doctor failure"));
+    assert!(error.contains("restored the previous Claude Desktop generation"));
+    settings::matches(&installed.settings).unwrap();
+    let restored =
+        crate::agents::shared::host::read_json_object(&installed.settings.settings_path).unwrap();
+    assert!(restored["env"].get("ANTHROPIC_BASE_URL").is_none());
+    assert_eq!(restored["env"]["HTTPS_PROXY"], installed.proxy_url());
 }
 
 #[test]
@@ -658,10 +787,15 @@ async fn sidecar_runs_the_real_gateway_and_authenticated_proxy_until_shutdown() 
     let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
     install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
     let mut installed = fixture.installed_state();
-    let (gateway_fingerprint, anthropic_base_url) = persistent_gateway_identity().unwrap();
+    let (gateway_fingerprint, anthropic_base_url, max_hook_payload_bytes) =
+        persistent_gateway_identity().unwrap();
     assert_eq!(
         anthropic_base_url.trim_end_matches('/'),
         "https://api.anthropic.com"
+    );
+    assert_eq!(
+        max_hook_payload_bytes,
+        crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES
     );
     installed.gateway_fingerprint = gateway_fingerprint;
     installed.configuration_fingerprint = configuration_fingerprint(

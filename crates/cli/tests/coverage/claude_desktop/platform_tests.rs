@@ -121,6 +121,7 @@ impl PlatformFixture {
             proxy_token: "token".into(),
             upstream_proxy: None,
             gateway_fingerprint: "gateway".into(),
+            max_hook_payload_bytes: crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
             configuration_fingerprint: "configuration".into(),
             certificate,
             settings: Default::default(),

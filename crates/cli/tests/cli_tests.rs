@@ -4069,7 +4069,7 @@ fn cli_hook_forward_reports_http_failure_when_fail_closed() {
     let output = child.wait_with_output().unwrap();
     let request = received.recv_timeout(Duration::from_secs(2)).unwrap();
 
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
     assert!(request.contains("POST /hooks/hermes HTTP/1.1"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("HTTP 503"));
 }
@@ -4110,7 +4110,7 @@ fn cli_hook_forward_reports_transport_failure_when_fail_closed() {
     child.stdin.take().unwrap().write_all(b"{}").unwrap();
     let output = child.wait_with_output().unwrap();
 
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("hook forward failed"));
 }
 

@@ -46,6 +46,11 @@ struct InstallProgress {
     locator_written: bool,
 }
 
+struct InstallFileSnapshots<'a> {
+    settings: &'a crate::filesystem::FileSnapshot,
+    provider_backup: &'a crate::filesystem::FileSnapshot,
+}
+
 #[derive(Default)]
 struct RollbackErrors(Vec<String>);
 
@@ -204,7 +209,8 @@ fn install_with(operations: &dyn DesktopOperations, command: InstallRequest) -> 
     );
 
     let relay_binary = operations.relay_binary()?;
-    let (gateway_fingerprint, anthropic_base_url) = operations.persistent_gateway_identity()?;
+    let (gateway_fingerprint, anthropic_base_url, max_hook_payload_bytes) =
+        operations.persistent_gateway_identity()?;
     if anthropic_base_url.trim_end_matches('/') != "https://api.anthropic.com" {
         return Err(format!(
             "Claude Desktop wrapping does not yet support a custom Anthropic gateway ({anthropic_base_url}); restore the default Anthropic upstream before installing"
@@ -221,6 +227,8 @@ fn install_with(operations: &dyn DesktopOperations, command: InstallRequest) -> 
         .map_or(marketplace_preexisting, |state| state.plugin_preexisting);
     let settings_path = operations.settings_path()?;
     let settings_snapshot = crate::filesystem::snapshot_optional_file(&settings_path)?;
+    let provider_backup_snapshot =
+        crate::filesystem::snapshot_optional_file(&crate::filesystem::backup_path(&settings_path))?;
     state::ensure_private_directory(&install_root)?;
     let generation = uuid::Uuid::now_v7().to_string();
     let mut journal = state::InstallJournal {
@@ -291,6 +299,7 @@ fn install_with(operations: &dyn DesktopOperations, command: InstallRequest) -> 
             proxy_token,
             upstream_proxy: provisional_settings.upstream_proxy.clone(),
             gateway_fingerprint: gateway_fingerprint.clone(),
+            max_hook_payload_bytes,
             configuration_fingerprint,
             certificate,
             settings: settings::SettingsPatch {
@@ -341,6 +350,12 @@ fn install_with(operations: &dyn DesktopOperations, command: InstallRequest) -> 
             marketplace_preexisting,
             command.skip_doctor,
         )?;
+        if plugin_preexisting {
+            // A force migration temporarily restores and re-enables direct provider routing,
+            // which rewrites Claude Code's provider backup. Desktop owns neither that backup nor
+            // its formatting, so preserve it exactly for the pre-existing terminal integration.
+            crate::filesystem::restore_file_snapshot(&provider_backup_snapshot)?;
+        }
         progress.plugin_added = !marketplace_preexisting;
         journal.stage = "plugin_ready".into();
         state::write_journal(&install_root, &journal)?;
@@ -369,6 +384,8 @@ fn install_with(operations: &dyn DesktopOperations, command: InstallRequest) -> 
         settings::matches(&new_state.settings)?;
         operations.wait_for_health(&new_state)?;
         if !command.skip_doctor {
+            journal.stage = "verifying".into();
+            state::write_journal(&install_root, &journal)?;
             operations.post_install_doctor(&marketplace_dir)?;
         }
         if let Some(old) = old_state.as_ref() {
@@ -386,6 +403,7 @@ fn install_with(operations: &dyn DesktopOperations, command: InstallRequest) -> 
             &new_state,
             old_state.as_ref(),
             &settings_snapshot,
+            &provider_backup_snapshot,
             &progress,
             &marketplace_dir,
         );
@@ -628,6 +646,10 @@ fn restore_direct_gateway_plugin(
     if !operations.plugin_exists(marketplace_dir) {
         operations.install_plugin(marketplace_dir, false, true)?;
     }
+    // A retired MCP child from direct mode can leave an authenticated, user-owned gateway
+    // running after its host exits. Clear only Relay's verified owned instance before restoring
+    // direct mode; foreign listeners remain an error and are never adopted or terminated.
+    operations.stop_direct_gateway()?;
     operations.restart_direct_gateway()
 }
 
@@ -636,15 +658,20 @@ fn rollback_install(
     new_state: &state::DesktopState,
     old_state: Option<&state::DesktopState>,
     settings_snapshot: &crate::filesystem::FileSnapshot,
+    provider_backup_snapshot: &crate::filesystem::FileSnapshot,
     progress: &InstallProgress,
     marketplace_dir: &Path,
 ) -> Result<(), String> {
     let mut errors = RollbackErrors::default();
     let current_platform = platform::Platform::parse(&new_state.platform)?;
+    let snapshots = InstallFileSnapshots {
+        settings: settings_snapshot,
+        provider_backup: provider_backup_snapshot,
+    };
     let service_unregistered = undo_new_install_effects(
         operations,
         new_state,
-        settings_snapshot,
+        &snapshots,
         progress,
         marketplace_dir,
         current_platform,
@@ -670,7 +697,7 @@ fn rollback_install(
 fn undo_new_install_effects(
     operations: &dyn DesktopOperations,
     new_state: &state::DesktopState,
-    settings_snapshot: &crate::filesystem::FileSnapshot,
+    snapshots: &InstallFileSnapshots<'_>,
     progress: &InstallProgress,
     marketplace_dir: &Path,
     current_platform: platform::Platform,
@@ -691,7 +718,10 @@ fn undo_new_install_effects(
     if progress.plugin_added {
         errors.record(operations.uninstall_plugin(marketplace_dir));
     }
-    errors.record(crate::filesystem::restore_file_snapshot(settings_snapshot));
+    errors.record(crate::filesystem::restore_file_snapshot(snapshots.settings));
+    errors.record(crate::filesystem::restore_file_snapshot(
+        snapshots.provider_backup,
+    ));
     if progress.trust_installed {
         errors.record(operations.remove_trust(current_platform, &new_state.certificate));
     }
@@ -726,6 +756,7 @@ fn restore_generation_best_effort(
 ) {
     errors.record(ensure_plugin_installed(operations, &installed.install_root));
     errors.record(state::write(installed));
+    errors.record(settings::apply_installed(&installed.settings));
     errors.record(operations.install_trust(current_platform, &installed.certificate));
     errors.record(activate_service(operations, installed));
     errors.record(state::write_locator(&installed.state_path()));
@@ -805,6 +836,9 @@ fn uninstall_with(
     }
     let settings_snapshot =
         crate::filesystem::snapshot_optional_file(&installed.settings.settings_path)?;
+    let provider_backup_snapshot = crate::filesystem::snapshot_optional_file(
+        &crate::filesystem::backup_path(&installed.settings.settings_path),
+    )?;
     let mut journal = state::InstallJournal {
         schema_version: state::STATE_SCHEMA_VERSION,
         operation: "uninstall".into(),
@@ -840,7 +874,13 @@ fn uninstall_with(
         Ok::<(), String>(())
     })();
     if let Err(error) = result {
-        let rollback = rollback_uninstall(operations, &installed, platform, &settings_snapshot);
+        let rollback = rollback_uninstall(
+            operations,
+            &installed,
+            platform,
+            &settings_snapshot,
+            &provider_backup_snapshot,
+        );
         return Err(if rollback.is_ok() {
             format!("{error}; restored Claude Desktop protection")
         } else {
@@ -869,10 +909,14 @@ fn rollback_uninstall(
     installed: &state::DesktopState,
     platform: platform::Platform,
     settings_snapshot: &crate::filesystem::FileSnapshot,
+    provider_backup_snapshot: &crate::filesystem::FileSnapshot,
 ) -> Result<(), String> {
     let mut errors = RollbackErrors::default();
     errors.record(operations.stop_direct_gateway());
     errors.record(crate::filesystem::restore_file_snapshot(settings_snapshot));
+    errors.record(crate::filesystem::restore_file_snapshot(
+        provider_backup_snapshot,
+    ));
     restore_generation_best_effort(operations, installed, platform, &mut errors);
     errors.record(state::remove_file_if_present(&state::journal_path(
         &installed.install_root,
@@ -976,6 +1020,14 @@ fn doctor_report_with(
     operations: &dyn DesktopOperations,
     install_dir: Option<&Path>,
 ) -> Result<DoctorReport, String> {
+    doctor_report_with_verifying_install(operations, install_dir, false)
+}
+
+fn doctor_report_with_verifying_install(
+    operations: &dyn DesktopOperations,
+    install_dir: Option<&Path>,
+    allow_verifying_install: bool,
+) -> Result<DoctorReport, String> {
     let state_path = state::resolve_state_path(install_dir)?;
     let installed = state::read(&state_path)?;
     let platform = platform::Platform::parse(&installed.platform)?;
@@ -990,12 +1042,7 @@ fn doctor_report_with(
     };
     report.push(
         "transaction_journal",
-        (!state::journal_path(&installed.install_root).exists())
-            .then_some("no interrupted install or uninstall operation".into())
-            .ok_or_else(|| {
-                "an interrupted operation requires `nemo-relay install claude-desktop --force` recovery"
-                    .into()
-            }),
+        transaction_journal_status(&installed, allow_verifying_install),
     );
     report.push(
         "application_identity",
@@ -1082,13 +1129,36 @@ fn doctor_report_with(
     Ok(report.finish())
 }
 
-fn plugin_checks(install_dir: Option<&Path>) -> Result<Vec<DoctorCheck>, String> {
+fn transaction_journal_status(
+    installed: &state::DesktopState,
+    allow_verifying_install: bool,
+) -> Result<String, String> {
+    let journal_path = state::journal_path(&installed.install_root);
+    if !journal_path.exists() {
+        return Ok("no interrupted install or uninstall operation".into());
+    }
+    if allow_verifying_install {
+        let journal = state::read_journal(&installed.install_root)?;
+        if journal.operation == "install"
+            && journal.stage == "verifying"
+            && journal.generation == installed.generation
+        {
+            return Ok("current installation generation is being verified".into());
+        }
+    }
+    Err(
+        "an interrupted operation requires `nemo-relay install claude-desktop --force` recovery"
+            .into(),
+    )
+}
+
+fn plugin_checks(install_dir: Option<&Path>, relay: &Path) -> Result<Vec<DoctorCheck>, String> {
     let options =
         crate::installation::marketplace::plugin_doctor_options(install_dir.map(Path::to_path_buf));
-    let readiness = crate::installation::marketplace::collect_marketplace_readiness(
+    let readiness = crate::installation::marketplace::collect_marketplace_readiness_with_relay(
         CodingAgent::ClaudeCode,
         &options,
-        &crate::installation::marketplace::host::RealCommandRunner,
+        relay,
     );
     Ok(readiness
         .checks
@@ -1170,8 +1240,17 @@ pub(crate) async fn run_sidecar(command: SidecarRequest) -> Result<ExitCode, Cli
     let upstream =
         proxy::upstream_client(installed.upstream_proxy.as_ref()).map_err(CliError::Launch)?;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let verifier_state = installed.clone();
     let runtime = proxy::Runtime::new(installed.clone(), tls, shutdown_tx.clone())
-        .map_err(CliError::Launch)?;
+        .map_err(CliError::Launch)?
+        .with_configuration_verifier(move || {
+            let actual = current_configuration_fingerprint(&verifier_state)?;
+            if actual == verifier_state.configuration_fingerprint {
+                Ok(())
+            } else {
+                Err("persistent Relay configuration fingerprint changed".into())
+            }
+        });
     let (gateway_shutdown_tx, gateway_shutdown_rx) = oneshot::channel();
     let mut gateway_task = tokio::spawn(crate::server::serve_claude_desktop_listener_with_dynamic(
         gateway_listener,
@@ -1235,7 +1314,7 @@ async fn platform_shutdown_signal() -> Result<(), String> {
     }
 }
 
-pub(crate) fn validate_hook_environment() -> Result<(), String> {
+fn effective_protected_state() -> Result<Option<state::DesktopState>, String> {
     let path = match settings::effective_state_path()? {
         Some(path) => path,
         None => {
@@ -1246,19 +1325,36 @@ pub(crate) fn validate_hook_environment() -> Result<(), String> {
                         .into(),
                 );
             }
-            return Ok(());
+            return Ok(None);
         }
     };
     let installed = state::read(&path)?;
     settings::effective_environment_matches(&installed.settings)?;
-    let actual = current_configuration_fingerprint(&installed)?;
-    if actual != installed.configuration_fingerprint {
-        return Err("Claude Desktop Relay configuration fingerprint changed".into());
-    }
-    proxy::health(&installed, HEALTH_TIMEOUT).map(|_| ())
+    proxy::health(&installed, HEALTH_TIMEOUT)?;
+    Ok(Some(installed))
 }
 
-fn persistent_gateway_identity() -> Result<(String, String), String> {
+pub(crate) fn hook_gateway() -> Result<Option<crate::bootstrap::PluginGatewaySpec>, String> {
+    let Some(installed) = effective_protected_state()? else {
+        return Ok(None);
+    };
+    Ok(Some(crate::bootstrap::PluginGatewaySpec {
+        gateway: crate::bootstrap::GatewaySpec::new(GATEWAY_BIND)
+            .with_fingerprint(installed.gateway_fingerprint),
+        max_hook_payload_bytes: installed.max_hook_payload_bytes,
+    }))
+}
+
+pub(crate) fn mcp_gateway() -> Result<Option<(String, String)>, String> {
+    Ok(effective_protected_state()?.map(|installed| {
+        (
+            format!("http://{GATEWAY_BIND}"),
+            installed.gateway_fingerprint,
+        )
+    }))
+}
+
+fn persistent_gateway_identity() -> Result<(String, String, usize), String> {
     let resolved = crate::configuration::resolve_persistent_server_config(&Default::default())
         .map_err(|error| error.to_string())?;
     Ok((
@@ -1266,6 +1362,7 @@ fn persistent_gateway_identity() -> Result<(String, String), String> {
             .bootstrap_fingerprint
             .ok_or_else(|| "persistent gateway fingerprint is missing".to_string())?,
         resolved.gateway.anthropic_base_url,
+        resolved.gateway.max_hook_payload_bytes,
     ))
 }
 
@@ -1277,9 +1374,12 @@ fn current_configuration_fingerprint_with(
     operations: &dyn DesktopOperations,
     installed: &state::DesktopState,
 ) -> Result<String, String> {
-    let (gateway, anthropic) = operations.persistent_gateway_identity()?;
+    let (gateway, anthropic, max_hook_payload_bytes) = operations.persistent_gateway_identity()?;
     if anthropic.trim_end_matches('/') != "https://api.anthropic.com" {
         return Err("persistent Anthropic upstream is no longer api.anthropic.com".into());
+    }
+    if max_hook_payload_bytes != installed.max_hook_payload_bytes {
+        return Err("persistent Relay hook payload limit changed".into());
     }
     configuration_fingerprint(
         &installed.generation,

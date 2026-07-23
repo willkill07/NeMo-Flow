@@ -10,6 +10,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 const RELAY_BASE_URLS: [&str; 2] = [crate::bootstrap::DEFAULT_URL, "http://localhost:47632"];
+const INTERCEPTED_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+
+fn uses_intercepted_anthropic_origin(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("api.anthropic.com"))
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct UpstreamProxy {
@@ -102,9 +119,11 @@ fn prepare_with_process_env(
     let original_env = env_object(&value)?.cloned().unwrap_or_default();
     let mut upstream_proxy =
         resolve_upstream_proxy(&original_env, process_env, proxy_url, prior_upstream)?;
-    if let Some(base_url) = unique_case_insensitive_string(process_env, "ANTHROPIC_BASE_URL")? {
+    if let Some(base_url) = unique_case_insensitive_string(process_env, "ANTHROPIC_BASE_URL")?
+        && !uses_intercepted_anthropic_origin(&base_url)
+    {
         return Err(format!(
-            "the installer inherited ANTHROPIC_BASE_URL={base_url:?}; unset it before installing Claude Desktop protection so terminal Claude Code cannot bypass TLS interception"
+            "the installer inherited ANTHROPIC_BASE_URL={base_url:?}, which is a custom endpoint; unset it before installing Claude Desktop protection so terminal Claude Code cannot bypass TLS interception"
         ));
     }
     let mut desired = original_env.clone();
@@ -512,8 +531,12 @@ fn validate_environment_policy(
             ));
         }
     }
-    if unique_case_insensitive_string(env, "ANTHROPIC_BASE_URL")?.is_some() {
-        return Err("effective Claude ANTHROPIC_BASE_URL bypasses Desktop TLS interception".into());
+    if let Some(base_url) = unique_case_insensitive_string(env, "ANTHROPIC_BASE_URL")?
+        && !uses_intercepted_anthropic_origin(&base_url)
+    {
+        return Err(format!(
+            "effective Claude ANTHROPIC_BASE_URL={base_url:?} bypasses Desktop TLS interception; expected {INTERCEPTED_ANTHROPIC_BASE_URL}"
+        ));
     }
     if let Some(no_proxy) = unique_case_insensitive_string(env, "NO_PROXY")?
         && sanitize_no_proxy(&no_proxy) != no_proxy
