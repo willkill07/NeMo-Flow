@@ -5,8 +5,9 @@
 """Opt-in, destructive-to-current-session release gate for Claude Desktop protection.
 
 The test installs user-scoped TLS trust and a login service, invokes the user's real Claude
-subscription, and requires two short visual confirmations in Claude Desktop. It always attempts
-to uninstall on exit. Run it only on a disposable release-gate account with Claude closed.
+subscription, validates isolated ATOF and ATIF file artifacts, and requires two short visual
+confirmations in Claude Desktop. It always attempts to uninstall on exit. Run it only on a
+disposable release-gate account with Claude closed.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -35,6 +37,9 @@ TOOL_SENTINEL = "NEMO_RELAY_CLAUDE_DESKTOP_POC_SENTINEL"
 SERVICE_LABEL = "com.nvidia.nemo-relay.claude-desktop"
 WINDOWS_TASK = "NeMo Relay Claude Desktop"
 LINUX_SERVICE = "nemo-relay-claude-desktop.service"
+ATOF_FILENAME = "events.jsonl"
+ATIF_FILENAME_TEMPLATE = "trajectory-{session_id}.json"
+ATIF_FILENAME_GLOB = "trajectory-*.json"
 
 PROVIDER_ENVIRONMENT = (
     "ANTHROPIC_API_KEY",
@@ -125,6 +130,68 @@ def run(
 def config_home() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME")
     return (Path(base) if base else Path.home() / ".config") / "nemo-relay"
+
+
+def assert_no_user_observability(path: Path) -> None:
+    if not path.is_file():
+        return
+    try:
+        config = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as error:
+        raise PocFailure(f"invalid TOML in {path}: {error}") from error
+    components = config.get("components")
+    if isinstance(components, list) and any(
+        isinstance(component, dict) and component.get("kind") == "observability" for component in components
+    ):
+        raise PocFailure(
+            f"temporarily remove the user-scoped observability component from {path}; "
+            "the live POC installs isolated ATOF and ATIF file exporters and restores the exact baseline afterward"
+        )
+
+
+def toml_string(value: os.PathLike[str] | str) -> str:
+    return json.dumps(os.fspath(value))
+
+
+def observability_component(output_root: Path) -> str:
+    return f"""[[components]]
+kind = "observability"
+enabled = true
+
+[components.config]
+version = 2
+
+[components.config.atof]
+enabled = true
+
+[[components.config.atof.sinks]]
+type = "file"
+output_directory = {toml_string(output_root / "atof")}
+filename = "{ATOF_FILENAME}"
+mode = "overwrite"
+
+[components.config.atif]
+enabled = true
+agent_name = "Claude Desktop live POC"
+output_directory = {toml_string(output_root / "atif")}
+filename_template = "{ATIF_FILENAME_TEMPLATE}"
+"""
+
+
+def configure_observability(path: Path, output_root: Path) -> None:
+    assert_no_user_observability(path)
+    if not path.is_file():
+        raise PocFailure(f"Relay did not create the expected user plugin configuration at {path}")
+    (output_root / "atof").mkdir(parents=True)
+    (output_root / "atif").mkdir()
+    existing = path.read_text(encoding="utf-8")
+    separator = "" if existing.endswith("\n\n") else "\n" if existing.endswith("\n") else "\n\n"
+    rendered = f"{existing}{separator}{observability_component(output_root)}\n"
+    try:
+        tomllib.loads(rendered)
+    except tomllib.TOMLDecodeError as error:
+        raise PocFailure(f"could not compose the live POC observability configuration: {error}") from error
+    path.write_text(rendered, encoding="utf-8")
 
 
 def settings_snapshot() -> tuple[FileSnapshot, FileSnapshot]:
@@ -342,6 +409,87 @@ def assert_pre_tool_guardrail(relay: Path, sentinel: Path, environment: Mapping[
         raise PocFailure("the sentinel tool unexpectedly executed")
 
 
+def load_atof_events(path: Path) -> list[dict[str, object]]:
+    if not path.is_file():
+        raise PocFailure(f"ATOF did not create {path}")
+    events: list[dict[str, object]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise PocFailure(f"could not read ATOF file {path}: {error}") from error
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise PocFailure(f"invalid ATOF JSON at {path}:{line_number}: {error}") from error
+        if not isinstance(event, dict):
+            raise PocFailure(f"ATOF record {path}:{line_number} is not a JSON object")
+        if event.get("atof_version") != "0.1":
+            raise PocFailure(f"ATOF record {path}:{line_number} does not use ATOF 0.1")
+        events.append(event)
+    if not events:
+        raise PocFailure(f"ATOF file {path} is empty")
+    return events
+
+
+def load_atif_trajectories(path: Path) -> list[dict[str, object]]:
+    files = sorted(path.glob(ATIF_FILENAME_GLOB))
+    if not files:
+        raise PocFailure(f"ATIF did not create a {ATIF_FILENAME_GLOB} file in {path}")
+    trajectories: list[dict[str, object]] = []
+    for file in files:
+        try:
+            contents = file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise PocFailure(f"could not read ATIF artifact {file}: {error}") from error
+        try:
+            trajectory = json.loads(contents)
+        except json.JSONDecodeError as error:
+            raise PocFailure(f"invalid ATIF JSON in {file}: {error}") from error
+        if not isinstance(trajectory, dict):
+            raise PocFailure(f"ATIF artifact {file} is not a JSON object")
+        if trajectory.get("schema_version") != "ATIF-v1.7":
+            raise PocFailure(f"ATIF artifact {file} does not use ATIF-v1.7")
+        trajectories.append(trajectory)
+    return trajectories
+
+
+def contains_rewritten_marker(value: object) -> bool:
+    return REWRITTEN_MARKER in json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def validate_observability_artifacts(output_root: Path) -> tuple[int, int]:
+    events = load_atof_events(output_root / "atof" / ATOF_FILENAME)
+    if not any(contains_rewritten_marker(event) for event in events):
+        raise PocFailure("the ATOF event stream does not contain the rewritten live POC request")
+
+    trajectories = load_atif_trajectories(output_root / "atif")
+    matching = [
+        trajectory
+        for trajectory in trajectories
+        if isinstance(trajectory.get("steps"), list)
+        and bool(trajectory["steps"])
+        and contains_rewritten_marker(trajectory)
+    ]
+    if not matching:
+        raise PocFailure("no non-empty ATIF trajectory contains the rewritten live POC request")
+    return len(events), len(trajectories)
+
+
+def wait_for_observability_artifacts(output_root: Path, timeout: float = 15) -> tuple[int, int]:
+    deadline = time.monotonic() + timeout
+    last_error: PocFailure | None = None
+    while time.monotonic() < deadline:
+        try:
+            return validate_observability_artifacts(output_root)
+        except PocFailure as error:
+            last_error = error
+            time.sleep(0.2)
+    raise PocFailure(f"observability artifacts were not complete after {timeout:g} seconds: {last_error}")
+
+
 def require_manual_pass(title: str, instructions: str, sentinel: Path) -> None:
     sentinel.unlink(missing_ok=True)
     print(f"\n--- {title} ---\n{instructions}\n", flush=True)
@@ -450,6 +598,7 @@ class PocRun:
     repo: Path
     work: Path
     workspace: Path
+    observability_root: Path
     sentinel: Path
     relay: Path
     claude: str
@@ -481,6 +630,7 @@ class PocRun:
             repo=repo,
             work=work,
             workspace=workspace,
+            observability_root=work / "observability",
             sentinel=workspace / TOOL_SENTINEL,
             relay=repo / "target" / "debug" / ("nemo-relay.exe" if os.name == "nt" else "nemo-relay"),
             claude=claude,
@@ -499,6 +649,7 @@ class PocRun:
         self.install_desktop()
         self.verify_terminal_paths()
         self.verify_gui_paths()
+        self.verify_observability()
         self.verify_fail_closed()
         self.succeeded = True
 
@@ -507,6 +658,7 @@ class PocRun:
             raise PocFailure(f"remove stale Claude Desktop integration files at {self.install_root} before the POC")
         if self.service_definition_baseline.data is not None or self.service_registration_baseline:
             raise PocFailure("remove the existing Claude Desktop Relay login service before the POC")
+        assert_no_user_observability(self.plugin_paths[0])
         run(["cargo", "build", "-p", "nemo-relay-cli", "--bin", "nemo-relay"], cwd=self.repo)
         dry_run = run(
             [self.relay, "install", "claude-desktop", "--dry-run"],
@@ -535,6 +687,7 @@ class PocRun:
         self.plugin_registered = True
         self.plugin_expected = capture_pair(self.plugin_paths)
         run([self.relay, "plugins", "enable", PLUGIN_ID], cwd=self.workspace)
+        configure_observability(self.plugin_paths[0], self.observability_root)
         self.plugin_expected = capture_pair(self.plugin_paths)
 
     def install_desktop(self) -> None:
@@ -573,6 +726,14 @@ open a Code session for {self.workspace}, and repeat both checks:
 Afterward, quit Claude Desktop completely before typing PASS.
 """.strip()
         require_manual_pass("original Claude icon", icon_instructions, self.sentinel)
+
+    def verify_observability(self) -> None:
+        event_count, trajectory_count = wait_for_observability_artifacts(self.observability_root)
+        print(
+            f"Validated {event_count} raw ATOF events and {trajectory_count} ATIF trajectories "
+            "from the live POC request.",
+            flush=True,
+        )
 
     def verify_fail_closed(self) -> None:
         environment = installed_claude_environment()
@@ -644,8 +805,8 @@ Afterward, quit Claude Desktop completely before typing PASS.
             raise PocFailure("the live POC did not complete")
         shutil.rmtree(self.work)
         print(
-            "PASS: OAuth, request rewriting, PreToolUse rejection, sidecar fail-closed behavior, "
-            "both GUI launch paths, and uninstall restoration were validated."
+            "PASS: OAuth, request rewriting, ATOF and ATIF file observability, PreToolUse rejection, "
+            "sidecar fail-closed behavior, both GUI launch paths, and uninstall restoration were validated."
         )
 
 
@@ -670,8 +831,8 @@ def main() -> int:
         return 0
     poc = PocRun.create(validate_host())
     print(
-        "This test will install current-user TLS trust, a login service, and Claude settings; "
-        "it consumes real Claude subscription requests and requires GUI confirmation.",
+        "This test will install current-user TLS trust, a login service, Claude settings, and isolated "
+        "ATOF and ATIF file exporters; it consumes real Claude subscription requests and requires GUI confirmation.",
         flush=True,
     )
     input("Confirm Claude Desktop and all terminal Claude processes are closed, then press Enter: ")

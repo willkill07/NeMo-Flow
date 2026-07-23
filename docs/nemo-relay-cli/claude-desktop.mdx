@@ -199,9 +199,11 @@ NEMO_RELAY_CLAUDE_DESKTOP_LIVE_POC=1 just test-claude-desktop-live-poc
 
 The same Python runner selects the macOS, Windows, or Linux service adapter. It
 builds temporary test middleware, verifies OAuth without an API key, exposes a
-model-request rewrite, rejects a sentinel `PreToolUse`, stops the sidecar to
-check inference and hook failure, exercises both the protected deep link and
-the original application icon, uninstalls, and compares the prior settings and
+model-request rewrite, and enables isolated ATOF `0.1` JSONL and ATIF v1.7
+file exporters. Both artifacts must contain the rewritten POC request. The
+runner also rejects a sentinel `PreToolUse`, stops the sidecar to check
+inference and hook failure, exercises both the protected deep link and the
+original application icon, uninstalls, and compares the prior settings and
 trust inventory, login-service state, and integration install root. It does not
 promote platform support automatically; attach the runner output to the
 platform's release evidence before updating the support matrix.
