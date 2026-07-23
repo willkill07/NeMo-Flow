@@ -137,6 +137,12 @@ async fn run_command(command: Command, server: &ServerArgs) -> Result<ExitCode, 
             hook_forward::execute(command).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::ClaudeDesktop(command) => {
+            crate::claude_desktop::launch(command.into_runtime()).await
+        }
+        Command::ClaudeDesktopSidecar(command) => {
+            crate::claude_desktop::run_sidecar(command.into_runtime()).await
+        }
         Command::Install(command) => install::install(command),
         Command::Uninstall(command) => install::uninstall(command),
         Command::Run(command) => run::execute(command, server).await,

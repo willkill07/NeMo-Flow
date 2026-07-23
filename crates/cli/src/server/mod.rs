@@ -81,6 +81,7 @@ struct BootstrapServeOptions<'a> {
     ready_file: Option<&'a Path>,
     shutdown_token: Option<String>,
     transparent_proxy_credential: Option<crate::provider_auth::TransparentProxyCredential>,
+    http_client: Option<Client>,
 }
 
 /// Binds the configured address and activates enabled dynamic plugins before serving.
@@ -247,6 +248,33 @@ pub(crate) async fn serve_transparent_listener_with_dynamic(
     .await
 }
 
+/// Serves the persistent Claude Desktop gateway on a caller-owned listener.
+///
+/// The Desktop sidecar supplies an HTTP client with the preserved corporate-proxy policy and the
+/// persistent configuration fingerprint used by installed MCP clients. Unlike an MCP-launched
+/// gateway, this server is lifecycle-bound to the login service and therefore has no idle timer.
+pub(crate) async fn serve_claude_desktop_listener_with_dynamic(
+    listener: TcpListener,
+    config: GatewayConfig,
+    dynamic_plugins: Vec<ActiveDynamicPluginComponent>,
+    bootstrap_fingerprint: String,
+    http_client: Client,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<(), CliError> {
+    serve_listener_with_dynamic_inner(
+        listener,
+        config,
+        dynamic_plugins,
+        Some(ShutdownMode::Receiver(shutdown)),
+        BootstrapServeOptions {
+            fingerprint: Some(bootstrap_fingerprint),
+            http_client: Some(http_client),
+            ..BootstrapServeOptions::default()
+        },
+    )
+    .await
+}
+
 type ShutdownFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 enum ShutdownMode {
@@ -267,6 +295,7 @@ async fn serve_listener_with_dynamic_inner(
         ready_file,
         shutdown_token: bootstrap_shutdown_token,
         transparent_proxy_credential,
+        http_client,
     } = bootstrap;
     let bootstrap_challenge_key = bootstrap_fingerprint
         .as_ref()
@@ -285,13 +314,14 @@ async fn serve_listener_with_dynamic_inner(
         initialize_plugin_host(config.plugin_config.clone(), dynamic_plugins).await?;
     let (bootstrap_shutdown, bootstrap_shutdown_rx) =
         bootstrap_shutdown_channel(bootstrap_shutdown_token.clone());
-    let mut state = AppState::new_with_bootstrap(
+    let mut state = AppState::new_with_bootstrap_and_http(
         config,
         bootstrap_fingerprint,
         bootstrap_challenge_key,
         require_provider_client_token,
         bootstrap_shutdown,
         transparent_proxy_credential,
+        http_client,
     );
     state.bootstrap_tls = bootstrap_tls;
     state.local_address = Some(listener.local_addr()?);
@@ -526,6 +556,7 @@ impl AppState {
         Self::new_with_bootstrap(config, None, None, false, None, None)
     }
 
+    #[cfg(test)]
     fn new_with_bootstrap(
         config: GatewayConfig,
         bootstrap_fingerprint: Option<String>,
@@ -534,14 +565,36 @@ impl AppState {
         bootstrap_shutdown: Option<BootstrapShutdown>,
         transparent_proxy_credential: Option<crate::provider_auth::TransparentProxyCredential>,
     ) -> Self {
+        Self::new_with_bootstrap_and_http(
+            config,
+            bootstrap_fingerprint,
+            bootstrap_challenge_key,
+            require_provider_client_token,
+            bootstrap_shutdown,
+            transparent_proxy_credential,
+            None,
+        )
+    }
+
+    fn new_with_bootstrap_and_http(
+        config: GatewayConfig,
+        bootstrap_fingerprint: Option<String>,
+        bootstrap_challenge_key: Option<BootstrapChallengeKey>,
+        require_provider_client_token: bool,
+        bootstrap_shutdown: Option<BootstrapShutdown>,
+        transparent_proxy_credential: Option<crate::provider_auth::TransparentProxyCredential>,
+        http_client: Option<Client>,
+    ) -> Self {
         let sessions = SessionManager::new(config.clone());
         sessions.start_idle_sweeper();
-        let http = Client::builder()
-            .connect_timeout(HTTP_CONNECT_TIMEOUT)
-            .timeout(HTTP_REQUEST_TIMEOUT)
-            .read_timeout(HTTP_READ_TIMEOUT)
-            .build()
-            .expect("gateway HTTP client configuration is valid");
+        let http = http_client.unwrap_or_else(|| {
+            Client::builder()
+                .connect_timeout(HTTP_CONNECT_TIMEOUT)
+                .timeout(HTTP_REQUEST_TIMEOUT)
+                .read_timeout(HTTP_READ_TIMEOUT)
+                .build()
+                .expect("gateway HTTP client configuration is valid")
+        });
         Self {
             config,
             bootstrap_fingerprint,

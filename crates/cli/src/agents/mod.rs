@@ -78,6 +78,11 @@ impl CodingAgent {
         self.descriptor().direct_hook_entries
     }
 
+    /// Whether this host can inherit the persistent Claude Desktop protection environment.
+    pub(crate) const fn uses_claude_desktop_protection(self) -> bool {
+        matches!(self, Self::ClaudeCode)
+    }
+
     pub(crate) fn minimum_version(self) -> Version {
         let (major, minor, patch) = self.descriptor().minimum_version;
         Version::new(major, minor, patch)

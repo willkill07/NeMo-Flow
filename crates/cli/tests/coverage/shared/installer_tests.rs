@@ -120,6 +120,28 @@ async fn transparent_hook_delivery_authenticates_the_wrapper_gateway() {
 }
 
 #[test]
+fn desktop_hook_validation_applies_only_to_persistent_claude_hooks() {
+    let mut command = HookForwardRequest {
+        agent: CodingAgent::ClaudeCode,
+        gateway_url: None,
+        generation_file: None,
+        generation_token: None,
+        forward_only: false,
+        transparent_run: false,
+        profile: None,
+        session_metadata: None,
+        gateway_mode: None,
+        fail_closed: true,
+    };
+    assert!(should_validate_claude_desktop(&command));
+    command.transparent_run = true;
+    assert!(!should_validate_claude_desktop(&command));
+    command.agent = CodingAgent::Codex;
+    command.transparent_run = false;
+    assert!(!should_validate_claude_desktop(&command));
+}
+
+#[test]
 fn hook_payload_reader_normalizes_blank_input_and_accepts_the_exact_limit() {
     assert_eq!(read_hook_payload_from(" \n\t".as_bytes(), 3).unwrap(), "{}");
     assert_eq!(

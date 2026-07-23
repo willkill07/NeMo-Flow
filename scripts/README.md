@@ -24,6 +24,7 @@ These checks exercise installed coding-agent clients and are intentionally outsi
 
 - `just test-codex-plugin-e2e`
 - `just test-claude-plugin-e2e`
+- `NEMO_RELAY_CLAUDE_DESKTOP_LIVE_POC=1 just test-claude-desktop-live-poc` (installs user TLS trust and a login service, consumes real subscription requests, and pauses for GUI confirmation)
 - `just test-hermes-mcp-e2e`
 
 ## Internal Layout

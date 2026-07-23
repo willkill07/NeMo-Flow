@@ -39,6 +39,7 @@ pub(crate) enum InstallTarget {
     Codex,
     #[value(name = "claude-code", alias = "claude")]
     ClaudeCode,
+    ClaudeDesktop,
     Hermes,
     All,
 }
@@ -48,6 +49,7 @@ impl InstallTarget {
         match self {
             Self::Codex => vec![CodingAgent::Codex],
             Self::ClaudeCode => vec![CodingAgent::ClaudeCode],
+            Self::ClaudeDesktop => Vec::new(),
             Self::Hermes => vec![CodingAgent::Hermes],
             Self::All => vec![
                 CodingAgent::Codex,
@@ -85,6 +87,9 @@ impl UninstallCommand {
 pub(super) fn install(command: InstallCommand) -> Result<ExitCode, CliError> {
     let target = command.host;
     let request = command.into_runtime();
+    if target == InstallTarget::ClaudeDesktop {
+        return crate::claude_desktop::install(request);
+    }
     let candidates = target.agents();
     let agents = if target.is_all() {
         crate::agents::detected_install_integrations(&candidates)
@@ -104,6 +109,9 @@ pub(super) fn install(command: InstallCommand) -> Result<ExitCode, CliError> {
 pub(super) fn uninstall(command: UninstallCommand) -> Result<ExitCode, CliError> {
     let target = command.host;
     let request = command.into_runtime();
+    if target == InstallTarget::ClaudeDesktop {
+        return crate::claude_desktop::uninstall(request);
+    }
     let candidates = target.agents();
     let agents = if target.is_all() {
         crate::agents::installed_integrations(&candidates, request.install_dir.as_deref())

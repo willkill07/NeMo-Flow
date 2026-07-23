@@ -41,6 +41,9 @@ fn execute_plugin_doctor(
     install_dir: Option<PathBuf>,
     json: bool,
 ) -> Result<ExitCode, CliError> {
+    if plugin == InstallTarget::ClaudeDesktop {
+        return crate::claude_desktop::doctor(install_dir, json);
+    }
     let candidates = plugin.agents();
     let agents = if plugin.is_all() {
         crate::agents::installed_integrations(&candidates, install_dir.as_deref())

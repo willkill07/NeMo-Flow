@@ -1,6 +1,6 @@
 ---
 title: "Coding Agent Installation"
-description: "Install and manage persistent NeMo Relay integrations for Claude Code, Codex, and Hermes Agent."
+description: "Install and manage persistent NeMo Relay integrations for Claude Desktop, Claude Code, Codex, and Hermes Agent."
 position: 3
 ---
 {/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -38,6 +38,21 @@ Install `nemo-relay` and ensure that it is available on `PATH` or `%PATH%`.
 The installer does not download a second Relay binary, install a daemon, or
 require an integration-local executable.
 
+Claude Desktop is a separate, explicit integration target because it installs
+current-user TLS trust and a login service in addition to reusing the Claude
+Code plugin:
+
+```bash
+nemo-relay install claude-desktop
+nemo-relay claude-desktop
+```
+
+It wraps both the Desktop Code tab and bare terminal Claude Code while
+preserving Claude subscription OAuth. It is intentionally excluded from
+`install all` and `uninstall all`. Refer to [Claude
+Desktop](/nemo-relay-cli/claude-desktop) for its platform requirements,
+certificate policy, proxy allowlist, and release-gate status.
+
 The selected coding-agent CLI must also be available at a supported version:
 
 - Claude Code 2.1.121 or newer through `claude`.
@@ -56,6 +71,7 @@ Run the command for the coding-agent integration that you want to install:
 nemo-relay install claude-code
 nemo-relay install codex
 nemo-relay install hermes
+nemo-relay install claude-desktop  # explicit; never selected by `all`
 ```
 
 Install every supported host detected on the machine:
@@ -254,6 +270,7 @@ nemo-relay doctor --plugin claude-code
 nemo-relay doctor --plugin codex
 nemo-relay doctor --plugin hermes
 nemo-relay doctor --plugin all
+nemo-relay doctor --plugin claude-desktop
 ```
 
 `nemo-relay doctor` includes every persistent integration it finds. It checks
@@ -267,6 +284,11 @@ missing, or duplicated required hooks. A stopped Codex sidecar is informational;
 the required plugin MCP starts it before the captured turn. Doctor also reports
 newly required forwarded environment names and recommends
 `nemo-relay install codex --force`.
+
+Claude Desktop diagnosis remains explicit: use `doctor --plugin
+claude-desktop`. It is not selected by `doctor --plugin all`, because its
+trusted TLS material and login-service lifecycle are independently
+release-gated.
 
 For Claude Code, doctor also validates version 2.1.121 or newer, the generated
 `alwaysLoad` MCP server, and its generation marker. A stopped sidecar remains
@@ -301,6 +323,7 @@ nemo-relay uninstall claude-code
 nemo-relay uninstall codex
 nemo-relay uninstall hermes
 nemo-relay uninstall all
+nemo-relay uninstall claude-desktop
 ```
 
 Uninstall removes Codex provider configuration and trust for the exact plugin
@@ -309,6 +332,11 @@ metadata. It then removes the host registration and marketplace. Claude Code
 provider routing is restored from the Relay backup. Unrelated user hooks and
 configuration remain unchanged. Hermes uninstall removes only Relay-owned MCP,
 hook, trust, and generation state.
+
+Claude Desktop uninstall restores its field-level Claude settings patch,
+removes the exact generated current-user root and login service, and returns a
+pre-existing Claude Code plugin to direct-gateway mode. Like installation,
+Desktop is not selected by `uninstall all`.
 
 ## Compatibility and Migration
 

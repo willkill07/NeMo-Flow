@@ -1066,6 +1066,11 @@ test-codex-plugin-e2e:
 test-claude-plugin-e2e:
     ./scripts/test-claude-plugin-e2e.sh
 
+# Opt-in: installs current-user TLS trust and a login service, consumes real subscription traffic,
+# and requires GUI confirmation. The environment gate prevents accidental execution.
+test-claude-desktop-live-poc:
+    python3 ./scripts/test-claude-desktop-live-poc.py
+
 # Opt-in: requires a supported Hermes Agent installation and is intentionally outside test-rust/CI.
 test-hermes-mcp-e2e:
     ./scripts/test-hermes-mcp-e2e.sh

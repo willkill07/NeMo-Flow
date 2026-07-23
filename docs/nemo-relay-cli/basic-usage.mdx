@@ -116,6 +116,17 @@ nemo-relay install hermes
 nemo-relay install all
 ```
 
+Claude Desktop is explicit because it adds current-user TLS trust and a login
+service. It is not selected by `all`:
+
+```bash
+nemo-relay install claude-desktop
+nemo-relay claude-desktop --folder .
+```
+
+Refer to [Claude Desktop](/nemo-relay-cli/claude-desktop) for the Code-tab
+traffic policy and platform release gates.
+
 Claude Code and Codex use marketplace plugins. Hermes exposes the same stdio
 MCP lifecycle through user configuration.
 

@@ -14,7 +14,9 @@ pub(crate) use delivery::hook_forward;
 #[cfg(test)]
 pub(crate) use delivery::send_verified_hook_forward_request;
 #[cfg(test)]
-pub(crate) use delivery::{gateway_headers, insert_header, read_hook_payload_from};
+pub(crate) use delivery::{
+    gateway_headers, insert_header, read_hook_payload_from, should_validate_claude_desktop,
+};
 #[cfg(test)]
 pub(crate) use destination::{
     HookGatewayLifecycle, resolve_hook_destination, transparent_gateway_spec,

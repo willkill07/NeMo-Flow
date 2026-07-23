@@ -437,6 +437,27 @@ impl CommandOutput {
             stderr: String::new(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(status: i32, stdout: String, stderr: String) -> Self {
+        Self {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+
+    pub(crate) const fn status(&self) -> i32 {
+        self.status
+    }
+
+    pub(crate) fn stdout(&self) -> &str {
+        &self.stdout
+    }
+
+    pub(crate) fn stderr(&self) -> &str {
+        &self.stderr
+    }
 }
 
 pub(crate) trait CommandRunner {

@@ -124,6 +124,32 @@ fn cli_parses_native_mcp_subcommand_and_bind_override() {
 }
 
 #[test]
+fn cli_parses_claude_desktop_contract_and_keeps_it_out_of_all() {
+    let cli =
+        Cli::try_parse_from(["nemo-relay", "claude-desktop", "--folder", "/tmp/project"]).unwrap();
+    assert!(matches!(cli.command, Some(Command::ClaudeDesktop(_))));
+
+    let install = Cli::try_parse_from(["nemo-relay", "install", "claude-desktop"]).unwrap();
+    assert!(matches!(install.command, Some(Command::Install(_))));
+    assert!(
+        install::InstallTarget::All
+            .agents()
+            .iter()
+            .all(|agent| agent.install_arg() != "claude-desktop")
+    );
+
+    let doctor = Cli::try_parse_from([
+        "nemo-relay",
+        "doctor",
+        "--plugin",
+        "claude-desktop",
+        "--json",
+    ])
+    .unwrap();
+    assert!(matches!(doctor.command, Some(Command::Doctor(_))));
+}
+
+#[test]
 fn cli_logging_options_override_environment_source() {
     let _environment = crate::test_support::EnvScope::set(&[
         (

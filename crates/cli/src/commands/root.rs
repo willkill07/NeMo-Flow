@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use super::completions::CompletionsCommand;
 use super::configure::ConfigCommand;
@@ -14,6 +16,34 @@ use super::plugins::PluginsCommand;
 use super::run::{EasyPathCommand, RunCommand};
 use super::serve::ServerArgs;
 use crate::agents::CodingAgent;
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ClaudeDesktopCommand {
+    /// Folder to open in a new Claude Desktop Code session (defaults to the current directory).
+    #[arg(long)]
+    pub(crate) folder: Option<PathBuf>,
+}
+
+impl ClaudeDesktopCommand {
+    pub(crate) fn into_runtime(self) -> crate::claude_desktop::LaunchRequest {
+        crate::claude_desktop::LaunchRequest {
+            folder: self.folder,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ClaudeDesktopSidecarCommand {
+    /// Installer-owned state file for this service generation.
+    #[arg(long)]
+    pub(crate) state: PathBuf,
+}
+
+impl ClaudeDesktopSidecarCommand {
+    pub(crate) fn into_runtime(self) -> crate::claude_desktop::SidecarRequest {
+        crate::claude_desktop::SidecarRequest { state: self.state }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -49,6 +79,12 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum Command {
+    /// Open a protected Claude Desktop Code session.
+    #[command(
+        long_about = "Open the Claude Desktop Code tab through the explicitly installed, fail-closed NeMo Relay sidecar. The command verifies TLS trust, authenticated proxy settings, plugin hooks, service identity, and the persistent gateway configuration before opening Claude. Run `nemo-relay install claude-desktop` first.",
+        after_help = "Examples:\n  nemo-relay claude-desktop\n  nemo-relay claude-desktop --folder ./my-project"
+    )]
+    ClaudeDesktop(ClaudeDesktopCommand),
     /// Run Claude Code with observability (setup on first use)
     #[command(
         long_about = "Run Anthropic's `claude` CLI under an ephemeral NeMo Relay gateway. \
@@ -123,11 +159,15 @@ pub(crate) enum Command {
     /// Internal: subprocess used by installed hooks to forward events. Not typed by humans.
     #[command(hide = true)]
     HookForward(HookForwardCommand),
+    /// Internal: persistent per-user Claude Desktop gateway and authenticated proxy.
+    #[command(hide = true)]
+    ClaudeDesktopSidecar(ClaudeDesktopSidecarCommand),
 }
 
 impl Command {
     pub(crate) fn log_name(&self) -> &'static str {
         match self {
+            Self::ClaudeDesktop(_) => "claude_desktop",
             Self::Claude(_) => "claude",
             Self::Codex(_) => "codex",
             Self::Hermes(_) => "hermes",
@@ -142,6 +182,7 @@ impl Command {
             Self::Completions(_) => "completions",
             Self::Run(_) => "run",
             Self::HookForward(_) => "hook_forward",
+            Self::ClaudeDesktopSidecar(_) => "claude_desktop_sidecar",
         }
     }
 

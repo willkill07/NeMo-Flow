@@ -6,6 +6,7 @@
 mod agents;
 mod banner;
 mod bootstrap;
+mod claude_desktop;
 mod commands;
 mod configuration;
 mod diagnostics;
