@@ -40,7 +40,7 @@ static FIXED_PORT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_
 #[derive(Default)]
 struct InstallProgress {
     trust_installed: bool,
-    service_registered: bool,
+    service_registration_attempted: bool,
     plugin_added: bool,
     settings_applied: bool,
     locator_written: bool,
@@ -326,8 +326,8 @@ fn install_with(operations: &dyn DesktopOperations, command: InstallRequest) -> 
         journal.stage = "certificate_trusted".into();
         state::write_journal(&install_root, &journal)?;
 
+        progress.service_registration_attempted = true;
         operations.register_service(&new_state)?;
-        progress.service_registered = true;
         operations.start_service(&new_state)?;
         operations.wait_for_health(&new_state)?;
         journal.stage = "sidecar_healthy".into();
@@ -473,6 +473,9 @@ fn recover_interrupted_operation(
         }
         remove_generation(install_root, &journal.generation)?;
         state::remove_file_if_present(&state::journal_path(install_root))?;
+        if journal.old_state.is_none() {
+            remove_fresh_install_root(install_root)?;
+        }
         println!(
             "recovered interrupted Claude Desktop install preparation for generation {}",
             journal.generation
@@ -557,6 +560,9 @@ fn recover_interrupted_operation(
         }
     }
     state::remove_file_if_present(&state::journal_path(install_root))?;
+    if journal.operation == "install" && journal.old_state.is_none() && current.is_some() {
+        remove_fresh_install_root(install_root)?;
+    }
     println!(
         "recovered interrupted Claude Desktop {} operation for generation {}",
         journal.operation, journal.generation
@@ -635,7 +641,7 @@ fn rollback_install(
 ) -> Result<(), String> {
     let mut errors = RollbackErrors::default();
     let current_platform = platform::Platform::parse(&new_state.platform)?;
-    undo_new_install_effects(
+    let service_unregistered = undo_new_install_effects(
         operations,
         new_state,
         settings_snapshot,
@@ -651,7 +657,13 @@ fn rollback_install(
         current_platform,
         &mut errors,
     );
-    cleanup_failed_install(new_state, old_state, progress, &mut errors);
+    cleanup_failed_install(
+        new_state,
+        old_state,
+        progress,
+        service_unregistered,
+        &mut errors,
+    );
     errors.finish()
 }
 
@@ -663,11 +675,16 @@ fn undo_new_install_effects(
     marketplace_dir: &Path,
     current_platform: platform::Platform,
     errors: &mut RollbackErrors,
-) {
+) -> bool {
     operations.shutdown_proxy(new_state);
-    if progress.service_registered {
-        errors.record(operations.unregister_service(new_state));
-    }
+    let service_unregistered = if progress.service_registration_attempted {
+        let result = operations.unregister_service(new_state);
+        let succeeded = result.is_ok();
+        errors.record(result);
+        succeeded
+    } else {
+        true
+    };
     if progress.settings_applied {
         errors.record(settings::restore(&new_state.settings).map(|_| ()));
     }
@@ -678,6 +695,7 @@ fn undo_new_install_effects(
     if progress.trust_installed {
         errors.record(operations.remove_trust(current_platform, &new_state.certificate));
     }
+    service_unregistered
 }
 
 fn restore_install_predecessor(
@@ -717,6 +735,7 @@ fn cleanup_failed_install(
     new_state: &state::DesktopState,
     old_state: Option<&state::DesktopState>,
     progress: &InstallProgress,
+    service_unregistered: bool,
     errors: &mut RollbackErrors,
 ) {
     if old_state.is_none() && progress.locator_written {
@@ -729,6 +748,9 @@ fn cleanup_failed_install(
     errors.record(state::remove_file_if_present(&state::journal_path(
         &new_state.install_root,
     )));
+    if old_state.is_none() && service_unregistered {
+        errors.record(remove_fresh_install_root(&new_state.install_root));
+    }
 }
 
 pub(crate) fn uninstall(command: UninstallRequest) -> Result<ExitCode, CliError> {
@@ -1361,6 +1383,22 @@ fn remove_generation(root: &Path, generation: &str) -> Result<(), String> {
         ));
     }
     match std::fs::remove_dir_all(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("failed to remove {}: {error}", path.display())),
+    }
+}
+
+fn remove_fresh_install_root(root: &Path) -> Result<(), String> {
+    for name in ["sidecar.stdout.log", "sidecar.stderr.log"] {
+        state::remove_file_if_present(&root.join(name))?;
+    }
+    remove_empty_directory(&root.join("generations"))?;
+    remove_empty_directory(root)
+}
+
+fn remove_empty_directory(path: &Path) -> Result<(), String> {
+    match std::fs::remove_dir(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("failed to remove {}: {error}", path.display())),

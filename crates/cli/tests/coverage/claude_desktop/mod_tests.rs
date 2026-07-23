@@ -15,6 +15,7 @@ struct FakeOperations {
     anthropic_base_url: RefCell<String>,
     healthy: Cell<bool>,
     doctor_healthy: Cell<bool>,
+    write_service_logs: Cell<bool>,
     failure: RefCell<Option<String>>,
     calls: RefCell<Vec<String>>,
 }
@@ -35,6 +36,7 @@ impl FakeOperations {
             anthropic_base_url: RefCell::new("https://api.anthropic.com".into()),
             healthy: Cell::new(true),
             doctor_healthy: Cell::new(true),
+            write_service_logs: Cell::new(false),
             failure: RefCell::new(None),
             calls: RefCell::new(Vec::new()),
         }
@@ -170,8 +172,18 @@ impl DesktopOperations for FakeOperations {
         self.step("register_service")
     }
 
-    fn start_service(&self, _installed: &state::DesktopState) -> Result<(), String> {
-        self.step("start_service")
+    fn start_service(&self, installed: &state::DesktopState) -> Result<(), String> {
+        self.step("start_service")?;
+        if self.write_service_logs.get() {
+            std::fs::write(installed.install_root.join("sidecar.stdout.log"), b"")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(
+                installed.install_root.join("sidecar.stderr.log"),
+                b"sidecar failed",
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     fn stop_service(&self, _installed: &state::DesktopState) -> Result<(), String> {
@@ -474,6 +486,7 @@ fn uninstall_repairs_a_missing_preexisting_terminal_plugin() {
 #[test]
 fn install_failure_rolls_back_settings_trust_service_and_plugin() {
     let fixture = LifecycleFixture::new(platform::Platform::Linux, false);
+    fixture.operations.write_service_logs.set(true);
     fixture.operations.fail_once("post_install_doctor");
     let error =
         install_with(&fixture.operations, fixture.install_request(false, false)).unwrap_err();
@@ -485,6 +498,20 @@ fn install_failure_rolls_back_settings_trust_service_and_plugin() {
     assert!(fixture.operations.called("remove_trust"));
     assert!(fixture.operations.called("uninstall_plugin"));
     assert!(!fixture.operations.plugin_present.get());
+    assert!(!fixture.marketplace_dir.join("claude-desktop").exists());
+}
+
+#[test]
+fn service_registration_failure_attempts_unregistration_before_cleanup() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    fixture.operations.fail_once("register_service");
+
+    let error =
+        install_with(&fixture.operations, fixture.install_request(false, true)).unwrap_err();
+
+    assert!(error.contains("injected register_service failure"));
+    assert!(fixture.operations.called("unregister_service"));
+    assert!(!fixture.marketplace_dir.join("claude-desktop").exists());
 }
 
 #[test]
@@ -604,6 +631,7 @@ fn failed_linux_ca_composition_recovers_the_preparation_journal() {
     assert!(error.contains("restored the previous Claude Desktop generation"));
     assert!(!fixture.state_path().exists());
     assert!(!state::journal_path(&fixture.marketplace_dir.join("claude-desktop")).exists());
+    assert!(!fixture.marketplace_dir.join("claude-desktop").exists());
 }
 
 #[test]
@@ -1223,4 +1251,18 @@ fn rollback_error_collection_preserves_every_failure() {
         errors.finish().unwrap_err(),
         "trust rollback failed; service rollback failed"
     );
+}
+
+#[test]
+fn fresh_install_cleanup_preserves_unknown_files() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let install_root = fixture.marketplace_dir.join("claude-desktop");
+    std::fs::create_dir_all(install_root.join("generations")).unwrap();
+    std::fs::write(install_root.join("sidecar.stdout.log"), b"known log").unwrap();
+    std::fs::write(install_root.join("foreign-file"), b"preserve me").unwrap();
+
+    assert!(remove_fresh_install_root(&install_root).is_err());
+    assert!(install_root.join("foreign-file").exists());
+    assert!(!install_root.join("sidecar.stdout.log").exists());
+    assert!(install_root.exists());
 }
