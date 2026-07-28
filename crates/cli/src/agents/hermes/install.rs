@@ -9,28 +9,36 @@ use crate::error::CliError;
 use crate::installation::marketplace::HostPluginReadiness;
 use crate::installation::marketplace::host::{
     CommandRunner, RealCommandRunner, require_host_cli, require_relay, validate_host_version,
-    validate_relay_hook_forward, validate_relay_mcp,
+    validate_relay_hook_forward,
 };
 use crate::installation::marketplace::state::PluginInstallOptions;
 use crate::installation::{InstallRequest, UninstallRequest};
 
 pub(crate) fn install(command: InstallRequest) -> Result<ExitCode, CliError> {
-    let options = options(command.dry_run, command.skip_doctor, command.force);
+    let options = options(
+        command.install_dir.clone(),
+        command.dry_run,
+        command.skip_doctor,
+        command.force,
+    );
     let runner = RealCommandRunner;
     require_host_cli(CodingAgent::Hermes, &options, &runner).map_err(CliError::Install)?;
     validate_host_version(CodingAgent::Hermes, &options, &runner).map_err(CliError::Install)?;
     let relay = require_relay(&options, &runner).map_err(CliError::Install)?;
     validate_relay_hook_forward(&relay, &options, &runner).map_err(CliError::Install)?;
-    validate_relay_mcp(&relay, &options, &runner).map_err(CliError::Install)?;
     let config = config_path().map_err(CliError::Install)?;
     if options.dry_run {
-        println!("configure Hermes MCP and hooks at {}", config.display());
+        println!(
+            "configure Hermes proxy environment and hooks at {}",
+            config.display()
+        );
         return Ok(ExitCode::SUCCESS);
     }
-    super::install_persistent(&config, &relay)
+    super::install_persistent(&config, &relay, Some(&options.install_dir))
         .map_err(|error| CliError::Install(error.to_string()))?;
     if !options.skip_doctor {
-        super::diagnose_persistent(&config).map_err(CliError::Install)?;
+        super::diagnose_persistent(&config, Some(&options.install_dir))
+            .map_err(CliError::Install)?;
     }
     println!("installed Hermes integration");
     Ok(ExitCode::SUCCESS)
@@ -40,7 +48,7 @@ pub(crate) fn uninstall(command: UninstallRequest) -> Result<ExitCode, CliError>
     let config = config_path().map_err(CliError::Install)?;
     if command.dry_run {
         println!(
-            "remove Relay-owned Hermes MCP and hooks from {}",
+            "remove Relay-owned Hermes proxy environment and hooks from {}",
             config.display()
         );
         return Ok(ExitCode::SUCCESS);
@@ -58,14 +66,17 @@ pub(crate) fn config_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "cannot determine home directory (set HOME or USERPROFILE)".into())
 }
 
-fn options(dry_run: bool, skip_doctor: bool, force: bool) -> PluginInstallOptions {
-    PluginInstallOptions {
-        install_dir: PathBuf::new(),
-        operation_lock_dir: PathBuf::new(),
-        force,
-        dry_run,
-        skip_doctor,
-    }
+fn options(
+    install_dir: Option<PathBuf>,
+    dry_run: bool,
+    skip_doctor: bool,
+    force: bool,
+) -> PluginInstallOptions {
+    let mut options = crate::installation::marketplace::plugin_doctor_options(install_dir);
+    options.force = force;
+    options.dry_run = dry_run;
+    options.skip_doctor = skip_doctor;
+    options
 }
 
 pub(crate) fn doctor(
@@ -171,21 +182,15 @@ pub(crate) fn collect_readiness(
                 validate_relay_hook_forward(&relay, options, runner)
                     .map(|_| "hook-forward is supported".into()),
             );
-            readiness.push(
-                "Relay MCP support",
-                validate_relay_mcp(&relay, options, runner)
-                    .map(|_| "native mcp subcommand is supported".into()),
-            );
         }
         Err(error) => {
             let unavailable = || format!("cannot verify configured Relay capabilities: {error}");
             readiness.push("Relay hook support", Err(unavailable()));
-            readiness.push("Relay MCP support", Err(unavailable()));
         }
     }
     readiness.push(
-        "Hermes MCP, hooks, and trust",
-        super::diagnose_persistent(config),
+        "Hermes proxy, hooks, and trust",
+        super::diagnose_persistent(config, Some(&options.install_dir)),
     );
     readiness
 }

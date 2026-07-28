@@ -866,6 +866,7 @@ docs:
     #!/usr/bin/env bash
     {{ bash_helpers }}
     ensure_docs_dependencies
+    uv run --no-sync python scripts/docs/test_sync_fern_docs_branch.py
     generate_docs_api_references
     cd "$NEMO_RELAY_REPO_ROOT/fern"
     npx fern check --warnings
@@ -876,6 +877,7 @@ docs-linkcheck:
     #!/usr/bin/env bash
     {{ bash_helpers }}
     ensure_docs_dependencies
+    uv run --no-sync python scripts/docs/test_sync_fern_docs_branch.py
     generate_docs_api_references
     cd "$NEMO_RELAY_REPO_ROOT/fern"
     npx fern check --warnings
@@ -1067,14 +1069,15 @@ test-claude-plugin-e2e:
     ./scripts/test-claude-plugin-e2e.sh
 
 # Opt-in: installs current-user TLS trust and a login service, consumes real subscription traffic,
-# validates ATOF and ATIF file output, and requires GUI confirmation.
+# verifies doctor/uninstall restoration, and requires GUI confirmation.
 # The environment gate prevents accidental execution.
 test-claude-desktop-live-poc:
-    python3 ./scripts/test-claude-desktop-live-poc.py
+    ./scripts/test-claude-desktop-live-poc.sh
 
-# Opt-in: requires a supported Hermes Agent installation and is intentionally outside test-rust/CI.
-test-hermes-mcp-e2e:
-    ./scripts/test-hermes-mcp-e2e.sh
+# Opt-in provisioned release lane: requires Hermes plus an unknown-provider command. Once selected
+# with NEMO_RELAY_HERMES_LIVE_E2E=1, missing prerequisites and classification evidence fail.
+test-hermes-agent-proxy-e2e:
+    ./scripts/test-hermes-agent-proxy-e2e.sh
 
 # --set [output_dir=<path>] [ci=true|false]
 test-rust:
@@ -1245,7 +1248,10 @@ test-python-plugin-e2e:
 
     uv build --wheel --out-dir "$tmp/wheels" python/plugin
     cargo build -p nemo-relay-cli
+    cargo build -p nemo-relay-cli --features internal-test-server \
+        --bin nemo-relay-internal-managed-server
     cli="$NEMO_RELAY_REPO_ROOT/target/debug/nemo-relay"
+    internal_server="$NEMO_RELAY_REPO_ROOT/target/debug/nemo-relay-internal-managed-server"
     config="$tmp/gateway.toml"
     # Explicit --config paths must exist; plugin state is written to sibling files.
     : > "$config"
@@ -1260,7 +1266,8 @@ test-python-plugin-e2e:
 
     port="$("$python_executable" -c \
         'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
-    "$cli" --config "$config" --bind "127.0.0.1:$port" >"$tmp/gateway.log" 2>&1 &
+    "$internal_server" --config "$config" --bind "127.0.0.1:$port" \
+        >"$tmp/gateway.log" 2>&1 &
     gateway_pid=$!
     gateway_ready_timeout_seconds=30
     gateway_ready_deadline=$((SECONDS + gateway_ready_timeout_seconds))

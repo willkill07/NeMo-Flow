@@ -18,7 +18,12 @@ struct FakeOperations {
     write_service_logs: Cell<bool>,
     mutate_provider_backup_on_install: Cell<bool>,
     mutate_settings_on_install: Cell<bool>,
-    failure: RefCell<Option<String>>,
+    generate_hook_on_install: Cell<bool>,
+    generated_hook_command: RefCell<Option<String>>,
+    occupy_first_started_endpoint: Cell<bool>,
+    handoff_health_failure: Cell<bool>,
+    occupied_endpoint: RefCell<Option<std::net::TcpListener>>,
+    failures: RefCell<Vec<String>>,
     calls: RefCell<Vec<String>>,
 }
 
@@ -41,22 +46,33 @@ impl FakeOperations {
             write_service_logs: Cell::new(false),
             mutate_provider_backup_on_install: Cell::new(false),
             mutate_settings_on_install: Cell::new(false),
-            failure: RefCell::new(None),
+            generate_hook_on_install: Cell::new(false),
+            generated_hook_command: RefCell::new(None),
+            occupy_first_started_endpoint: Cell::new(false),
+            handoff_health_failure: Cell::new(false),
+            occupied_endpoint: RefCell::new(None),
+            failures: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
         }
     }
 
     fn step(&self, name: &str) -> Result<(), String> {
         self.calls.borrow_mut().push(name.into());
-        if self.failure.borrow().as_deref() != Some(name) {
+        if self.failures.borrow().first().map(String::as_str) != Some(name) {
             return Ok(());
         }
-        self.failure.borrow_mut().take();
+        self.failures.borrow_mut().remove(0);
         Err(format!("injected {name} failure"))
     }
 
     fn fail_once(&self, name: &str) {
-        *self.failure.borrow_mut() = Some(name.into());
+        self.failures.borrow_mut().push(name.into());
+    }
+
+    fn fail_in_order(&self, names: &[&str]) {
+        self.failures
+            .borrow_mut()
+            .extend(names.iter().map(|name| (*name).to_string()));
     }
 
     fn called(&self, name: &str) -> bool {
@@ -86,6 +102,11 @@ impl DesktopOperations for FakeOperations {
     fn application_identity(&self, _platform: platform::Platform) -> Result<String, String> {
         self.step("application_identity")?;
         Ok("Claude test application".into())
+    }
+
+    fn service_identity(&self, platform: platform::Platform) -> Result<Option<String>, String> {
+        self.step("service_identity")?;
+        Ok((platform == platform::Platform::Windows).then(|| "S-1-5-21-1000".into()))
     }
 
     fn active_claude_processes(
@@ -130,11 +151,20 @@ impl DesktopOperations for FakeOperations {
 
     fn install_plugin(
         &self,
-        _marketplace_dir: &Path,
+        marketplace_dir: &Path,
         _force: bool,
         _skip_doctor: bool,
     ) -> Result<(), String> {
         self.step("install_plugin")?;
+        if self.generate_hook_on_install.get() {
+            let command = crate::hooks::persistent_hook_forward_command(
+                &self.relay_binary,
+                CodingAgent::ClaudeCode,
+                &marketplace_dir.join("plugins/nemo-relay-plugin/.nemo-relay-generation"),
+                "test-plugin-generation",
+            )?;
+            *self.generated_hook_command.borrow_mut() = Some(command);
+        }
         if self.mutate_provider_backup_on_install.get() {
             let backup = crate::filesystem::backup_path(&self.settings_path);
             if let Some(parent) = backup.parent() {
@@ -157,7 +187,7 @@ impl DesktopOperations for FakeOperations {
                 .ok_or_else(|| "test Claude env settings are not an object".to_string())?;
             env.insert(
                 "ANTHROPIC_BASE_URL".into(),
-                serde_json::Value::String(format!("http://{GATEWAY_BIND}")),
+                serde_json::Value::String(format!("http://{LEGACY_PROXY_BIND}")),
             );
             let mut bytes =
                 serde_json::to_vec_pretty(&settings).map_err(|error| error.to_string())?;
@@ -172,14 +202,6 @@ impl DesktopOperations for FakeOperations {
         self.step("uninstall_plugin")?;
         self.plugin_present.set(false);
         Ok(())
-    }
-
-    fn stop_direct_gateway(&self) -> Result<(), String> {
-        self.step("stop_direct_gateway")
-    }
-
-    fn restart_direct_gateway(&self) -> Result<(), String> {
-        self.step("restart_direct_gateway")
     }
 
     fn shutdown_proxy(&self, _installed: &state::DesktopState) {
@@ -208,12 +230,18 @@ impl DesktopOperations for FakeOperations {
 
     fn start_service(&self, installed: &state::DesktopState) -> Result<(), String> {
         self.step("start_service")?;
+        if self.occupy_first_started_endpoint.replace(false) {
+            let listener = std::net::TcpListener::bind(installed.bind)
+                .map_err(|error| format!("failed to simulate endpoint handoff race: {error}"))?;
+            *self.occupied_endpoint.borrow_mut() = Some(listener);
+            self.handoff_health_failure.set(true);
+        }
         if self.write_service_logs.get() {
-            std::fs::write(installed.install_root.join("sidecar.stdout.log"), b"")
+            std::fs::write(installed.install_root.join("proxy.stdout.log"), b"")
                 .map_err(|error| error.to_string())?;
             std::fs::write(
-                installed.install_root.join("sidecar.stderr.log"),
-                b"sidecar failed",
+                installed.install_root.join("proxy.stderr.log"),
+                b"proxy failed",
             )
             .map_err(|error| error.to_string())?;
         }
@@ -230,6 +258,9 @@ impl DesktopOperations for FakeOperations {
 
     fn wait_for_health(&self, _installed: &state::DesktopState) -> Result<(), String> {
         self.step("wait_for_health")?;
+        if self.handoff_health_failure.replace(false) {
+            return Err("simulated endpoint handoff race".into());
+        }
         self.healthy.set(true);
         Ok(())
     }
@@ -237,15 +268,15 @@ impl DesktopOperations for FakeOperations {
     fn health(&self, installed: &state::DesktopState) -> Result<proxy::Health, String> {
         self.step("health")?;
         if !self.healthy.get() {
-            return Err("injected unhealthy sidecar".into());
+            return Err("injected unhealthy proxy".into());
         }
         Ok(proxy::Health {
-            service: "nemo-relay-claude-desktop".into(),
+            service: "nemo-relay-agent-proxy".into(),
             version: installed.relay_version.clone(),
             generation: installed.generation.clone(),
             configuration_fingerprint: installed.configuration_fingerprint.clone(),
-            gateway_url: format!("http://{GATEWAY_BIND}"),
-            proxy_url: format!("http://{PROXY_BIND}"),
+            gateway_url: format!("https://{}", installed.bind),
+            proxy_url: format!("https://{}", installed.bind),
         })
     }
 
@@ -348,7 +379,7 @@ impl LifecycleFixture {
 
     fn state_path(&self) -> PathBuf {
         self.marketplace_dir
-            .join("claude-desktop")
+            .join("agent-proxy")
             .join(state::STATE_FILE_NAME)
     }
 
@@ -364,13 +395,19 @@ impl LifecycleFixture {
         old_state: Option<state::DesktopState>,
     ) {
         state::write_journal(
-            &self.marketplace_dir.join("claude-desktop"),
+            &self.marketplace_dir.join("agent-proxy"),
             &state::InstallJournal {
                 schema_version: state::STATE_SCHEMA_VERSION,
                 operation: operation.into(),
                 stage: stage.into(),
                 generation: generation.into(),
                 old_state,
+                settings_snapshot: None,
+                provider_backup_snapshot: None,
+                marketplace_snapshot: None,
+                settings_result_snapshot: None,
+                provider_backup_result_snapshot: None,
+                marketplace_result_snapshot: None,
             },
         )
         .unwrap();
@@ -400,7 +437,6 @@ fn assert_successful_lifecycle(platform: platform::Platform) {
     install_with(&fixture.operations, fixture.install_request(false, false)).unwrap();
     let installed = fixture.installed_state();
     assert_eq!(installed.platform, platform.as_str());
-    assert!(!installed.plugin_preexisting);
     assert_platform_settings(platform, &installed);
     assert!(certificate::certificate_files_exist(&installed.certificate));
     assert!(fixture.operations.called("post_install_doctor"));
@@ -423,28 +459,142 @@ fn deep_link_percent_encodes_folder_exactly() {
 }
 
 #[test]
-fn desktop_ports_are_fixed_loopback_endpoints() {
-    assert_eq!(GATEWAY_BIND.to_string(), "127.0.0.1:47632");
-    assert_eq!(PROXY_BIND.to_string(), "127.0.0.1:47633");
+fn coding_agent_proxy_uses_one_dynamic_loopback_endpoint() {
+    assert!(LEGACY_PROXY_BIND.ip().is_loopback());
+    assert_ne!(LEGACY_PROXY_BIND, PROXY_BIND);
+    let selected = select_proxy_bind().unwrap();
+    assert!(selected.ip().is_loopback());
+    assert_ne!(selected.port(), 0);
+    let first_user = proxy_port_candidates(1_000).collect::<Vec<_>>();
+    let second_user = proxy_port_candidates(1_001).collect::<Vec<_>>();
+    assert_eq!(first_user.len(), usize::from(USER_PORT_PROBE_COUNT));
+    assert!(
+        first_user.iter().all(|port| {
+            (USER_PORT_BASE..USER_PORT_BASE + USER_PORT_SPAN as u16).contains(port)
+        })
+    );
+    assert_ne!(first_user[0], second_user[0]);
 }
 
 #[test]
-fn hook_and_mcp_environments_are_optional_before_install_and_fail_closed_after_install() {
+fn dynamic_proxy_port_candidates_never_include_the_legacy_listener() {
+    let user_key = (0..u64::from(USER_PORT_SPAN))
+        .find(|user_key| {
+            let offset =
+                ((user_key.wrapping_mul(2_654_435_761)) % u64::from(USER_PORT_SPAN)) as u16;
+            USER_PORT_BASE + offset == LEGACY_PROXY_BIND.port()
+        })
+        .expect("one user-derived offset must map to the legacy port");
+
+    let candidates = proxy_port_candidates(user_key).collect::<Vec<_>>();
+
+    assert_eq!(candidates.len(), usize::from(USER_PORT_PROBE_COUNT));
+    assert!(!candidates.contains(&LEGACY_PROXY_BIND.port()));
+}
+
+#[test]
+fn dynamic_proxy_port_selection_advances_past_a_collision() {
+    let (user_key, first_port, _reservation) = (0..u64::from(USER_PORT_SPAN))
+        .find_map(|user_key| {
+            let first_port = proxy_port_candidates(user_key).next().unwrap();
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, first_port))
+                .ok()
+                .map(|listener| (user_key, first_port, listener))
+        })
+        .expect("a candidate port must be available for the collision test");
+
+    let selected = select_proxy_bind_for_user(user_key).unwrap();
+
+    assert_eq!(selected.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_ne!(selected.port(), first_port);
+    assert!(proxy_port_candidates(user_key).any(|port| port == selected.port()));
+}
+
+#[test]
+fn dynamic_proxy_port_selection_falls_back_after_all_candidates_collide() {
+    let (user_key, reservations) = (0..u64::from(USER_PORT_SPAN))
+        .find_map(|user_key| {
+            let mut reservations = Vec::new();
+            for port in proxy_port_candidates(user_key) {
+                match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                    Ok(listener) => reservations.push(listener),
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return None,
+                    Err(error) => panic!("failed to reserve candidate port {port}: {error}"),
+                }
+            }
+            Some((user_key, reservations))
+        })
+        .expect("a complete candidate range must be available for the fallback test");
+    let candidates = proxy_port_candidates(user_key).collect::<Vec<_>>();
+
+    let selected = select_proxy_bind_for_user(user_key).unwrap();
+
+    assert_eq!(selected.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_ne!(selected.port(), 0);
+    assert!(!candidates.contains(&selected.port()));
+    assert_eq!(reservations.len(), usize::from(USER_PORT_PROBE_COUNT));
+}
+
+#[test]
+fn fresh_service_reselects_and_retargets_after_bind_handoff_race() {
     let fixture = LifecycleFixture::new(platform::Platform::Linux, false);
-    assert!(hook_gateway().unwrap().is_none());
-    assert!(mcp_gateway().unwrap().is_none());
+    fixture.operations.occupy_first_started_endpoint.set(true);
 
     install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
-    let error = match hook_gateway() {
-        Err(error) => error,
-        Ok(_) => panic!("installed protection without an effective state marker must fail"),
-    };
-    assert!(error.contains("effective state marker is missing"));
-    let error = match mcp_gateway() {
-        Err(error) => error,
-        Ok(_) => panic!("installed protection without an effective state marker must fail"),
-    };
-    assert!(error.contains("effective state marker is missing"));
+
+    let installed = fixture.installed_state();
+    let occupied = fixture
+        .operations
+        .occupied_endpoint
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    assert_ne!(installed.bind, occupied);
+    assert_eq!(fixture.operations.call_count("start_service"), 2);
+    assert_eq!(fixture.operations.call_count("wait_for_health"), 3);
+    assert_eq!(fixture.operations.call_count("stop_service"), 1);
+    assert_eq!(fixture.operations.call_count("register_service"), 2);
+    settings::matches(&installed.settings).unwrap();
+    let proxy_url = installed.proxy_url();
+    assert_eq!(
+        installed
+            .settings
+            .fields
+            .get("HTTPS_PROXY")
+            .and_then(|field| field.installed.as_ref())
+            .and_then(Value::as_str),
+        Some(proxy_url.as_str())
+    );
+}
+
+#[test]
+fn fresh_claude_enrollment_retargets_owned_settings_after_handoff_race() {
+    let fixture = LifecycleFixture::new(platform::Platform::Linux, false);
+    fixture.operations.occupy_first_started_endpoint.set(true);
+    let request = fixture.install_request(false, true);
+
+    let enrollment =
+        enroll_agent_with(&fixture.operations, CodingAgent::ClaudeCode, &request).unwrap();
+
+    let installed = fixture.installed_state();
+    let occupied = fixture
+        .operations
+        .occupied_endpoint
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    assert_ne!(installed.bind, occupied);
+    assert_eq!(
+        enrollment.gateway_url,
+        format!("https://{}", installed.bind)
+    );
+    assert_eq!(fixture.operations.call_count("start_service"), 2);
+    assert_eq!(fixture.operations.call_count("wait_for_health"), 2);
+    settings::matches(&installed.settings).unwrap();
 }
 
 #[test]
@@ -458,12 +608,12 @@ fn doctor_json_exposes_effective_protection_and_named_checks() {
         effective_protection: false,
         checks: Vec::new(),
     };
-    report.push("sidecar_identity", Ok("generation matches".into()));
+    report.push("proxy_identity", Ok("generation matches".into()));
     let value = serde_json::to_value(report.finish()).unwrap();
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["integration"], "claude-desktop");
     assert_eq!(value["effective_protection"], true);
-    assert_eq!(value["checks"][0]["name"], "sidecar_identity");
+    assert_eq!(value["checks"][0]["name"], "proxy_identity");
 }
 
 #[test]
@@ -503,7 +653,6 @@ fn force_upgrade_preserves_original_plugin_ownership() {
     install_with(&fixture.operations, fixture.install_request(true, true)).unwrap();
     let second = fixture.installed_state();
     assert_ne!(first.generation, second.generation);
-    assert!(!second.plugin_preexisting);
     assert!(!first.certificate.root_pem.exists());
     assert!(fixture.operations.called("stop_service"));
 
@@ -512,24 +661,17 @@ fn force_upgrade_preserves_original_plugin_ownership() {
 }
 
 #[test]
-fn preexisting_terminal_plugin_returns_to_direct_gateway_on_uninstall() {
+fn preexisting_legacy_plugin_is_rejected_without_mutation() {
     let fixture = LifecycleFixture::new(platform::Platform::Windows, true);
-    install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
-    assert!(fixture.installed_state().plugin_preexisting);
-    let stops_before = fixture.operations.call_count("stop_direct_gateway");
-
-    uninstall_with(&fixture.operations, fixture.uninstall_request()).unwrap();
-    assert!(fixture.operations.called("restart_direct_gateway"));
-    assert_eq!(
-        fixture.operations.call_count("stop_direct_gateway"),
-        stops_before + 1
-    );
-    assert!(!fixture.operations.called("uninstall_plugin"));
+    let error =
+        install_with(&fixture.operations, fixture.install_request(false, true)).unwrap_err();
+    assert!(error.contains("does not migrate it in place"), "{error}");
     assert!(fixture.operations.plugin_present.get());
+    assert!(!fixture.state_path().exists());
 }
 
 #[test]
-fn preexisting_terminal_plugin_preserves_its_provider_backup_exactly() {
+fn preexisting_legacy_plugin_rejection_preserves_provider_files_exactly() {
     let fixture = LifecycleFixture::new(platform::Platform::MacOs, true);
     let settings = br#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:47632"}}"#;
     let provider_backup = b"{\n  \"provider-backup-sentinel\": true\n}\n";
@@ -542,16 +684,19 @@ fn preexisting_terminal_plugin_preserves_its_provider_backup_exactly() {
         .mutate_provider_backup_on_install
         .set(true);
 
-    install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
+    let error =
+        install_with(&fixture.operations, fixture.install_request(false, true)).unwrap_err();
+    assert!(error.contains("old Relay binary"), "{error}");
     assert_eq!(std::fs::read(&backup_path).unwrap(), provider_backup);
-
-    uninstall_with(&fixture.operations, fixture.uninstall_request()).unwrap();
-    assert_eq!(std::fs::read(&backup_path).unwrap(), provider_backup);
+    assert_eq!(
+        std::fs::read(&fixture.operations.settings_path).unwrap(),
+        settings
+    );
 }
 
 #[test]
 fn failed_desktop_install_restores_the_provider_backup_exactly() {
-    let fixture = LifecycleFixture::new(platform::Platform::Linux, true);
+    let fixture = LifecycleFixture::new(platform::Platform::Linux, false);
     let settings = br#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:47632"}}"#;
     let provider_backup = b"{ \"provider-backup-sentinel\" : true }\n";
     std::fs::create_dir_all(fixture.operations.settings_path.parent().unwrap()).unwrap();
@@ -576,23 +721,6 @@ fn failed_desktop_install_restores_the_provider_backup_exactly() {
 }
 
 #[test]
-fn uninstall_repairs_a_missing_preexisting_terminal_plugin() {
-    let fixture = LifecycleFixture::new(platform::Platform::Windows, true);
-    install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
-    fixture.operations.plugin_present.set(false);
-    let installs_before = fixture.operations.call_count("install_plugin");
-
-    uninstall_with(&fixture.operations, fixture.uninstall_request()).unwrap();
-
-    assert_eq!(
-        fixture.operations.call_count("install_plugin"),
-        installs_before + 1
-    );
-    assert!(fixture.operations.plugin_present.get());
-    assert!(fixture.operations.called("restart_direct_gateway"));
-}
-
-#[test]
 fn install_failure_rolls_back_settings_trust_service_and_plugin() {
     let fixture = LifecycleFixture::new(platform::Platform::Linux, false);
     fixture.operations.write_service_logs.set(true);
@@ -605,9 +733,38 @@ fn install_failure_rolls_back_settings_trust_service_and_plugin() {
     assert!(!fixture.operations.settings_path.exists());
     assert!(fixture.operations.called("unregister_service"));
     assert!(fixture.operations.called("remove_trust"));
-    assert!(fixture.operations.called("uninstall_plugin"));
     assert!(!fixture.operations.plugin_present.get());
-    assert!(!fixture.marketplace_dir.join("claude-desktop").exists());
+    assert!(!fixture.marketplace_dir.join("agent-proxy").exists());
+    assert_ne!(
+        state::resolve_state_path(None).unwrap(),
+        fixture.state_path(),
+        "rollback retained the pre-plugin state locator"
+    );
+}
+
+#[test]
+fn failed_install_rollback_retains_its_recovery_journal() {
+    let fixture = LifecycleFixture::new(platform::Platform::Linux, false);
+    fixture
+        .operations
+        .fail_in_order(&["post_install_doctor", "remove_trust"]);
+
+    let error =
+        install_with(&fixture.operations, fixture.install_request(false, false)).unwrap_err();
+
+    assert!(error.contains("rollback also failed"), "{error}");
+    assert!(
+        state::journal_path(&fixture.marketplace_dir.join("agent-proxy")).exists(),
+        "failed rollback erased its only durable recovery record"
+    );
+    recover_interrupted_operation(
+        &fixture.operations,
+        &fixture.marketplace_dir.join("agent-proxy"),
+        &fixture.state_path(),
+        platform::Platform::Linux,
+    )
+    .unwrap();
+    assert!(!fixture.state_path().exists());
 }
 
 #[test]
@@ -640,7 +797,7 @@ fn service_registration_failure_attempts_unregistration_before_cleanup() {
 
     assert!(error.contains("injected register_service failure"));
     assert!(fixture.operations.called("unregister_service"));
-    assert!(!fixture.marketplace_dir.join("claude-desktop").exists());
+    assert!(!fixture.marketplace_dir.join("agent-proxy").exists());
 }
 
 #[test]
@@ -660,6 +817,32 @@ fn uninstall_failure_restores_the_protected_generation() {
 
     uninstall_with(&fixture.operations, fixture.uninstall_request()).unwrap();
     assert!(!fixture.state_path().exists());
+}
+
+#[test]
+fn failed_uninstall_rollback_retains_its_recovery_journal() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
+    let installed = fixture.installed_state();
+    fixture
+        .operations
+        .fail_in_order(&["remove_trust", "register_service"]);
+
+    let error = uninstall_with(&fixture.operations, fixture.uninstall_request()).unwrap_err();
+
+    assert!(error.contains("rollback also failed"), "{error}");
+    assert!(
+        state::journal_path(&installed.install_root).exists(),
+        "failed rollback erased its only durable recovery record"
+    );
+    recover_interrupted_operation(
+        &fixture.operations,
+        &installed.install_root,
+        &installed.state_path(),
+        platform::Platform::MacOs,
+    )
+    .unwrap();
+    assert!(!state::journal_path(&installed.install_root).exists());
 }
 
 #[test]
@@ -688,8 +871,7 @@ fn uninstall_refuses_running_claude_and_unexpected_install_roots() {
         .join(&installed.generation);
     installed.certificate.root_der = certificate_root.join("root-ca.der");
     installed.certificate.root_pem = certificate_root.join("root-ca.pem");
-    installed.certificate.leaf_der = certificate_root.join("api.anthropic.com.der");
-    installed.certificate.leaf_key_der = certificate_root.join("api.anthropic.com-key.der");
+    installed.certificate.ca_key_der = certificate_root.join("root-ca-key.der");
     let mut bytes = serde_json::to_vec_pretty(&installed).unwrap();
     bytes.push(b'\n');
     crate::filesystem::atomic_write_private(&installed.state_path(), &bytes).unwrap();
@@ -741,7 +923,7 @@ fn preflight_rejects_running_claude_and_custom_anthropic_gateway() {
     *fixture.operations.anthropic_base_url.borrow_mut() = "https://gateway.example".into();
     let error =
         install_with(&fixture.operations, fixture.install_request(false, true)).unwrap_err();
-    assert!(error.contains("does not yet support a custom Anthropic gateway"));
+    assert!(error.contains("does not support a custom Anthropic upstream"));
 }
 
 #[test]
@@ -759,8 +941,8 @@ fn failed_linux_ca_composition_recovers_the_preparation_journal() {
     assert!(error.contains("failed to resolve NODE_EXTRA_CA_CERTS"));
     assert!(error.contains("restored the previous Claude Desktop generation"));
     assert!(!fixture.state_path().exists());
-    assert!(!state::journal_path(&fixture.marketplace_dir.join("claude-desktop")).exists());
-    assert!(!fixture.marketplace_dir.join("claude-desktop").exists());
+    assert!(!state::journal_path(&fixture.marketplace_dir.join("agent-proxy")).exists());
+    assert!(!fixture.marketplace_dir.join("agent-proxy").exists());
 }
 
 #[test]
@@ -782,7 +964,7 @@ fn task_failure_preserves_failure_origin() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sidecar_runs_the_real_gateway_and_authenticated_proxy_until_shutdown() {
+async fn proxy_service_runs_managed_engine_and_authenticated_proxy_until_shutdown() {
     let _port_guard = FIXED_PORT_TEST_LOCK.lock().await;
     let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
     install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
@@ -801,14 +983,24 @@ async fn sidecar_runs_the_real_gateway_and_authenticated_proxy_until_shutdown() 
     installed.configuration_fingerprint = configuration_fingerprint(
         &installed.generation,
         &installed.relay_binary,
+        &installed.user_config_dir,
         &installed.gateway_fingerprint,
         &installed.certificate.root_sha256,
+        installed.bind,
+        installed.service_identity.as_deref(),
         installed.upstream_proxy.as_ref(),
+        &installed.enrollments,
     )
     .unwrap();
     state::write(&installed).unwrap();
+    let unrelated_service_environment = fixture._temp.path().join("service-environment-config");
+    std::fs::create_dir_all(&unrelated_service_environment).unwrap();
+    fixture._environment.update(&[(
+        "XDG_CONFIG_HOME",
+        Some(unrelated_service_environment.as_os_str()),
+    )]);
 
-    let sidecar = tokio::spawn(run_sidecar(SidecarRequest {
+    let proxy_service = tokio::spawn(run_proxy_service(ProxyServiceRequest {
         state: fixture.state_path(),
     }));
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -824,7 +1016,7 @@ async fn sidecar_runs_the_real_gateway_and_authenticated_proxy_until_shutdown() 
         }
         assert!(
             Instant::now() < deadline,
-            "real Claude Desktop sidecar did not become healthy"
+            "real coding-agent proxy did not become healthy"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -835,7 +1027,74 @@ async fn sidecar_runs_the_real_gateway_and_authenticated_proxy_until_shutdown() 
         .unwrap()
         .unwrap();
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), sidecar)
+        tokio::time::timeout(Duration::from_secs(5), proxy_service)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        ExitCode::SUCCESS
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn running_proxy_rejects_routes_after_state_permissions_are_relaxed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _port_guard = FIXED_PORT_TEST_LOCK.lock().await;
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
+    let mut installed = fixture.installed_state();
+    let (gateway_fingerprint, _, _) = persistent_gateway_identity().unwrap();
+    installed.gateway_fingerprint = gateway_fingerprint;
+    installed.configuration_fingerprint = configuration_fingerprint(
+        &installed.generation,
+        &installed.relay_binary,
+        &installed.user_config_dir,
+        &installed.gateway_fingerprint,
+        &installed.certificate.root_sha256,
+        installed.bind,
+        installed.service_identity.as_deref(),
+        installed.upstream_proxy.as_ref(),
+        &installed.enrollments,
+    )
+    .unwrap();
+    state::write(&installed).unwrap();
+
+    let proxy_service = tokio::spawn(run_proxy_service(ProxyServiceRequest {
+        state: fixture.state_path(),
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let health_state = installed.clone();
+        let healthy = tokio::task::spawn_blocking(move || {
+            proxy::health(&health_state, Duration::from_millis(200)).is_ok()
+        })
+        .await
+        .unwrap();
+        if healthy {
+            break;
+        }
+        assert!(Instant::now() < deadline, "proxy did not become healthy");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    std::fs::set_permissions(fixture.state_path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let health_state = installed.clone();
+    let error =
+        tokio::task::spawn_blocking(move || proxy::health(&health_state, Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap_err();
+    assert!(error.contains("rejected authenticated request"), "{error}");
+
+    let shutdown_state = installed.clone();
+    tokio::task::spawn_blocking(move || proxy::shutdown(&shutdown_state, Duration::from_secs(2)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), proxy_service)
             .await
             .unwrap()
             .unwrap()
@@ -845,7 +1104,7 @@ async fn sidecar_runs_the_real_gateway_and_authenticated_proxy_until_shutdown() 
 }
 
 #[tokio::test]
-async fn sidecar_rejects_relocated_or_stale_installed_state() {
+async fn proxy_service_rejects_relocated_or_stale_installed_state() {
     let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
     install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
     let relocated_state = fixture.installed_state();
@@ -854,7 +1113,7 @@ async fn sidecar_rejects_relocated_or_stale_installed_state() {
     bytes.push(b'\n');
     crate::filesystem::atomic_write_private(&relocated, &bytes).unwrap();
     assert!(
-        run_sidecar(SidecarRequest { state: relocated })
+        run_proxy_service(ProxyServiceRequest { state: relocated })
             .await
             .unwrap_err()
             .to_string()
@@ -865,13 +1124,64 @@ async fn sidecar_rejects_relocated_or_stale_installed_state() {
     installed.configuration_fingerprint = "stale".into();
     state::write(&installed).unwrap();
     assert!(
-        run_sidecar(SidecarRequest {
+        run_proxy_service(ProxyServiceRequest {
             state: fixture.state_path(),
         })
         .await
         .unwrap_err()
         .to_string()
         .contains("fingerprint is stale")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn proxy_service_and_doctor_reject_a_shared_generation_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
+    let mut installed = fixture.installed_state();
+    let (gateway_fingerprint, _, _) = persistent_gateway_identity().unwrap();
+    installed.gateway_fingerprint = gateway_fingerprint;
+    installed.configuration_fingerprint = configuration_fingerprint(
+        &installed.generation,
+        &installed.relay_binary,
+        &installed.user_config_dir,
+        &installed.gateway_fingerprint,
+        &installed.certificate.root_sha256,
+        installed.bind,
+        installed.service_identity.as_deref(),
+        installed.upstream_proxy.as_ref(),
+        &installed.enrollments,
+    )
+    .unwrap();
+    state::write(&installed).unwrap();
+    let generation = installed
+        .install_root
+        .join("generations")
+        .join(&installed.generation);
+    std::fs::set_permissions(&generation, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+    let error = run_proxy_service(ProxyServiceRequest {
+        state: fixture.state_path(),
+    })
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("must have owner-only mode 700"), "{error}");
+
+    let report = doctor_report_with(&fixture.operations, Some(&fixture.marketplace_dir)).unwrap();
+    let permissions = report
+        .checks
+        .iter()
+        .find(|check| check.name == "file_permissions")
+        .unwrap();
+    assert!(!permissions.ok);
+    assert!(
+        permissions
+            .details
+            .contains("must have owner-only mode 700")
     );
 }
 
@@ -924,14 +1234,9 @@ async fn system_operations_delegate_to_the_real_host_adapters() {
     let tls = certificate::server_config(&installed.install_root, &installed.certificate).unwrap();
     let (shutdown_tx, _) = watch::channel(false);
     let runtime = proxy::Runtime::new(installed.clone(), tls, shutdown_tx).unwrap();
-    let listener = TcpListener::bind(PROXY_BIND).await.unwrap();
+    let listener = TcpListener::bind(installed.bind).await.unwrap();
     let proxy_task = tokio::spawn(proxy::serve(listener, runtime));
-    assert!(
-        operations
-            .health(&installed)
-            .unwrap_err()
-            .contains("gateway")
-    );
+    assert!(operations.health(&installed).is_ok());
     operations.shutdown_proxy(&installed);
     proxy_task.await.unwrap().unwrap();
 
@@ -955,22 +1260,139 @@ fn configuration_fingerprint_tracks_binary_proxy_and_ca_content() {
         no_proxy: Some("localhost".into()),
         ca_bundle: Some(ca.clone()),
     };
-    let first =
-        configuration_fingerprint("generation", &relay, "gateway", "root", Some(&proxy)).unwrap();
+    let user_config_dir = temp.path().join("config");
+    let mut enrollments = std::collections::BTreeMap::new();
+    let first = configuration_fingerprint(
+        "generation",
+        &relay,
+        &user_config_dir,
+        "gateway",
+        "root",
+        LEGACY_PROXY_BIND,
+        None,
+        Some(&proxy),
+        &enrollments,
+    )
+    .unwrap();
     std::fs::write(&relay, b"relay two").unwrap();
-    let second =
-        configuration_fingerprint("generation", &relay, "gateway", "root", Some(&proxy)).unwrap();
+    let second = configuration_fingerprint(
+        "generation",
+        &relay,
+        &user_config_dir,
+        "gateway",
+        "root",
+        LEGACY_PROXY_BIND,
+        None,
+        Some(&proxy),
+        &enrollments,
+    )
+    .unwrap();
     std::fs::write(&ca, b"ca two").unwrap();
-    let third =
-        configuration_fingerprint("generation", &relay, "gateway", "root", Some(&proxy)).unwrap();
+    let third = configuration_fingerprint(
+        "generation",
+        &relay,
+        &user_config_dir,
+        "gateway",
+        "root",
+        LEGACY_PROXY_BIND,
+        None,
+        Some(&proxy),
+        &enrollments,
+    )
+    .unwrap();
     assert_ne!(first, second);
     assert_ne!(second, third);
+
+    let agent_ca = temp.path().join("agent-ca.pem");
+    std::fs::write(&agent_ca, b"agent ca one").unwrap();
+    enrollments.insert(
+        "codex".into(),
+        state::AgentEnrollment {
+            username: "codex".into(),
+            token: "secret".into(),
+            installed_at: "now".into(),
+            upstream_proxy: Some(settings::UpstreamProxy {
+                url: "https://codex-proxy.example:8443/".into(),
+                no_proxy: None,
+                ca_bundle: Some(agent_ca.clone()),
+            }),
+            client_ca_bundle_source: None,
+            client_ca_bundle_variable: None,
+        },
+    );
+    let fourth = configuration_fingerprint(
+        "generation",
+        &relay,
+        &user_config_dir,
+        "gateway",
+        "root",
+        LEGACY_PROXY_BIND,
+        None,
+        Some(&proxy),
+        &enrollments,
+    )
+    .unwrap();
+    std::fs::write(&agent_ca, b"agent ca two").unwrap();
+    let fifth = configuration_fingerprint(
+        "generation",
+        &relay,
+        &user_config_dir,
+        "gateway",
+        "root",
+        LEGACY_PROXY_BIND,
+        None,
+        Some(&proxy),
+        &enrollments,
+    )
+    .unwrap();
+    assert_ne!(third, fourth);
+    assert_ne!(fourth, fifth);
+    let sixth = configuration_fingerprint(
+        "generation",
+        &relay,
+        &user_config_dir,
+        "gateway",
+        "root",
+        LEGACY_PROXY_BIND,
+        Some("S-1-5-21-1000"),
+        Some(&proxy),
+        &enrollments,
+    )
+    .unwrap();
+    assert_ne!(fifth, sixth);
+    let seventh = configuration_fingerprint(
+        "generation",
+        &relay,
+        &temp.path().join("different-config"),
+        "gateway",
+        "root",
+        LEGACY_PROXY_BIND,
+        Some("S-1-5-21-1000"),
+        Some(&proxy),
+        &enrollments,
+    )
+    .unwrap();
+    assert_ne!(sixth, seventh);
+}
+
+#[test]
+fn runtime_binary_identity_hashes_once_and_detects_metadata_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let relay = temp.path().join("relay");
+    std::fs::write(&relay, b"relay executable").unwrap();
+
+    let identity = RelayBinaryIdentity::capture(&relay).unwrap();
+    assert_eq!(identity.sha256, relay_binary_sha256(&relay).unwrap());
+    identity.verify(&relay).unwrap();
+
+    std::fs::write(&relay, b"changed relay executable").unwrap();
+    assert!(identity.verify(&relay).unwrap_err().contains("changed"));
 }
 
 #[test]
 fn generation_removal_is_scoped_and_idempotent() {
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("claude-desktop");
+    let root = temp.path().join("agent-proxy");
     let generation = root.join("generations").join("one");
     std::fs::create_dir_all(&generation).unwrap();
     std::fs::write(generation.join("certificate.pem"), b"certificate").unwrap();
@@ -1061,11 +1483,670 @@ fn repeated_install_requires_force() {
 }
 
 #[test]
+fn desktop_only_install_generates_and_validates_shared_claude_hook_delivery() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    fixture.operations.generate_hook_on_install.set(true);
+    install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
+
+    assert!(enrollment(CodingAgent::ClaudeCode).unwrap().is_some());
+    let shared = claude_plugin_enrollment().unwrap().unwrap();
+    assert_eq!(
+        shared.gateway_url,
+        format!("https://{}", fixture.installed_state().bind)
+    );
+    assert!(shared.authorization.starts_with("Basic "));
+    let command = fixture
+        .operations
+        .generated_hook_command
+        .borrow()
+        .clone()
+        .expect("Desktop installation generated the shared Claude hook");
+    assert!(command.contains("hook-forward claude"));
+    assert!(command.contains(&shared.gateway_url));
+    verify_hook_enrollment_health_with(&fixture.operations, CodingAgent::ClaudeCode, &shared)
+        .unwrap();
+}
+
+#[test]
+fn claude_code_and_desktop_share_one_configuration_enrollment() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
+    let before = fixture.installed_state();
+    let before_proxy = before.proxy_url();
+
+    enroll_agent_with(
+        &fixture.operations,
+        CodingAgent::ClaudeCode,
+        &fixture.install_request(false, true),
+    )
+    .unwrap();
+
+    let installed = fixture.installed_state();
+    assert!(installed.claude_code_installed);
+    assert!(installed.claude_desktop_installed);
+    assert_eq!(
+        installed.enrollments.keys().collect::<Vec<_>>(),
+        vec![&"claude"]
+    );
+    assert_eq!(installed.proxy_url(), before_proxy);
+    settings::matches(&installed.settings).unwrap();
+}
+
+#[test]
+fn desktop_reuses_the_existing_claude_configuration_enrollment() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let request = fixture.install_request(false, true);
+    enroll_agent_with(&fixture.operations, CodingAgent::ClaudeCode, &request).unwrap();
+    let before = fixture.installed_state();
+    let before_proxy = before.proxy_url();
+
+    install_with(&fixture.operations, request).unwrap();
+
+    let installed = fixture.installed_state();
+    assert!(installed.claude_code_installed);
+    assert!(installed.claude_desktop_installed);
+    assert_eq!(
+        installed.enrollments.keys().collect::<Vec<_>>(),
+        vec![&"claude"]
+    );
+    assert_eq!(installed.proxy_url(), before_proxy);
+    settings::matches(&installed.settings).unwrap();
+}
+
+#[test]
+fn hermes_host_setup_uses_the_explicit_proxy_state_root() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let request = fixture.install_request(false, true);
+    enroll_agent_with(&fixture.operations, CodingAgent::Hermes, &request).unwrap();
+
+    let explicit = enrollment_at(CodingAgent::Hermes, Some(&fixture.marketplace_dir))
+        .unwrap()
+        .unwrap();
+    let unrelated = tempfile::tempdir().unwrap();
+    assert!(
+        enrollment_at(CodingAgent::Hermes, Some(unrelated.path()))
+            .unwrap()
+            .is_none()
+    );
+
+    let config = fixture._temp.path().join("home/.hermes/config.yaml");
+    crate::agents::hermes::install_persistent(
+        &config,
+        &std::env::current_exe().unwrap(),
+        Some(&fixture.marketplace_dir),
+    )
+    .unwrap();
+    let proxy_env = std::fs::read_to_string(config.parent().unwrap().join(".env")).unwrap();
+    assert!(proxy_env.contains(&explicit.proxy_url));
+}
+
+#[test]
+fn claude_code_enrollment_installs_native_proxy_settings() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let request = fixture.install_request(false, true);
+
+    let enrollment =
+        enroll_agent_with(&fixture.operations, CodingAgent::ClaudeCode, &request).unwrap();
+    let installed = fixture.installed_state();
+
+    assert!(enrollment.proxy_url.contains("nemo-relay-claude"));
+    assert!(!installed.settings.fields.is_empty());
+    settings::matches(&installed.settings).unwrap();
+    let settings =
+        crate::agents::shared::host::read_json_object(&installed.settings.settings_path).unwrap();
+    let env = settings["env"].as_object().unwrap();
+    assert_eq!(
+        env.get("HTTPS_PROXY").and_then(Value::as_str),
+        Some(enrollment.proxy_url.as_str())
+    );
+    assert!(!env.contains_key("ANTHROPIC_BASE_URL"));
+    assert_eq!(
+        env.get("CLAUDE_CODE_CERT_STORE").and_then(Value::as_str),
+        Some("bundled,system")
+    );
+    assert!(!fixture.operations.called("stop_service"));
+}
+
+#[test]
+fn first_agent_enrollment_does_not_stop_an_unregistered_service() {
+    for platform in [platform::Platform::Windows, platform::Platform::Linux] {
+        let fixture = LifecycleFixture::new(platform, false);
+        let request = fixture.install_request(false, true);
+
+        enroll_agent_with(&fixture.operations, CodingAgent::Codex, &request).unwrap();
+
+        assert!(!fixture.operations.called("stop_service"));
+    }
+}
+
+#[test]
+fn adding_an_agent_rotates_a_narrow_first_enrollment_ca_for_host_expansion() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let request = fixture.install_request(false, true);
+    enroll_agent_with(&fixture.operations, CodingAgent::ClaudeCode, &request).unwrap();
+    let claude_only = fixture.installed_state();
+    assert_eq!(
+        certificate::permitted_dns_hosts(&claude_only.certificate).unwrap(),
+        vec!["api.anthropic.com"]
+    );
+
+    enroll_agent_with(&fixture.operations, CodingAgent::Codex, &request).unwrap();
+    let expanded = fixture.installed_state();
+    assert_ne!(expanded.generation, claude_only.generation);
+    assert_eq!(
+        certificate::permitted_dns_hosts(&expanded.certificate).unwrap(),
+        vec!["api.anthropic.com", "api.openai.com", "chatgpt.com"]
+    );
+    assert!(!claude_only.certificate.root_pem.exists());
+}
+
+#[test]
+fn host_expansion_preserves_each_agents_corporate_route() {
+    for added_agent in [CodingAgent::Codex, CodingAgent::Hermes] {
+        let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+        let request = fixture.install_request(false, true);
+        enroll_agent_with(&fixture.operations, CodingAgent::ClaudeCode, &request).unwrap();
+        let mut claude_only = fixture.installed_state();
+        let claude_route = settings::UpstreamProxy {
+            url: "https://claude-proxy.example:8443/".into(),
+            no_proxy: Some("localhost".into()),
+            ca_bundle: None,
+        };
+        claude_only
+            .enrollments
+            .get_mut("claude")
+            .unwrap()
+            .upstream_proxy = Some(claude_route.clone());
+        claude_only.upstream_proxy = Some(claude_route.clone());
+        state::write(&claude_only).unwrap();
+
+        enroll_agent_with(&fixture.operations, added_agent, &request).unwrap();
+        let expanded = fixture.installed_state();
+
+        assert_eq!(
+            expanded.enrollments["claude"].upstream_proxy,
+            Some(claude_route)
+        );
+        assert_eq!(
+            expanded.enrollments[added_agent.install_arg()].upstream_proxy,
+            None
+        );
+    }
+}
+
+#[test]
+fn linux_codex_uses_a_stable_composed_ca_bundle_and_removes_it_with_ownership() {
+    let fixture = LifecycleFixture::new(platform::Platform::Linux, false);
+    let request = fixture.install_request(false, true);
+    enroll_agent_with(&fixture.operations, CodingAgent::Codex, &request).unwrap();
+
+    let mut installed = fixture.installed_state();
+    let source = fixture.marketplace_dir.join("existing-codex-ca.pem");
+    std::fs::write(&source, b"existing corporate root\n").unwrap();
+    let enrollment = installed.enrollments.get_mut("codex").unwrap();
+    enrollment.client_ca_bundle_source = Some(source.clone());
+    enrollment.client_ca_bundle_variable = Some("SSL_CERT_FILE".into());
+    sync_codex_ca_bundle(&installed).unwrap();
+
+    let stable = codex_ca_bundle_path(&installed.install_root);
+    let root = std::fs::read(&installed.certificate.root_pem).unwrap();
+    let bundle = std::fs::read(&stable).unwrap();
+    assert!(bundle.starts_with(b"existing corporate root\n"));
+    assert!(bundle.ends_with(&root));
+    let notices = codex_ca_uninstall_notices(
+        CodingAgent::Codex,
+        platform::Platform::Linux,
+        &installed.install_root,
+        &installed.enrollments["codex"],
+    );
+    assert!(notices[0].contains(&stable.display().to_string()));
+    assert!(notices[1].contains("SSL_CERT_FILE"));
+    assert!(notices[1].contains(&source.display().to_string()));
+
+    installed.enrollments.remove("codex");
+    sync_codex_ca_bundle(&installed).unwrap();
+    assert!(!stable.exists());
+}
+
+#[test]
+fn host_install_failure_removes_a_fresh_proxy_enrollment() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let request = fixture.install_request(false, true);
+
+    let error = enroll_agent_transactionally_with(
+        &fixture.operations,
+        CodingAgent::Codex,
+        &request,
+        &crate::agents::SetupSnapshot::Test,
+        || Err::<(), _>(CliError::Install("injected host install failure".into())),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("injected host install failure"));
+    assert!(!fixture.state_path().exists());
+    assert!(fixture.operations.called("unregister_service"));
+}
+
+#[test]
+fn host_install_failure_restores_a_forced_proxy_refresh_exactly() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let initial = fixture.install_request(false, true);
+    enroll_agent_transactionally_with(
+        &fixture.operations,
+        CodingAgent::Codex,
+        &initial,
+        &crate::agents::SetupSnapshot::Test,
+        || Ok::<_, CliError>(()),
+    )
+    .unwrap();
+    let state_before = std::fs::read(fixture.state_path()).unwrap();
+
+    let refresh = fixture.install_request(true, true);
+    let error = enroll_agent_transactionally_with(
+        &fixture.operations,
+        CodingAgent::Codex,
+        &refresh,
+        &crate::agents::SetupSnapshot::Test,
+        || Err::<(), _>(CliError::Install("injected replacement failure".into())),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("injected replacement failure"));
+    assert_eq!(std::fs::read(fixture.state_path()).unwrap(), state_before);
+}
+
+#[test]
+fn durable_agent_journal_recovers_a_crash_after_proxy_rotation() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let initial = fixture.install_request(false, true);
+    enroll_agent_with(&fixture.operations, CodingAgent::Codex, &initial).unwrap();
+    let previous = fixture.installed_state();
+    let state_before = std::fs::read(fixture.state_path()).unwrap();
+    let mut journal = AgentTransactionJournal {
+        schema_version: state::STATE_SCHEMA_VERSION,
+        operation: "install".into(),
+        stage: "preparing-proxy".into(),
+        agent: CodingAgent::Codex.install_arg().into(),
+        install_root: previous.install_root.clone(),
+        state_path: previous.state_path(),
+        previous_state: Some(previous),
+        setup_snapshot: crate::agents::SetupSnapshot::Test,
+        setup_result_snapshot: None,
+        marketplace_snapshot: None,
+        marketplace_result_snapshot: None,
+    };
+    write_agent_transaction(&journal).unwrap();
+
+    let mut interrupted = fixture.installed_state();
+    interrupted.generation = "interrupted-generation".into();
+    interrupted.certificate =
+        certificate::generate(&interrupted.install_root, &interrupted.generation).unwrap();
+    interrupted.configuration_fingerprint = "interrupted-configuration".into();
+    state::write(&interrupted).unwrap();
+    journal.stage = "proxy-active".into();
+    write_agent_transaction(&journal).unwrap();
+    assert_ne!(std::fs::read(fixture.state_path()).unwrap(), state_before);
+
+    recover_pending_agent_transaction(&fixture.operations).unwrap();
+
+    assert_eq!(std::fs::read(fixture.state_path()).unwrap(), state_before);
+    assert!(!agent_transaction_path().unwrap().exists());
+}
+
+#[test]
+fn committed_agent_install_finishes_retirement_instead_of_rolling_back() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let initial = fixture.install_request(false, true);
+    enroll_agent_transactionally_with(
+        &fixture.operations,
+        CodingAgent::Codex,
+        &initial,
+        &crate::agents::SetupSnapshot::Test,
+        || Ok::<_, CliError>(()),
+    )
+    .unwrap();
+    let mut previous = fixture.installed_state();
+    certificate::rewrite_host_constraints_for_test(
+        &mut previous.certificate,
+        &[certificate::INTERCEPTED_HOST],
+    )
+    .unwrap();
+    state::write(&previous).unwrap();
+
+    fixture.operations.fail_once("remove_trust");
+    let error = enroll_agent_transactionally_with(
+        &fixture.operations,
+        CodingAgent::Codex,
+        &fixture.install_request(true, true),
+        &crate::agents::SetupSnapshot::Test,
+        || Ok::<_, CliError>(()),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("remove_trust"));
+    let committed = read_agent_transaction().unwrap().unwrap();
+    assert_eq!(committed.stage, "committed");
+    let active_generation = fixture.installed_state().generation;
+    assert_ne!(active_generation, previous.generation);
+
+    recover_pending_agent_transaction(&fixture.operations).unwrap();
+
+    assert_eq!(fixture.installed_state().generation, active_generation);
+    assert!(!agent_transaction_path().unwrap().exists());
+    assert!(
+        !previous
+            .install_root
+            .join("generations")
+            .join(previous.generation)
+            .exists()
+    );
+}
+
+#[test]
+fn committed_final_agent_uninstall_retires_generation_on_recovery() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let request = fixture.install_request(false, true);
+    enroll_agent_with(&fixture.operations, CodingAgent::Codex, &request).unwrap();
+    let previous = fixture.installed_state();
+    let mut journal = AgentTransactionJournal {
+        schema_version: state::STATE_SCHEMA_VERSION,
+        operation: "uninstall".into(),
+        stage: "host-removed".into(),
+        agent: CodingAgent::Codex.install_arg().into(),
+        install_root: previous.install_root.clone(),
+        state_path: previous.state_path(),
+        previous_state: Some(previous.clone()),
+        setup_snapshot: crate::agents::SetupSnapshot::Test,
+        setup_result_snapshot: None,
+        marketplace_snapshot: None,
+        marketplace_result_snapshot: None,
+    };
+    write_agent_transaction(&journal).unwrap();
+    unenroll_agent_locked(
+        &fixture.operations,
+        CodingAgent::Codex,
+        &fixture.uninstall_request(),
+    )
+    .unwrap();
+    journal.stage = "committed".into();
+    write_agent_transaction(&journal).unwrap();
+
+    assert!(!fixture.state_path().exists());
+    assert!(
+        previous
+            .install_root
+            .join("generations")
+            .join(&previous.generation)
+            .exists()
+    );
+
+    recover_pending_agent_transaction(&fixture.operations).unwrap();
+
+    assert!(!agent_transaction_path().unwrap().exists());
+    assert!(!previous.install_root.exists());
+}
+
+#[test]
+fn batch_retirement_keeps_the_active_generation_and_removes_its_predecessor() {
+    let fixture = LifecycleFixture::new(platform::Platform::Linux, false);
+    enroll_agent_with(
+        &fixture.operations,
+        CodingAgent::Codex,
+        &fixture.install_request(false, true),
+    )
+    .unwrap();
+    let previous = fixture.installed_state();
+    let mut active = previous.clone();
+    active.generation = "batch-active-generation".into();
+    active.certificate = certificate::generate(&active.install_root, &active.generation).unwrap();
+    active.configuration_fingerprint = "batch-active-fingerprint".into();
+    state::write(&active).unwrap();
+
+    finalize_batch_resource_retirements(&[DeferredProxyRetirement {
+        state: previous.clone(),
+    }])
+    .unwrap();
+
+    assert!(
+        !previous
+            .install_root
+            .join("generations")
+            .join(previous.generation)
+            .exists()
+    );
+    assert!(
+        active
+            .install_root
+            .join("generations")
+            .join(active.generation)
+            .exists()
+    );
+}
+
+#[test]
+fn batch_retirement_removes_every_generation_after_final_uninstall() {
+    let fixture = LifecycleFixture::new(platform::Platform::Linux, false);
+    enroll_agent_with(
+        &fixture.operations,
+        CodingAgent::Codex,
+        &fixture.install_request(false, true),
+    )
+    .unwrap();
+    let first = fixture.installed_state();
+    let mut second = first.clone();
+    second.generation = "batch-intermediate-generation".into();
+    second.certificate = certificate::generate(&second.install_root, &second.generation).unwrap();
+    std::fs::remove_file(first.state_path()).unwrap();
+
+    finalize_batch_resource_retirements(&[
+        DeferredProxyRetirement {
+            state: first.clone(),
+        },
+        DeferredProxyRetirement { state: second },
+    ])
+    .unwrap();
+
+    assert!(!first.install_root.exists());
+}
+
+#[test]
+fn batch_resource_retirement_guard_is_scoped() {
+    assert!(!batch_resource_retirement_deferred());
+    {
+        let _guard = defer_batch_resource_retirement(|_| Ok(()));
+        assert!(batch_resource_retirement_deferred());
+    }
+    assert!(!batch_resource_retirement_deferred());
+}
+
+#[test]
+fn interrupted_agent_recovery_stops_when_service_stop_fails() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let request = fixture.install_request(false, true);
+    enroll_agent_with(&fixture.operations, CodingAgent::Codex, &request).unwrap();
+    let previous = fixture.installed_state();
+    let journal = AgentTransactionJournal {
+        schema_version: state::STATE_SCHEMA_VERSION,
+        operation: "install".into(),
+        stage: "proxy-active".into(),
+        agent: CodingAgent::Codex.install_arg().into(),
+        install_root: previous.install_root.clone(),
+        state_path: previous.state_path(),
+        previous_state: Some(previous.clone()),
+        setup_snapshot: crate::agents::SetupSnapshot::Test,
+        setup_result_snapshot: None,
+        marketplace_snapshot: None,
+        marketplace_result_snapshot: None,
+    };
+    write_agent_transaction(&journal).unwrap();
+    fixture.operations.fail_once("stop_service");
+
+    let error = recover_pending_agent_transaction(&fixture.operations).unwrap_err();
+
+    assert!(error.contains("stop_service"));
+    assert!(agent_transaction_path().unwrap().exists());
+    assert_eq!(fixture.installed_state().generation, previous.generation);
+}
+
+#[test]
+fn explicit_uninstall_root_cannot_remove_a_different_active_enrollment() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let request = fixture.install_request(false, true);
+    enroll_agent_with(&fixture.operations, CodingAgent::Hermes, &request).unwrap();
+    let host_removed = Cell::new(false);
+    let wrong_root = tempfile::tempdir().unwrap();
+    let uninstall = UninstallRequest {
+        install_dir: Some(wrong_root.path().to_path_buf()),
+        dry_run: false,
+    };
+
+    let error = unenroll_agent_transactionally_with(
+        &fixture.operations,
+        CodingAgent::Hermes,
+        &uninstall,
+        Some(&crate::agents::SetupSnapshot::Test),
+        || {
+            host_removed.set(true);
+            Ok::<_, CliError>(())
+        },
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("matching --install-dir"), "{error}");
+    assert!(!host_removed.get());
+    assert!(fixture.state_path().exists());
+}
+
+#[test]
+fn explicit_doctor_root_cannot_diagnose_a_different_active_enrollment() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let request = fixture.install_request(false, true);
+    enroll_agent_with(&fixture.operations, CodingAgent::Hermes, &request).unwrap();
+    let wrong_root = tempfile::tempdir().unwrap();
+
+    let error = diagnose_enrollment_at(CodingAgent::Hermes, Some(wrong_root.path())).unwrap_err();
+
+    assert!(error.contains("rerun doctor with the matching --install-dir"));
+    assert!(error.contains(&fixture.state_path().display().to_string()));
+}
+
+#[test]
+fn doctor_without_an_explicit_root_uses_the_active_locator() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let request = fixture.install_request(false, true);
+    enroll_agent_with(&fixture.operations, CodingAgent::Hermes, &request).unwrap();
+
+    assert_eq!(
+        resolved_marketplace_install_dir(None).unwrap(),
+        fixture.marketplace_dir
+    );
+}
+
+#[test]
+fn proxy_unenrollment_failure_restores_the_previous_shared_state() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let request = fixture.install_request(false, true);
+    enroll_agent_with(&fixture.operations, CodingAgent::ClaudeCode, &request).unwrap();
+    enroll_agent_with(&fixture.operations, CodingAgent::Codex, &request).unwrap();
+    let state_before = std::fs::read(fixture.state_path()).unwrap();
+    fixture.operations.fail_once("register_service");
+
+    let error = unenroll_agent_transactionally_with(
+        &fixture.operations,
+        CodingAgent::ClaudeCode,
+        &fixture.uninstall_request(),
+        Some(&crate::agents::SetupSnapshot::Test),
+        || Ok::<_, CliError>(()),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("register_service"));
+    assert_eq!(std::fs::read(fixture.state_path()).unwrap(), state_before);
+    settings::matches(&fixture.installed_state().settings).unwrap();
+}
+
+#[test]
+fn removing_the_last_claude_surface_removes_the_shared_configuration() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let request = fixture.install_request(false, true);
+    enroll_agent_with(&fixture.operations, CodingAgent::ClaudeCode, &request).unwrap();
+    enroll_agent_with(&fixture.operations, CodingAgent::Codex, &request).unwrap();
+
+    unenroll_agent_transactionally_with(
+        &fixture.operations,
+        CodingAgent::ClaudeCode,
+        &fixture.uninstall_request(),
+        Some(&crate::agents::SetupSnapshot::Test),
+        || Ok::<_, CliError>(()),
+    )
+    .unwrap();
+
+    let installed = fixture.installed_state();
+    assert!(installed.enrollments.contains_key("codex"));
+    assert!(!installed.enrollments.contains_key("claude"));
+    assert!(installed.settings.fields.is_empty());
+    assert!(!installed.claude_code_installed);
+    assert!(!installed.claude_desktop_installed);
+}
+
+#[test]
+fn code_uninstall_retains_the_desktop_surface_and_shared_configuration() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    let request = fixture.install_request(false, true);
+    install_with(&fixture.operations, request.clone()).unwrap();
+    enroll_agent_with(&fixture.operations, CodingAgent::ClaudeCode, &request).unwrap();
+
+    unenroll_agent_transactionally_with(
+        &fixture.operations,
+        CodingAgent::ClaudeCode,
+        &fixture.uninstall_request(),
+        Some(&crate::agents::SetupSnapshot::Test),
+        || Ok::<_, CliError>(()),
+    )
+    .unwrap();
+
+    let installed = fixture.installed_state();
+    assert!(!installed.claude_code_installed);
+    assert!(installed.claude_desktop_installed);
+    assert!(installed.enrollments.contains_key("claude"));
+    assert!(!installed.settings.fields.is_empty());
+    settings::matches(&installed.settings).unwrap();
+}
+
+#[test]
+fn desktop_uninstall_retains_shared_claude_plugin_and_settings() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
+    let mut installed = fixture.installed_state();
+    installed.claude_code_installed = true;
+    state::write(&installed).unwrap();
+    let uninstall_calls = fixture.operations.call_count("uninstall_plugin");
+
+    uninstall_with(&fixture.operations, fixture.uninstall_request()).unwrap();
+
+    let retained = fixture.installed_state();
+    assert_eq!(
+        retained.enrollments.keys().cloned().collect::<Vec<_>>(),
+        vec!["claude"]
+    );
+    assert!(!retained.settings.fields.is_empty());
+    assert!(retained.claude_code_installed);
+    assert!(!retained.claude_desktop_installed);
+    assert_eq!(
+        fixture.operations.call_count("uninstall_plugin"),
+        uninstall_calls
+    );
+    assert!(fixture.operations.plugin_present.get());
+    settings::matches(&retained.settings).unwrap();
+}
+
+#[test]
 fn interrupted_install_recovery_removes_the_uncommitted_generation() {
     let fixture = LifecycleFixture::new(platform::Platform::Linux, false);
     install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
     let installed = fixture.installed_state();
-    fixture.write_journal("install", "sidecar_healthy", &installed.generation, None);
+    fixture.write_journal("install", "proxy_healthy", &installed.generation, None);
 
     recover_interrupted_operation(
         &fixture.operations,
@@ -1096,7 +2177,7 @@ fn preparation_recovery_handles_new_and_preexisting_generations() {
     assert!(!fixture.state_path().exists());
     drop(fixture);
 
-    let fixture = LifecycleFixture::new(platform::Platform::Windows, true);
+    let fixture = LifecycleFixture::new(platform::Platform::Windows, false);
     install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
     let installed = fixture.installed_state();
     fixture.write_journal(
@@ -1137,7 +2218,6 @@ fn interrupted_uninstall_is_restored_or_finished_by_journal_stage() {
     .unwrap();
     assert!(fixture.state_path().exists());
     assert!(!state::journal_path(&installed.install_root).exists());
-    assert!(fixture.operations.called("stop_direct_gateway"));
 
     fixture.write_journal(
         "uninstall",
@@ -1156,14 +2236,64 @@ fn interrupted_uninstall_is_restored_or_finished_by_journal_stage() {
 }
 
 #[test]
+fn committed_partial_uninstall_recovery_retains_shared_proxy_state() {
+    let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
+    install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
+    let mut before = fixture.installed_state();
+    before.enrollments.insert(
+        "codex".into(),
+        state::AgentEnrollment {
+            username: "nemo-relay-codex".into(),
+            token: "codex-secret".into(),
+            installed_at: "now".into(),
+            upstream_proxy: None,
+            client_ca_bundle_source: None,
+            client_ca_bundle_variable: None,
+        },
+    );
+    let mut active = before.clone();
+    active.enrollments.remove("claude");
+    active.claude_desktop_installed = false;
+    active.settings = Default::default();
+    state::write(&active).unwrap();
+    fixture.write_journal(
+        "uninstall",
+        "committed_retained",
+        &active.generation,
+        Some(before),
+    );
+
+    recover_interrupted_operation(
+        &fixture.operations,
+        &active.install_root,
+        &fixture.state_path(),
+        platform::Platform::MacOs,
+    )
+    .unwrap();
+
+    assert!(active.install_root.exists());
+    assert_eq!(
+        fixture
+            .installed_state()
+            .enrollments
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["codex"]
+    );
+    assert!(!state::journal_path(&active.install_root).exists());
+}
+
+#[test]
 fn interrupted_operation_rejects_platform_and_generation_mismatch() {
     let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
     install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
     let mut installed = fixture.installed_state();
     installed.platform = "windows".into();
+    installed.service_identity = Some("S-1-5-21-1000".into());
     fixture.write_journal(
         "install",
-        "sidecar_healthy",
+        "proxy_healthy",
         &installed.generation,
         Some(installed.clone()),
     );
@@ -1179,9 +2309,10 @@ fn interrupted_operation_rejects_platform_and_generation_mismatch() {
     );
 
     installed.platform = "macos".into();
+    installed.service_identity = None;
     fixture.write_journal(
         "install",
-        "sidecar_healthy",
+        "proxy_healthy",
         "different-generation",
         Some(installed.clone()),
     );
@@ -1331,13 +2462,15 @@ fn doctor_reports_expiry_journal_files_proxy_and_fingerprint_independently() {
         no_proxy: None,
         ca_bundle: None,
     });
-    std::fs::remove_file(&installed.certificate.leaf_key_der).unwrap();
+    std::fs::remove_file(&installed.certificate.ca_key_der).unwrap();
     state::write(&installed).unwrap();
-    fixture.write_journal("install", "sidecar_healthy", &installed.generation, None);
+    fixture.write_journal("install", "proxy_healthy", &installed.generation, None);
+    std::fs::write(agent_transaction_path().unwrap(), "{}").unwrap();
 
     let report = doctor_report_with(&fixture.operations, Some(&fixture.marketplace_dir)).unwrap();
     for name in [
         "transaction_journal",
+        "shared_transaction_journals",
         "certificate_files",
         "certificate_expiry",
         "file_permissions",
@@ -1356,7 +2489,7 @@ fn doctor_reports_expiry_journal_files_proxy_and_fingerprint_independently() {
 }
 
 #[test]
-fn doctor_warns_before_certificate_expiry_without_marking_protection_unhealthy() {
+fn doctor_warns_for_near_expiry_and_rejects_tampered_expiry_metadata() {
     let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
     install_with(&fixture.operations, fixture.install_request(false, true)).unwrap();
     let mut installed = fixture.installed_state();
@@ -1372,7 +2505,13 @@ fn doctor_warns_before_certificate_expiry_without_marking_protection_unhealthy()
         .unwrap();
     assert!(expiry.ok);
     assert!(expiry.details.contains("rotate with"));
-    assert!(report.ok);
+    assert!(!report.ok);
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "certificate_files" && !check.ok)
+    );
 }
 
 #[test]
@@ -1390,13 +2529,13 @@ fn rollback_error_collection_preserves_every_failure() {
 #[test]
 fn fresh_install_cleanup_preserves_unknown_files() {
     let fixture = LifecycleFixture::new(platform::Platform::MacOs, false);
-    let install_root = fixture.marketplace_dir.join("claude-desktop");
+    let install_root = fixture.marketplace_dir.join("agent-proxy");
     std::fs::create_dir_all(install_root.join("generations")).unwrap();
-    std::fs::write(install_root.join("sidecar.stdout.log"), b"known log").unwrap();
+    std::fs::write(install_root.join("proxy.stdout.log"), b"known log").unwrap();
     std::fs::write(install_root.join("foreign-file"), b"preserve me").unwrap();
 
     assert!(remove_fresh_install_root(&install_root).is_err());
     assert!(install_root.join("foreign-file").exists());
-    assert!(!install_root.join("sidecar.stdout.log").exists());
+    assert!(!install_root.join("proxy.stdout.log").exists());
     assert!(install_root.exists());
 }

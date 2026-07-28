@@ -3,14 +3,7 @@
 
 //! Shared coding-agent command parsing, discovery, and process construction.
 
-pub(crate) mod detached;
-pub(crate) mod launcher;
-mod prepared;
-mod types;
-
-pub(crate) use prepared::PreparedAgentLaunch;
-pub(crate) use prepared::insert_after_host;
-pub(crate) use types::RunOverrides;
+pub(crate) mod status;
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -100,8 +93,8 @@ pub(crate) fn strip_windows_verbatim_prefix(encoded: &[u16]) -> Option<Vec<u16>>
 
 /// Parses the intentionally simple command strings accepted by `[agents.*].command`.
 ///
-/// Complex shell expressions belong after `nemo-relay run --`; configuration values are argv
-/// prefixes and therefore use whitespace separation consistently in launch and diagnostics.
+/// Configuration values are argv prefixes and therefore use whitespace separation consistently
+/// in discovery and diagnostics.
 pub(crate) fn command_argv(command: &str) -> Vec<String> {
     command.split_whitespace().map(ToOwned::to_owned).collect()
 }
@@ -128,16 +121,6 @@ pub(crate) fn resolve_executable(command: &str) -> Option<PathBuf> {
     resolve_executable_for_platform(
         command,
         std::env::var_os("PATH").as_deref(),
-        std::env::var_os("PATHEXT").as_deref(),
-        cfg!(windows),
-    )
-}
-
-/// Resolves a command against an explicit PATH. This keeps setup detection deterministic in tests.
-pub(crate) fn resolve_executable_in_path(command: &str, path: Option<&OsStr>) -> Option<PathBuf> {
-    resolve_executable_for_platform(
-        command,
-        path,
         std::env::var_os("PATHEXT").as_deref(),
         cfg!(windows),
     )
@@ -210,10 +193,3 @@ pub(crate) fn tokio_command(argv: &[String]) -> tokio::process::Command {
     command.args(&argv[1..]);
     command
 }
-
-mod supervision;
-pub(crate) use supervision::SupervisedChild;
-
-#[cfg(test)]
-#[path = "../../tests/coverage/shared/agent_process_tests.rs"]
-mod tests;

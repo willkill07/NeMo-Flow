@@ -224,10 +224,7 @@ executed entrypoint.
 Run the following commands from the project directory:
 
 ```bash
-relay_tmp="$(mktemp -d)"
-relay_config="$relay_tmp/gateway.toml"
-
-nemo-relay --config "$relay_config" plugins add ./relay-plugin.toml
+nemo-relay plugins add --user ./relay-plugin.toml
 ```
 
 `plugins add` creates an isolated Relay-managed Python environment and installs
@@ -244,10 +241,11 @@ process isolation is not a security sandbox.
 
 ## Configure the Plugin
 
-After `plugins add` registers the worker, edit
-`$relay_tmp/plugins.toml`. Add the configuration table to the
-`[[plugins.dynamic]]` entry that `plugins add` created. The configuration sets
-the tag that the worker adds to tool request JSON:
+After `plugins add` registers the worker, run
+`nemo-relay plugins edit --user`. In the user plugin file, add the
+configuration table to the `[[plugins.dynamic]]` entry that `plugins add`
+created. The configuration sets the tag that the worker adds to tool request
+JSON:
 
 ```toml
 # `plugins add` writes the canonical absolute manifest path.
@@ -267,11 +265,13 @@ environment. The `tag` field is optional and defaults to `python_grpc_worker`.
 `nemo-relay plugins validate` checks the manifest, trust evidence, and optional
 static schema. It does not call `WorkerPlugin.validate`.
 
-To test runtime validation:
+To test runtime validation in the persistent coding-agent proxy:
 
-1. Set `reject = true`, then start the gateway. Relay starts the worker and
-   reports the worker diagnostic before it installs registrations.
-2. Set `tag` to a non-string value, then start the gateway. Relay reports the
+1. Register the worker in the user plugin file.
+2. Set `reject = true`, then force-refresh an enrolled coding agent. Relay
+   starts the worker and reports the worker diagnostic before it installs
+   registrations.
+3. Set `tag` to a non-string value, then force-refresh again. Relay reports the
    structured diagnostic from `WorkerPlugin.validate`.
 
 `WorkerPlugin.validate` runs after Relay starts the worker and before Relay
@@ -279,13 +279,19 @@ installs registrations.
 
 ## Run the Plugin
 
-Enable, validate, and start the gateway with the following commands:
+Register and enable the worker in user policy, validate it, and refresh an
+enrolled agent:
 
 ```bash
-nemo-relay --config "$relay_config" plugins enable examples.python_grpc_worker
-nemo-relay --config "$relay_config" plugins validate examples.python_grpc_worker
-nemo-relay --config "$relay_config" --bind 127.0.0.1:4040
+nemo-relay plugins enable examples.python_grpc_worker
+nemo-relay plugins validate examples.python_grpc_worker
+nemo-relay install codex --force
+# Linux only: export CODEX_CA_CERTIFICATE="<path printed by install>"
+nemo-relay doctor codex
 ```
+
+Run Codex normally to exercise the configured component. The removed
+standalone `--bind` launch path is not a worker-validation mechanism.
 
 ## Update the Worker
 
@@ -297,8 +303,8 @@ environment instead of only updating the manifest digest:
 2. Remove the registered worker, then add it again:
 
    ```bash
-   nemo-relay --config "$relay_config" plugins remove examples.python_grpc_worker
-   nemo-relay --config "$relay_config" plugins add ./relay-plugin.toml
+   nemo-relay plugins remove examples.python_grpc_worker
+   nemo-relay plugins add --user ./relay-plugin.toml
    ```
 
 3. Restore any `[[plugins.dynamic]].config` values, then enable the worker.
@@ -309,8 +315,7 @@ Relay-managed environment. It cannot refresh an already registered worker.
 After you stop Relay, remove the plugin and its managed environment:
 
 ```bash
-nemo-relay --config "$relay_config" plugins remove examples.python_grpc_worker
-rm -rf "$relay_tmp"
+nemo-relay plugins remove examples.python_grpc_worker
 ```
 
 Refer to [gRPC Worker Protocol Overview](/build-plugins/dynamic-plugins/grpc-worker/grpc-worker-protocol) for the

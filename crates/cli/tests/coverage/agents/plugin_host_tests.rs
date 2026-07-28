@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, VecDeque};
 #[cfg(windows)]
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -17,7 +17,7 @@ use tempfile::tempdir;
 use toml_edit::{DocumentMut, Item, Value as TomlValue};
 
 use super::*;
-use crate::configuration::{BOOTSTRAP_CLIENT_TOKEN_HEADER, BootstrapChallengeKey};
+use crate::configuration::BOOTSTRAP_CLIENT_TOKEN_HEADER;
 use crate::filesystem::{backup, backup_path, restore_file_snapshot, snapshot_optional_file};
 
 const TEST_PLUGIN_GENERATION: &str = "test-generation";
@@ -90,12 +90,12 @@ fn expected_plugin_command() -> String {
     let relay = current_exe().unwrap();
     let relay = relay.canonicalize().unwrap_or(relay);
     let relay = portable_executable_path(relay);
-    codex_plugin_hook_command(
+    codex_plugin_hook_command_for_platform(
         &relay,
         Path::new("/tmp/nemo-relay-plugin/.nemo-relay-generation"),
         TEST_PLUGIN_GENERATION,
+        cfg!(windows),
     )
-    .unwrap()
 }
 
 fn write_plugin_generation_for_hooks(path: &Path) {
@@ -326,53 +326,6 @@ done
     )
 }
 
-fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 1024];
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                request.extend_from_slice(&buffer[..count]);
-                if http_request_body_complete(&request) {
-                    break;
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                break;
-            }
-            Err(error) => panic!("failed to read local HTTP request: {error}"),
-        }
-    }
-    request
-}
-
-fn http_request_body_complete(request: &[u8]) -> bool {
-    let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return false;
-    };
-    let body_start = header_end + 4;
-    let headers = String::from_utf8_lossy(&request[..body_start]);
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
-        })
-        .unwrap_or(0);
-    request.len() >= body_start + content_length
-}
-
 fn home_env_lock() -> &'static Mutex<()> {
     &crate::test_support::ENV_TEST_LOCK
 }
@@ -456,15 +409,6 @@ impl EnvVarGuard {
         // SAFETY: Callers hold the process-wide environment mutex through HomeScope.
         unsafe {
             std::env::set_var(key, value);
-        }
-        Self { key, previous }
-    }
-
-    fn remove(key: &'static str) -> Self {
-        let previous = std::env::var_os(key);
-        // SAFETY: Callers hold the process-wide environment mutex through HomeScope.
-        unsafe {
-            std::env::remove_var(key);
         }
         Self { key, previous }
     }
@@ -1120,7 +1064,7 @@ fn codex_install_rolls_back_all_files_when_trust_activation_fails() {
     fs::write(&hooks_backup, "original hooks backup\n").unwrap();
 
     let error = install_codex_with_trust(
-        DEFAULT_URL,
+        LEGACY_FIXED_URL,
         &expected_plugin_command(),
         |_home, _config, _command| Err("Codex trust write rejected".into()),
     )
@@ -1150,8 +1094,8 @@ fn repeated_codex_install_does_not_overwrite_original_backup() {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
 
-    install_codex_config(&path, DEFAULT_URL).unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
 
     assert_eq!(
         fs::read_to_string(backup_path(&path)).unwrap(),
@@ -1165,12 +1109,11 @@ fn repeated_codex_install_does_not_overwrite_original_backup() {
         doc["features"]["multi_agent_v2"]["enabled"].as_bool(),
         Some(false)
     );
-    let token = codex_provider_client_token(&doc).unwrap();
-    assert!(
-        BootstrapChallengeKey::load()
-            .unwrap()
-            .verify_client_token(token)
+    assert_eq!(
+        codex_provider_agent_authorization(&doc),
+        Some(TEST_AGENT_AUTHORIZATION)
     );
+    assert!(codex_provider_client_token(&doc).is_none());
 }
 
 #[test]
@@ -1187,7 +1130,7 @@ tool_namespace = "agents"
 "#;
     fs::write(&path, original).unwrap();
 
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     let installed = fs::read_to_string(&path)
         .unwrap()
         .parse::<DocumentMut>()
@@ -1201,7 +1144,7 @@ tool_namespace = "agents"
         Some("agents")
     );
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
 
     let restored = fs::read_to_string(&path)
         .unwrap()
@@ -1228,10 +1171,10 @@ fn codex_uninstall_removes_multi_agent_v2_absent_from_backup() {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
 
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     assert!(backup_path(&path).exists());
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
 
     let restored = fs::read_to_string(&path)
         .unwrap()
@@ -1260,6 +1203,30 @@ X-NeMo-Relay-Client-Token = "regular-table-token"
     );
 }
 
+#[test]
+fn codex_install_reports_the_exact_legacy_mcp_config_path() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        format!(
+            r#"
+[model_providers.nemo-relay-openai]
+name = "NeMo Relay"
+
+[model_providers.nemo-relay-openai.http_headers]
+{BOOTSTRAP_CLIENT_TOKEN_HEADER} = "legacy-token"
+"#
+        ),
+    )
+    .unwrap();
+
+    let error = install_codex_config(&path, LEGACY_FIXED_URL).unwrap_err();
+
+    assert!(error.contains(&path.display().to_string()));
+    assert!(error.contains("previous Relay binary"));
+}
+
 #[cfg(unix)]
 #[test]
 fn codex_install_tightens_the_secret_bearing_config_to_owner_only() {
@@ -1272,7 +1239,7 @@ fn codex_install_tightens_the_secret_bearing_config_to_owner_only() {
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
 
     assert_eq!(
         fs::metadata(path).unwrap().permissions().mode() & 0o777,
@@ -1287,14 +1254,14 @@ fn codex_reinstall_refreshes_a_stale_backup_before_overwriting_user_changes() {
     let path = dir.path().join(".codex").join("config.toml");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
 
     let user_owned = "model_provider = \"local\"\ncustom = \"preserve-me\"\n";
     fs::write(&path, user_owned).unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     assert_eq!(fs::read_to_string(backup_path(&path)).unwrap(), user_owned);
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
 
     assert_eq!(fs::read_to_string(&path).unwrap(), user_owned);
     assert!(!backup_path(&path).exists());
@@ -1307,7 +1274,7 @@ fn codex_reinstall_sanitizes_managed_fields_from_a_partial_edit_backup() {
     let path = dir.path().join(".codex").join("config.toml");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
 
     let installed = fs::read_to_string(&path).unwrap();
     let partially_edited = installed.replacen(
@@ -1318,13 +1285,13 @@ fn codex_reinstall_sanitizes_managed_fields_from_a_partial_edit_backup() {
     assert_ne!(installed, partially_edited);
     fs::write(&path, partially_edited).unwrap();
 
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     let backup = fs::read_to_string(backup_path(&path)).unwrap();
     assert!(backup.contains("model_provider = \"local\""));
     assert!(!backup.contains("nemo-relay-openai"));
     assert!(!backup.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let uninstalled = fs::read_to_string(&path).unwrap();
     assert!(uninstalled.contains("model_provider = \"local\""));
     assert!(!uninstalled.contains("nemo-relay-openai"));
@@ -1343,14 +1310,14 @@ fn codex_uninstall_migrates_a_contaminated_legacy_backup() {
         "model_provider = \"openai\"\ncustom = \"preserve-me\"\n",
     )
     .unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
 
     // Older partial-reinstall logic could replace the original backup with the complete
     // generated config. Uninstall must recognize its authenticated proof and not restore it.
     let contaminated = fs::read(&path).unwrap();
     fs::write(backup_path(&path), contaminated).unwrap();
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let uninstalled = fs::read_to_string(&path).unwrap();
     assert!(uninstalled.contains("custom = \"preserve-me\""));
     assert!(!uninstalled.contains("nemo-relay-openai"));
@@ -1366,7 +1333,7 @@ fn codex_backup_migration_preserves_user_provider_extensions() {
     let path = dir.path().join(".codex").join("config.toml");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
 
     let extended = fs::read_to_string(&path).unwrap().replace(
         "name = \"NeMo Relay\"",
@@ -1375,11 +1342,11 @@ fn codex_backup_migration_preserves_user_provider_extensions() {
     fs::write(&path, &extended).unwrap();
     fs::write(backup_path(&path), &extended).unwrap();
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let uninstalled = fs::read_to_string(&path).unwrap();
     assert!(uninstalled.contains("user_option = \"keep\""));
     assert!(!uninstalled.contains("model_provider = \"nemo-relay-openai\""));
-    assert!(uninstalled.contains(&format!("base_url = \"{DEFAULT_URL}\"")));
+    assert!(uninstalled.contains(&format!("base_url = \"{LEGACY_FIXED_URL}\"")));
     assert!(!uninstalled.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
     assert!(!uninstalled.contains("hooks = true"));
     assert!(!backup_path(&path).exists());
@@ -1392,7 +1359,7 @@ fn codex_reinstall_round_trips_user_provider_fields_and_headers() {
     let path = dir.path().join(".codex").join("config.toml");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
 
     let mut extended = fs::read_to_string(&path)
         .unwrap()
@@ -1408,26 +1375,30 @@ fn codex_reinstall_round_trips_user_provider_fields_and_headers() {
         .insert("x-user-header", TomlValue::from("keep-header"));
     fs::write(&path, extended.to_string()).unwrap();
 
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     let reinstalled = fs::read_to_string(&path).unwrap();
-    assert!(reinstalled.contains("user_option = \"keep\""));
-    assert!(reinstalled.contains("x-user-header = \"keep-header\""));
-    assert!(reinstalled.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
+    assert_codex_user_provider_fields(&reinstalled);
+    assert!(reinstalled.contains(AGENT_AUTHORIZATION_HEADER));
     let backup = fs::read_to_string(backup_path(&path)).unwrap();
-    assert!(backup.contains("model_provider = \"openai\""));
-    assert!(backup.contains("user_option = \"keep\""));
-    assert!(backup.contains("x-user-header = \"keep-header\""));
-    assert!(!backup.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
-    assert!(backup.contains(&format!("base_url = \"{DEFAULT_URL}\"")));
+    assert_restored_codex_provider(&backup);
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let uninstalled = fs::read_to_string(&path).unwrap();
-    assert!(uninstalled.contains("model_provider = \"openai\""));
-    assert!(uninstalled.contains("user_option = \"keep\""));
-    assert!(uninstalled.contains("x-user-header = \"keep-header\""));
-    assert!(!uninstalled.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
-    assert!(uninstalled.contains(&format!("base_url = \"{DEFAULT_URL}\"")));
+    assert_restored_codex_provider(&uninstalled);
     assert!(!uninstalled.contains("hooks = true"));
+}
+
+fn assert_codex_user_provider_fields(config: &str) {
+    assert!(config.contains("user_option = \"keep\""));
+    assert!(config.contains("x-user-header = \"keep-header\""));
+}
+
+fn assert_restored_codex_provider(config: &str) {
+    assert!(config.contains("model_provider = \"openai\""));
+    assert_codex_user_provider_fields(config);
+    assert!(!config.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
+    assert!(!config.contains(AGENT_AUTHORIZATION_HEADER));
+    assert!(config.contains(&format!("base_url = \"{LEGACY_FIXED_URL}\"")));
 }
 
 #[test]
@@ -1437,7 +1408,7 @@ fn codex_direct_uninstall_preserves_a_complete_extended_provider_inactively() {
     let path = dir.path().join(".codex").join("config.toml");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     let mut extended = fs::read_to_string(&path)
         .unwrap()
         .parse::<DocumentMut>()
@@ -1452,10 +1423,10 @@ fn codex_direct_uninstall_preserves_a_complete_extended_provider_inactively() {
         .insert("x-user-header", TomlValue::from("keep-header"));
     fs::write(&path, extended.to_string()).unwrap();
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let uninstalled = fs::read_to_string(&path).unwrap();
     assert!(uninstalled.contains("model_provider = \"openai\""));
-    assert!(uninstalled.contains(&format!("base_url = \"{DEFAULT_URL}\"")));
+    assert!(uninstalled.contains(&format!("base_url = \"{LEGACY_FIXED_URL}\"")));
     assert!(uninstalled.contains("name = \"NeMo Relay\""));
     assert!(uninstalled.contains("user_option = \"keep\""));
     assert!(uninstalled.contains("x-user-header = \"keep-header\""));
@@ -1470,7 +1441,7 @@ fn codex_uninstall_sanitizes_an_extended_contaminated_backup_without_the_key() {
     let path = dir.path().join(".codex").join("config.toml");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "model_provider = \"openai\"\ncustom = \"keep\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     let mut installed = fs::read_to_string(&path)
         .unwrap()
         .parse::<DocumentMut>()
@@ -1485,19 +1456,15 @@ fn codex_uninstall_sanitizes_an_extended_contaminated_backup_without_the_key() {
         .insert("x-user-header", TomlValue::from("keep-header"));
     fs::write(&path, installed.to_string()).unwrap();
     fs::write(backup_path(&path), fs::read(&path).unwrap()).unwrap();
-    let key_path = crate::configuration::user_config_dir()
-        .unwrap()
-        .join("bootstrap/fingerprint-hmac.key");
-    fs::remove_file(key_path).unwrap();
-
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let uninstalled = fs::read_to_string(&path).unwrap();
     assert!(uninstalled.contains("custom = \"keep\""));
     assert!(!uninstalled.contains("model_provider = \"nemo-relay-openai\""));
-    assert!(uninstalled.contains(&format!("base_url = \"{DEFAULT_URL}\"")));
+    assert!(uninstalled.contains(&format!("base_url = \"{LEGACY_FIXED_URL}\"")));
     assert!(uninstalled.contains("user_option = \"keep\""));
     assert!(uninstalled.contains("x-user-header = \"keep-header\""));
     assert!(!uninstalled.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
+    assert!(!uninstalled.contains(AGENT_AUTHORIZATION_HEADER));
     assert!(!uninstalled.contains("hooks = true"));
 }
 
@@ -1508,7 +1475,7 @@ fn codex_uninstall_sanitizes_an_extended_contaminated_backup_after_key_rotation(
     let path = dir.path().join(".codex").join("config.toml");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "model_provider = \"openai\"\ncustom = \"keep\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     let mut installed = fs::read_to_string(&path)
         .unwrap()
         .parse::<DocumentMut>()
@@ -1523,30 +1490,26 @@ fn codex_uninstall_sanitizes_an_extended_contaminated_backup_after_key_rotation(
         .insert("x-user-header", TomlValue::from("keep-header"));
     fs::write(&path, installed.to_string()).unwrap();
     fs::write(backup_path(&path), fs::read(&path).unwrap()).unwrap();
-    let key_path = crate::configuration::user_config_dir()
-        .unwrap()
-        .join("bootstrap/fingerprint-hmac.key");
-    fs::write(key_path, [0x5a; 32]).unwrap();
-
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let uninstalled = fs::read_to_string(&path).unwrap();
     assert!(uninstalled.contains("custom = \"keep\""));
     assert!(!uninstalled.contains("model_provider = \"nemo-relay-openai\""));
-    assert!(uninstalled.contains(&format!("base_url = \"{DEFAULT_URL}\"")));
+    assert!(uninstalled.contains(&format!("base_url = \"{LEGACY_FIXED_URL}\"")));
     assert!(uninstalled.contains("user_option = \"keep\""));
     assert!(uninstalled.contains("x-user-header = \"keep-header\""));
     assert!(!uninstalled.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
+    assert!(!uninstalled.contains(AGENT_AUTHORIZATION_HEADER));
     assert!(!uninstalled.contains("hooks = true"));
 }
 
 #[test]
-fn codex_reinstall_repairs_a_rotated_client_proof_and_keeps_custom_headers() {
+fn codex_reinstall_repairs_a_changed_agent_authorization_and_keeps_custom_headers() {
     let dir = tempdir().unwrap();
     let _home = HomeScope::enter(dir.path());
     let path = dir.path().join(".codex").join("config.toml");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     let mut installed = fs::read_to_string(&path)
         .unwrap()
         .parse::<DocumentMut>()
@@ -1555,23 +1518,23 @@ fn codex_reinstall_repairs_a_rotated_client_proof_and_keeps_custom_headers() {
         .as_inline_table_mut()
         .unwrap()
         .insert("x-user-header", TomlValue::from("keep-header"));
-    fs::write(&path, installed.to_string()).unwrap();
-    let key_path = crate::configuration::user_config_dir()
+    installed["model_providers"]["nemo-relay-openai"]["http_headers"]
+        .as_inline_table_mut()
         .unwrap()
-        .join("bootstrap/fingerprint-hmac.key");
-    fs::write(key_path, [0x3c; 32]).unwrap();
+        .insert(
+            AGENT_AUTHORIZATION_HEADER,
+            TomlValue::from("Basic d3Jvbmc6d3Jvbmc="),
+        );
+    fs::write(&path, installed.to_string()).unwrap();
 
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     let reinstalled = fs::read_to_string(&path)
         .unwrap()
         .parse::<DocumentMut>()
         .unwrap();
-    let token = codex_provider_client_token(&reinstalled).unwrap();
-    assert!(
-        BootstrapChallengeKey::load_existing()
-            .unwrap()
-            .unwrap()
-            .verify_client_token(token)
+    assert_eq!(
+        codex_provider_agent_authorization(&reinstalled),
+        Some(TEST_AGENT_AUTHORIZATION)
     );
     assert_eq!(
         codex_provider_header(&reinstalled, "x-user-header").and_then(TomlValue::as_str),
@@ -1579,6 +1542,7 @@ fn codex_reinstall_repairs_a_rotated_client_proof_and_keeps_custom_headers() {
     );
     let backup = fs::read_to_string(backup_path(&path)).unwrap();
     assert!(!backup.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
+    assert!(!backup.contains(AGENT_AUTHORIZATION_HEADER));
     assert!(backup.contains("x-user-header = \"keep-header\""));
 }
 
@@ -1596,7 +1560,7 @@ fn codex_install_rollback_restores_original_private_permissions() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
     let error = install_codex_with_trust(
-        DEFAULT_URL,
+        LEGACY_FIXED_URL,
         &expected_plugin_command(),
         |_home, _config, _command| Err("injected trust failure".into()),
     )
@@ -1626,7 +1590,7 @@ fn codex_install_rollback_restores_the_original_windows_dacl() {
     let original_dacl = crate::filesystem::read_windows_dacl(&path).unwrap();
 
     let error = install_codex_with_trust(
-        DEFAULT_URL,
+        LEGACY_FIXED_URL,
         &expected_plugin_command(),
         |_home, _config, _command| Err("injected trust failure".into()),
     )
@@ -1699,7 +1663,7 @@ fn codex_upgrade_adds_client_proof_without_replacing_original_backup() {
     let path = dir.path().join(".codex").join("config.toml");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     let original_backup = fs::read(backup_path(&path)).unwrap();
 
     let mut legacy = fs::read_to_string(&path)
@@ -1712,10 +1676,10 @@ fn codex_upgrade_adds_client_proof_without_replacing_original_backup() {
         .remove("http_headers");
     fs::write(&path, legacy.to_string()).unwrap();
 
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
 
     assert_eq!(fs::read(backup_path(&path)).unwrap(), original_backup);
-    assert!(codex_provider_installed(DEFAULT_URL));
+    assert!(codex_provider_installed(LEGACY_FIXED_URL));
 }
 
 #[test]
@@ -1732,12 +1696,12 @@ name = "NeMo Relay"
 base_url = "http://127.0.0.1:47632"
 wire_api = "responses"
 requires_openai_auth = true
-supports_websockets = false
+supports_websockets = true
 "#,
     )
     .unwrap();
 
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
 
     assert!(
         fs::read_to_string(backup_path(&path))
@@ -1763,16 +1727,16 @@ name = "NeMo Relay"
 base_url = "http://127.0.0.1:47632"
 wire_api = "responses"
 requires_openai_auth = true
-supports_websockets = false
+supports_websockets = true
 "#,
     )
     .unwrap();
 
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
 
     let backup = fs::read_to_string(backup_path(&path)).unwrap();
     assert!(backup.contains("hooks = false"));
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let updated = fs::read_to_string(&path).unwrap();
     assert!(updated.contains("hooks = false"));
 }
@@ -1796,19 +1760,19 @@ name = "NeMo Relay"
 base_url = "http://127.0.0.1:47632"
 wire_api = "responses"
 requires_openai_auth = true
-supports_websockets = false
+supports_websockets = true
 "#,
     )
     .unwrap();
 
-    assert!(!codex_provider_installed(DEFAULT_URL));
+    assert!(!codex_provider_installed(LEGACY_FIXED_URL));
     assert!(
         !xdg.join("nemo-relay/bootstrap/fingerprint-hmac.key")
             .exists(),
         "read-only provider diagnosis must not create bootstrap state"
     );
-    install_codex_config(&path, DEFAULT_URL).unwrap();
-    assert!(codex_provider_installed(DEFAULT_URL));
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
+    assert!(codex_provider_installed(LEGACY_FIXED_URL));
     let mut tampered = fs::read_to_string(&path)
         .unwrap()
         .parse::<DocumentMut>()
@@ -1817,13 +1781,13 @@ supports_websockets = false
         .as_inline_table_mut()
         .unwrap()
         .insert(
-            BOOTSTRAP_CLIENT_TOKEN_HEADER,
-            TomlValue::from("hmac-sha256:wrong"),
+            AGENT_AUTHORIZATION_HEADER,
+            TomlValue::from("Basic d3Jvbmc6d3Jvbmc="),
         );
     fs::write(&path, tampered.to_string()).unwrap();
-    assert!(!codex_provider_installed(DEFAULT_URL));
-    install_codex_config(&path, DEFAULT_URL).unwrap();
-    assert!(codex_provider_installed(DEFAULT_URL));
+    assert!(!codex_provider_installed(LEGACY_FIXED_URL));
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
+    assert!(codex_provider_installed(LEGACY_FIXED_URL));
     assert!(!codex_provider_installed("http://127.0.0.1:47633"));
     fs::write(
         &path,
@@ -1838,11 +1802,11 @@ name = "NeMo Relay"
 base_url = "http://127.0.0.1:47632"
 wire_api = "responses"
 requires_openai_auth = true
-supports_websockets = false
+supports_websockets = true
 "#,
     )
     .unwrap();
-    assert!(!codex_provider_installed(DEFAULT_URL));
+    assert!(!codex_provider_installed(LEGACY_FIXED_URL));
 }
 
 #[test]
@@ -1912,20 +1876,20 @@ fn codex_setup_can_validate_hooks_while_installer_holds_the_generation_lock() {
 
 #[cfg(not(windows))]
 #[test]
-fn codex_doctor_requires_app_server_reported_trust_but_allows_stopped_sidecar() {
+fn codex_doctor_requires_app_server_reported_trust_but_allows_stopped_proxy() {
     let dir = tempdir().unwrap();
     let _home = HomeScope::enter(dir.path());
     let codex_dir = dir.path().join(".codex");
     fs::create_dir_all(&codex_dir).unwrap();
-    install_codex_config(&codex_dir.join("config.toml"), DEFAULT_URL).unwrap();
+    install_codex_config(&codex_dir.join("config.toml"), LEGACY_FIXED_URL).unwrap();
     let plugin_root = dir.path().join("plugin");
     let hooks_path = write_plugin_hooks(&plugin_root);
     let trusted = required_codex_hook_metadata(&hooks_path, "trusted", true);
     let (_path, _hooks, _log) = fake_codex_app_server(dir.path(), &trusted);
     let _plugin_root = EnvVarGuard::set_path("PLUGIN_ROOT", &plugin_root);
 
-    doctor_plugin(CodingAgent::Codex, DEFAULT_URL, &plugin_root).unwrap();
-    let report = doctor_plugin_json(CodingAgent::Codex, DEFAULT_URL, &plugin_root).unwrap();
+    doctor_plugin(CodingAgent::Codex, LEGACY_FIXED_URL, &plugin_root).unwrap();
+    let report = doctor_plugin_json(CodingAgent::Codex, LEGACY_FIXED_URL, &plugin_root).unwrap();
     assert_eq!(report["checks"]["codex_hooks_trusted"], json!(true));
     assert_eq!(
         report["codex_hook_trust"]["trusted"],
@@ -1956,14 +1920,14 @@ name = "NeMo Relay"
 base_url = "http://127.0.0.1:47632"
 wire_api = "responses"
 requires_openai_auth = true
-supports_websockets = false
+supports_websockets = true
 "#,
     )
     .unwrap();
     let plugin_root = dir.path().join("plugin");
     let hooks_path = write_plugin_hooks(&plugin_root);
 
-    assert!(!codex_provider_installed(DEFAULT_URL));
+    assert!(!codex_provider_installed(LEGACY_FIXED_URL));
     assert!(codex_hooks_installed(&hooks_path).unwrap());
 }
 
@@ -1973,19 +1937,19 @@ fn plugin_host_doctor_rejects_unsupported_agents_and_reports_lazy_claude_status(
     let _home = HomeScope::enter(dir.path());
 
     assert!(
-        doctor_plugin(CodingAgent::Hermes, DEFAULT_URL, dir.path())
+        doctor_plugin(CodingAgent::Hermes, LEGACY_FIXED_URL, dir.path())
             .unwrap_err()
             .contains("supports claude and codex")
     );
     assert!(
-        doctor_plugin_json(CodingAgent::Hermes, DEFAULT_URL, dir.path())
+        doctor_plugin_json(CodingAgent::Hermes, LEGACY_FIXED_URL, dir.path())
             .unwrap_err()
             .contains("supports claude and codex")
     );
 
-    let report = doctor_plugin_json(CodingAgent::ClaudeCode, DEFAULT_URL, dir.path()).unwrap();
+    let report = doctor_plugin_json(CodingAgent::ClaudeCode, LEGACY_FIXED_URL, dir.path()).unwrap();
     assert_eq!(report["ok"], json!(false));
-    assert_eq!(report["sidecar_health"], json!("not_running_mcp_start"));
+    assert_eq!(report["proxy_service_health"], json!("not_running"));
     assert_eq!(report["checks"]["claude_provider_routing"], json!(false));
 }
 
@@ -1997,7 +1961,7 @@ fn codex_setup_uses_plugin_hooks_without_writing_user_hooks() {
     fs::create_dir_all(&codex_dir).unwrap();
 
     install_codex_with_trust(
-        DEFAULT_URL,
+        LEGACY_FIXED_URL,
         &expected_plugin_command(),
         |_home, _config, command| {
             assert_eq!(command, expected_plugin_command());
@@ -2008,10 +1972,10 @@ fn codex_setup_uses_plugin_hooks_without_writing_user_hooks() {
 
     let hooks_path = codex_dir.join("hooks.json");
     assert!(!hooks_path.exists());
-    assert!(codex_provider_installed(DEFAULT_URL));
+    assert!(codex_provider_installed(LEGACY_FIXED_URL));
 
     let mut client = empty_codex_hooks_client();
-    uninstall_codex_with_client(DEFAULT_URL, Some(&mut client)).unwrap();
+    uninstall_codex_with_client(LEGACY_FIXED_URL, Some(&mut client)).unwrap();
     assert!(!hooks_path.exists());
 }
 
@@ -2023,7 +1987,7 @@ fn codex_setup_and_uninstall_honor_custom_codex_home() {
     let _codex_home = EnvVarGuard::set_path("CODEX_HOME", &codex_home);
 
     install_codex_with_trust(
-        DEFAULT_URL,
+        LEGACY_FIXED_URL,
         &expected_plugin_command(),
         |_cwd, config_path, _command| {
             assert_eq!(config_path, codex_home.join("config.toml"));
@@ -2032,25 +1996,13 @@ fn codex_setup_and_uninstall_honor_custom_codex_home() {
     )
     .unwrap();
 
-    assert!(codex_provider_installed(DEFAULT_URL));
+    assert!(codex_provider_installed(LEGACY_FIXED_URL));
     assert!(codex_home.join("config.toml").exists());
     assert!(!dir.path().join("home/.codex/config.toml").exists());
 
     let mut client = empty_codex_hooks_client();
-    uninstall_codex_with_client(DEFAULT_URL, Some(&mut client)).unwrap();
-    assert!(!codex_provider_installed(DEFAULT_URL));
-}
-
-#[test]
-fn relay_binary_prefers_sidecar_binary_override() {
-    let dir = tempdir().unwrap();
-    let _home = HomeScope::enter(dir.path());
-    let sidecar_override = dir.path().join("sidecar").join("nemo-relay");
-    fs::create_dir_all(sidecar_override.parent().unwrap()).unwrap();
-    fs::write(&sidecar_override, b"sidecar override").unwrap();
-    let _binary_override = EnvVarGuard::set_path("NEMO_RELAY_PLUGIN_BINARY", &sidecar_override);
-
-    assert_eq!(relay_binary().unwrap(), sidecar_override);
+    uninstall_codex_with_client(LEGACY_FIXED_URL, Some(&mut client)).unwrap();
+    assert!(!codex_provider_installed(LEGACY_FIXED_URL));
 }
 
 #[test]
@@ -2073,12 +2025,12 @@ name = "NeMo Relay"
 base_url = "http://127.0.0.1:47632"
 wire_api = "responses"
 requires_openai_auth = true
-supports_websockets = false
+supports_websockets = true
 "#,
     )
     .unwrap();
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let updated = fs::read_to_string(&path).unwrap();
 
     assert!(!updated.contains("model_provider"));
@@ -2097,8 +2049,8 @@ fn codex_uninstall_clears_all_trust_for_the_exact_relay_plugin() {
     let hooks_path = codex_dir.join("hooks.json");
     fs::write(&config_path, "model_provider = \"openai\"\n").unwrap();
     fs::write(&hooks_path, "{}\n").unwrap();
-    install_codex_hooks(&hooks_path, DEFAULT_URL).unwrap();
-    install_codex_config(&config_path, DEFAULT_URL).unwrap();
+    install_codex_hooks(&hooks_path, LEGACY_FIXED_URL).unwrap();
+    install_codex_config(&config_path, LEGACY_FIXED_URL).unwrap();
     let mut hooks = generated_codex_hook_metadata(&hooks_path, "trusted", true);
     let mut unrelated = codex_hook_metadata(
         &hooks_path,
@@ -2118,7 +2070,7 @@ fn codex_uninstall_clears_all_trust_for_the_exact_relay_plugin() {
         ..FakeCodexHooksClient::default()
     };
 
-    uninstall_codex_with_client(DEFAULT_URL, Some(&mut client)).unwrap();
+    uninstall_codex_with_client(LEGACY_FIXED_URL, Some(&mut client)).unwrap();
 
     assert_eq!(
         client.cleared,
@@ -2171,7 +2123,7 @@ fn codex_uninstall_clears_persisted_optional_hooks_after_downgrade() {
         ..FakeCodexHooksClient::default()
     };
 
-    uninstall_codex_with_client(DEFAULT_URL, Some(&mut client)).unwrap();
+    uninstall_codex_with_client(LEGACY_FIXED_URL, Some(&mut client)).unwrap();
 
     assert_eq!(
         client.cleared[0].iter().cloned().collect::<BTreeSet<_>>(),
@@ -2203,7 +2155,7 @@ fn codex_uninstall_clears_persisted_relay_trust_when_discovery_is_empty() {
         ..FakeCodexHooksClient::default()
     };
 
-    uninstall_codex_with_client(DEFAULT_URL, Some(&mut client)).unwrap();
+    uninstall_codex_with_client(LEGACY_FIXED_URL, Some(&mut client)).unwrap();
 
     assert_eq!(client.cleared.len(), 1);
     assert_eq!(
@@ -2236,7 +2188,7 @@ fn codex_uninstall_rolls_back_persisted_relay_trust_when_clear_is_not_applied() 
         ..FakeCodexHooksClient::default()
     };
 
-    let error = uninstall_codex_with_client(DEFAULT_URL, Some(&mut client)).unwrap_err();
+    let error = uninstall_codex_with_client(LEGACY_FIXED_URL, Some(&mut client)).unwrap_err();
 
     assert!(error.contains("did not clear trust"), "{error}");
     assert_eq!(fs::read(&config_path).unwrap(), original_config);
@@ -2261,8 +2213,8 @@ fn codex_uninstall_restores_files_even_when_trust_cleanup_fails() {
     let hooks_path = codex_dir.join("hooks.json");
     fs::write(&config_path, "model_provider = \"openai\"\n").unwrap();
     fs::write(&hooks_path, "{}\n").unwrap();
-    install_codex_hooks(&hooks_path, DEFAULT_URL).unwrap();
-    install_codex_config(&config_path, DEFAULT_URL).unwrap();
+    install_codex_hooks(&hooks_path, LEGACY_FIXED_URL).unwrap();
+    install_codex_config(&config_path, LEGACY_FIXED_URL).unwrap();
     let original_config = fs::read(&config_path).unwrap();
     let original_config_backup = fs::read(backup_path(&config_path)).unwrap();
     let original_hooks = fs::read(&hooks_path).unwrap();
@@ -2274,7 +2226,7 @@ fn codex_uninstall_restores_files_even_when_trust_cleanup_fails() {
         ..FakeCodexHooksClient::default()
     };
 
-    let error = uninstall_codex_with_client(DEFAULT_URL, Some(&mut client)).unwrap_err();
+    let error = uninstall_codex_with_client(LEGACY_FIXED_URL, Some(&mut client)).unwrap_err();
 
     assert!(error.contains("config is locked"), "{error}");
     assert_eq!(fs::read(&config_path).unwrap(), original_config);
@@ -2303,7 +2255,7 @@ fn codex_uninstall_requires_trust_client_before_mutating_files() {
     let original_config = fs::read(&config_path).unwrap();
     let original_hooks = fs::read(&hooks_path).unwrap();
 
-    let error = uninstall_codex_with_client(DEFAULT_URL, None).unwrap_err();
+    let error = uninstall_codex_with_client(LEGACY_FIXED_URL, None).unwrap_err();
 
     assert!(error.contains("app-server is required"), "{error}");
     assert_eq!(fs::read(&config_path).unwrap(), original_config);
@@ -2320,8 +2272,8 @@ fn codex_uninstall_rolls_back_when_trust_cleanup_cannot_be_verified() {
     let hooks_path = codex_dir.join("hooks.json");
     fs::write(&config_path, "model_provider = \"openai\"\n").unwrap();
     fs::write(&hooks_path, "{}\n").unwrap();
-    install_codex_hooks(&hooks_path, DEFAULT_URL).unwrap();
-    install_codex_config(&config_path, DEFAULT_URL).unwrap();
+    install_codex_hooks(&hooks_path, LEGACY_FIXED_URL).unwrap();
+    install_codex_config(&config_path, LEGACY_FIXED_URL).unwrap();
     let original_config = fs::read(&config_path).unwrap();
     let original_hooks = fs::read(&hooks_path).unwrap();
     let trusted = required_codex_hook_metadata(&hooks_path, "trusted", true);
@@ -2330,7 +2282,7 @@ fn codex_uninstall_rolls_back_when_trust_cleanup_cannot_be_verified() {
         ..FakeCodexHooksClient::default()
     };
 
-    let error = uninstall_codex_with_client(DEFAULT_URL, Some(&mut client)).unwrap_err();
+    let error = uninstall_codex_with_client(LEGACY_FIXED_URL, Some(&mut client)).unwrap_err();
 
     assert!(error.contains("did not clear trust"), "{error}");
     assert_eq!(fs::read(&config_path).unwrap(), original_config);
@@ -2343,7 +2295,7 @@ fn codex_uninstall_with_backup_preserves_user_changed_model_provider() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("config.toml");
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     fs::write(
         &path,
         r#"
@@ -2357,15 +2309,54 @@ name = "NeMo Relay"
 base_url = "http://127.0.0.1:47632"
 wire_api = "responses"
 requires_openai_auth = true
-supports_websockets = false
+supports_websockets = true
 "#,
     )
     .unwrap();
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let updated = fs::read_to_string(&path).unwrap();
 
     assert!(updated.contains("model_provider = \"local\""));
+    assert!(!updated.contains("nemo-relay-openai"));
+    assert!(!backup_path(&path).exists());
+}
+
+#[test]
+fn codex_uninstall_retries_after_a_concurrent_config_writer() {
+    let dir = tempdir().unwrap();
+    let _home = HomeScope::enter(dir.path());
+    let path = dir.path().join(".codex/config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "model_provider = \"openai\"\n").unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
+
+    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let completed = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let writer_path = path.clone();
+    let writer_release = release.clone();
+    let writer_completed = completed.clone();
+    let writer = std::thread::spawn(move || {
+        writer_release.wait();
+        let mut raw = fs::read_to_string(&writer_path).unwrap();
+        raw.push_str("\n[user]\nconcurrent = true\n");
+        fs::write(&writer_path, raw).unwrap();
+        writer_completed.wait();
+    });
+    let mut first_attempt = true;
+    uninstall_codex_config_with_hook(&path, LEGACY_FIXED_URL, false, || {
+        if first_attempt {
+            first_attempt = false;
+            release.wait();
+            completed.wait();
+        }
+    })
+    .unwrap();
+    writer.join().unwrap();
+
+    let updated = fs::read_to_string(&path).unwrap();
+    assert!(updated.contains("[user]"));
+    assert!(updated.contains("concurrent = true"));
     assert!(!updated.contains("nemo-relay-openai"));
     assert!(!backup_path(&path).exists());
 }
@@ -2375,7 +2366,7 @@ fn codex_uninstall_with_backup_preserves_user_changed_provider_table() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("config.toml");
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     fs::write(
         &path,
         r#"
@@ -2389,12 +2380,12 @@ name = "Custom Relay"
 base_url = "http://127.0.0.1:47632"
 wire_api = "responses"
 requires_openai_auth = true
-supports_websockets = false
+supports_websockets = true
 "#,
     )
     .unwrap();
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let updated = fs::read_to_string(&path).unwrap();
 
     assert!(updated.contains("model_provider = \"nemo-relay-openai\""));
@@ -2408,7 +2399,7 @@ fn codex_uninstall_preserves_user_changed_provider_url() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("config.toml");
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     fs::write(
         &path,
         r#"
@@ -2422,12 +2413,12 @@ name = "NeMo Relay"
 base_url = "http://127.0.0.1:49999"
 wire_api = "responses"
 requires_openai_auth = true
-supports_websockets = false
+supports_websockets = true
 "#,
     )
     .unwrap();
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let updated = fs::read_to_string(&path).unwrap();
 
     assert!(updated.contains("model_provider = \"nemo-relay-openai\""));
@@ -2442,18 +2433,19 @@ fn codex_uninstall_removes_proof_from_a_user_modified_provider() {
     let path = dir.path().join(".codex/config.toml");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
     let installed = fs::read_to_string(&path).unwrap();
-    assert!(installed.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
-    let modified = installed.replacen(DEFAULT_URL, "http://127.0.0.1:49999", 1);
+    assert!(installed.contains(AGENT_AUTHORIZATION_HEADER));
+    let modified = installed.replacen(LEGACY_FIXED_URL, "http://127.0.0.1:49999", 1);
     assert_ne!(installed, modified);
     fs::write(&path, modified).unwrap();
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let updated = fs::read_to_string(&path).unwrap();
 
     assert!(updated.contains("base_url = \"http://127.0.0.1:49999\""));
     assert!(!updated.contains(BOOTSTRAP_CLIENT_TOKEN_HEADER));
+    assert!(!updated.contains(AGENT_AUTHORIZATION_HEADER));
     assert!(!backup_path(&path).exists());
 }
 
@@ -2474,12 +2466,12 @@ name = "NeMo Relay"
 base_url = "http://127.0.0.1:49999"
 wire_api = "responses"
 requires_openai_auth = true
-supports_websockets = false
+supports_websockets = true
 "#,
     )
     .unwrap();
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let updated = fs::read_to_string(&path).unwrap();
 
     assert!(updated.contains("model_provider = \"nemo-relay-openai\""));
@@ -2501,7 +2493,7 @@ hooks = true
     )
     .unwrap();
 
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     let updated = fs::read_to_string(&path).unwrap();
 
     assert!(updated.contains("hooks = true"));
@@ -2541,14 +2533,14 @@ hooks = false
     )
     .unwrap();
     install_codex_with_trust(
-        DEFAULT_URL,
+        LEGACY_FIXED_URL,
         &expected_plugin_command(),
         |_home, _config, _command| Ok(()),
     )
     .unwrap();
 
     let mut client = empty_codex_hooks_client();
-    uninstall_codex_with_client(DEFAULT_URL, Some(&mut client)).unwrap();
+    uninstall_codex_with_client(LEGACY_FIXED_URL, Some(&mut client)).unwrap();
 
     let updated_config = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
     assert!(updated_config.contains("hooks = true"));
@@ -2572,13 +2564,13 @@ fn codex_reinstall_uses_fresh_backup_after_prior_uninstall() {
     let path = dir.path().join("config.toml");
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
 
-    install_codex_config(&path, DEFAULT_URL).unwrap();
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
     assert!(!backup_path(&path).exists());
 
     fs::write(&path, "model_provider = \"local\"\n").unwrap();
-    install_codex_config(&path, DEFAULT_URL).unwrap();
-    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    install_codex_config(&path, LEGACY_FIXED_URL).unwrap();
+    uninstall_codex_config(&path, LEGACY_FIXED_URL, false).unwrap();
 
     assert_eq!(
         fs::read_to_string(&path).unwrap(),
@@ -2597,7 +2589,7 @@ fn claude_restore_without_backup_preserves_matching_user_relay_url() {
         &settings,
         serde_json::to_vec_pretty(&json!({
             "env": {
-                "ANTHROPIC_BASE_URL": DEFAULT_URL,
+                "ANTHROPIC_BASE_URL": LEGACY_FIXED_URL,
                 "OTHER": "kept"
             }
         }))
@@ -2605,12 +2597,12 @@ fn claude_restore_without_backup_preserves_matching_user_relay_url() {
     )
     .unwrap();
 
-    restore_claude_provider(DEFAULT_URL).unwrap();
+    restore_claude_provider(LEGACY_FIXED_URL).unwrap();
 
     let updated: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(
         json_env_string(&updated, "ANTHROPIC_BASE_URL"),
-        Some(DEFAULT_URL)
+        Some(LEGACY_FIXED_URL)
     );
     assert_eq!(json_env_string(&updated, "OTHER"), Some("kept"));
     assert!(!backup_path(&settings).exists());
@@ -2634,7 +2626,7 @@ fn claude_enable_rolls_back_backup_when_settings_write_fails() {
     .unwrap();
     crate::filesystem::fail_next_atomic_write(&settings);
 
-    let error = enable_claude_provider(DEFAULT_URL).unwrap_err();
+    let error = enable_claude_provider(LEGACY_FIXED_URL).unwrap_err();
 
     assert!(error.contains("failed to write"));
     assert!(!backup_path(&settings).exists());
@@ -2655,7 +2647,7 @@ fn claude_enable_does_not_back_up_when_env_shape_is_invalid() {
     )
     .unwrap();
 
-    let error = enable_claude_provider(DEFAULT_URL).unwrap_err();
+    let error = enable_claude_provider(LEGACY_FIXED_URL).unwrap_err();
 
     assert!(error.contains("non-object env field"));
     assert!(!backup_path(&settings).exists());
@@ -2680,12 +2672,12 @@ fn claude_restore_with_backup_preserves_user_settings_added_after_install() {
         .unwrap(),
     )
     .unwrap();
-    enable_claude_provider(DEFAULT_URL).unwrap();
+    enable_claude_provider(LEGACY_FIXED_URL).unwrap();
     fs::write(
         &settings,
         serde_json::to_vec_pretty(&json!({
             "env": {
-                "ANTHROPIC_BASE_URL": DEFAULT_URL,
+                "ANTHROPIC_BASE_URL": LEGACY_FIXED_URL,
                 "ORIGINAL": "updated",
                 "ADDED": "kept"
             },
@@ -2695,7 +2687,7 @@ fn claude_restore_with_backup_preserves_user_settings_added_after_install() {
     )
     .unwrap();
 
-    restore_claude_provider(DEFAULT_URL).unwrap();
+    restore_claude_provider(LEGACY_FIXED_URL).unwrap();
 
     let updated: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(
@@ -2724,7 +2716,7 @@ fn claude_restore_with_backup_preserves_user_changed_provider_url() {
         .unwrap(),
     )
     .unwrap();
-    enable_claude_provider(DEFAULT_URL).unwrap();
+    enable_claude_provider(LEGACY_FIXED_URL).unwrap();
     fs::write(
         &settings,
         serde_json::to_vec_pretty(&json!({
@@ -2736,7 +2728,7 @@ fn claude_restore_with_backup_preserves_user_changed_provider_url() {
     )
     .unwrap();
 
-    restore_claude_provider(DEFAULT_URL).unwrap();
+    restore_claude_provider(LEGACY_FIXED_URL).unwrap();
 
     let updated: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(
@@ -2763,7 +2755,7 @@ fn claude_reinstall_refreshes_backup_after_user_owned_restore() {
     )
     .unwrap();
 
-    enable_claude_provider(DEFAULT_URL).unwrap();
+    enable_claude_provider(LEGACY_FIXED_URL).unwrap();
     fs::write(
         &settings,
         serde_json::to_vec_pretty(&json!({
@@ -2774,10 +2766,10 @@ fn claude_reinstall_refreshes_backup_after_user_owned_restore() {
         .unwrap(),
     )
     .unwrap();
-    restore_claude_provider(DEFAULT_URL).unwrap();
+    restore_claude_provider(LEGACY_FIXED_URL).unwrap();
     assert!(backup_path(&settings).exists());
 
-    enable_claude_provider(DEFAULT_URL).unwrap();
+    enable_claude_provider(LEGACY_FIXED_URL).unwrap();
     let refreshed_backup: Value =
         serde_json::from_str(&fs::read_to_string(backup_path(&settings)).unwrap()).unwrap();
     assert_eq!(
@@ -2785,7 +2777,7 @@ fn claude_reinstall_refreshes_backup_after_user_owned_restore() {
         Some("https://custom.example")
     );
 
-    restore_claude_provider(DEFAULT_URL).unwrap();
+    restore_claude_provider(LEGACY_FIXED_URL).unwrap();
 
     let updated: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(
@@ -2812,8 +2804,8 @@ fn claude_reinstall_uses_fresh_backup_after_prior_restore() {
     )
     .unwrap();
 
-    enable_claude_provider(DEFAULT_URL).unwrap();
-    restore_claude_provider(DEFAULT_URL).unwrap();
+    enable_claude_provider(LEGACY_FIXED_URL).unwrap();
+    restore_claude_provider(LEGACY_FIXED_URL).unwrap();
     assert!(!backup_path(&settings).exists());
 
     fs::write(
@@ -2827,8 +2819,8 @@ fn claude_reinstall_uses_fresh_backup_after_prior_restore() {
     )
     .unwrap();
 
-    enable_claude_provider(DEFAULT_URL).unwrap();
-    restore_claude_provider(DEFAULT_URL).unwrap();
+    enable_claude_provider(LEGACY_FIXED_URL).unwrap();
+    restore_claude_provider(LEGACY_FIXED_URL).unwrap();
 
     let updated: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(
@@ -2853,7 +2845,7 @@ fn claude_gateway_url_change_preserves_the_pre_relay_backup() {
     )
     .unwrap();
 
-    enable_claude_provider(DEFAULT_URL).unwrap();
+    enable_claude_provider(LEGACY_FIXED_URL).unwrap();
     let replacement_gateway = "http://127.0.0.1:49999";
     enable_claude_provider(replacement_gateway).unwrap();
     restore_claude_provider(replacement_gateway).unwrap();
@@ -2888,11 +2880,12 @@ fn windows_shell_argument_quoting_and_hook_encoding_preserve_paths() {
             "hook-forward".into(),
             "codex".into(),
             "--gateway-url".into(),
-            DEFAULT_URL.into(),
+            LEGACY_FIXED_URL.into(),
             "--generation-file".into(),
             generation.display().to_string(),
             "--generation-token".into(),
             "test-generation".into(),
+            "--fail-closed".into(),
         ]
     );
     assert_eq!(
@@ -2991,41 +2984,13 @@ fn posix_shell_argument_quoting_and_hook_encoding_preserve_paths() {
     );
     assert_eq!(
         codex_plugin_hook_command_for_platform(&relay, &generation, "test-generation", false),
-        "'/tmp/NeMo $Relay`test'\\''/bin/nemo-relay' hook-forward codex --gateway-url http://127.0.0.1:47632 --generation-file '/tmp/NeMo $Relay`test'\\''/plugin/.nemo-relay-generation' --generation-token test-generation"
+        "'/tmp/NeMo $Relay`test'\\''/bin/nemo-relay' hook-forward codex --gateway-url http://127.0.0.1:47632 --generation-file '/tmp/NeMo $Relay`test'\\''/plugin/.nemo-relay-generation' --generation-token test-generation --fail-closed"
     );
     assert_eq!(shell_quote_arg_for_platform("", false), "''");
     assert_eq!(
         shell_quote_arg_for_platform(r"/tmp/path\with-backslash", false),
         r#"'/tmp/path\with-backslash'"#
     );
-}
-
-#[test]
-fn healthz_rejects_foreign_success_response() {
-    let dir = tempdir().unwrap();
-    let _home = HomeScope::enter(dir.path());
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let handle = thread::spawn(move || {
-        for _ in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
-            let _ = read_http_request(&mut stream);
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
-                )
-                .unwrap();
-        }
-    });
-
-    let error = GatewaySpec::new(address)
-        .acquire()
-        .expect_err("foreign listener unexpectedly acquired");
-    assert!(
-        error.contains("not a compatible NeMo Relay gateway"),
-        "{error}"
-    );
-    handle.join().unwrap();
 }
 
 #[test]
@@ -3230,7 +3195,7 @@ fn codex_install_does_not_write_provider_config_when_hooks_are_invalid() {
     write_plugin_generation_for_hooks(&plugin_hooks);
     fs::write(&plugin_hooks, "{ invalid json").unwrap();
 
-    let error = install_codex(DEFAULT_URL, &plugin_hooks).unwrap_err();
+    let error = install_codex(LEGACY_FIXED_URL, &plugin_hooks).unwrap_err();
     assert!(error.contains("invalid JSON"));
 
     assert_eq!(
@@ -3267,7 +3232,7 @@ fn codex_install_does_not_write_hooks_when_config_is_invalid() {
     fs::write(&hooks_path, &original_hooks).unwrap();
 
     let error = install_codex_with_trust(
-        DEFAULT_URL,
+        LEGACY_FIXED_URL,
         &expected_plugin_command(),
         |_home, _config, _command| Err("expected exactly one Relay handler".into()),
     )
@@ -3305,7 +3270,7 @@ fn codex_install_does_not_write_hooks_when_config_is_not_readable() {
     fs::write(&hooks_path, &original_hooks).unwrap();
 
     let error = install_codex_with_trust(
-        DEFAULT_URL,
+        LEGACY_FIXED_URL,
         &expected_plugin_command(),
         |_home, _config, _command| Err("expected exactly one Relay handler".into()),
     )
@@ -3323,7 +3288,7 @@ fn codex_install_config_rolls_back_backup_when_write_fails() {
     fs::write(&path, "model_provider = \"openai\"\n").unwrap();
     crate::filesystem::fail_next_atomic_write(&path);
 
-    let error = install_codex_config(&path, DEFAULT_URL).unwrap_err();
+    let error = install_codex_config(&path, LEGACY_FIXED_URL).unwrap_err();
 
     assert!(error.contains("failed to write"));
     assert!(!backup_path(&path).exists());
@@ -3350,7 +3315,7 @@ fn codex_install_preserves_invalid_user_hooks_when_trust_fails() {
     fs::write(&hooks_path, &original_hooks).unwrap();
 
     let error = install_codex_with_trust(
-        DEFAULT_URL,
+        LEGACY_FIXED_URL,
         &expected_plugin_command(),
         |_home, _config, _command| Err("expected exactly one Relay handler".into()),
     )
@@ -3373,11 +3338,11 @@ fn codex_uninstall_rolls_back_hooks_when_provider_config_is_invalid() {
     fs::create_dir_all(&codex_dir).unwrap();
     fs::write(codex_dir.join("config.toml"), "model_provider = [").unwrap();
     let hooks_path = codex_dir.join("hooks.json");
-    install_codex_hooks(&hooks_path, DEFAULT_URL).unwrap();
+    install_codex_hooks(&hooks_path, LEGACY_FIXED_URL).unwrap();
     let original_hooks = fs::read(&hooks_path).unwrap();
 
     let mut client = empty_codex_hooks_client();
-    let error = uninstall_codex_with_client(DEFAULT_URL, Some(&mut client)).unwrap_err();
+    let error = uninstall_codex_with_client(LEGACY_FIXED_URL, Some(&mut client)).unwrap_err();
 
     assert!(error.contains("invalid TOML"));
     assert_eq!(fs::read(&hooks_path).unwrap(), original_hooks);
@@ -3415,7 +3380,7 @@ fn codex_install_rolls_back_hooks_when_provider_config_write_fails() {
     fs::write(&hooks_path, &original_hooks).unwrap();
 
     let plugin_hooks = write_plugin_hooks(&dir.path().join("plugin"));
-    let error = install_codex(DEFAULT_URL, &plugin_hooks).unwrap_err();
+    let error = install_codex(LEGACY_FIXED_URL, &plugin_hooks).unwrap_err();
 
     assert!(error.contains("failed to write"));
     assert_eq!(fs::read(&hooks_path).unwrap(), original_hooks);
@@ -3435,7 +3400,7 @@ fn codex_uninstall_hooks_removes_legacy_generated_command() {
     let legacy = generated_hooks(CodingAgent::Codex, &legacy_command);
     fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
 
-    uninstall_codex_hooks(&path, DEFAULT_URL).unwrap();
+    uninstall_codex_hooks(&path, LEGACY_FIXED_URL).unwrap();
     let updated: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
 
     assert!(!event_contains_command(
@@ -3551,39 +3516,6 @@ fn shared_filesystem_helpers_cover_tables_snapshots_and_lock_branches() {
 }
 
 #[test]
-fn shared_defaults_cover_idle_lifecycle_and_lock_names() {
-    let dir = tempdir().unwrap();
-    let _home = HomeScope::enter(dir.path());
-    let _plugin_url = EnvVarGuard::remove("NEMO_RELAY_PLUGIN_GATEWAY_URL");
-    let _claude_url = EnvVarGuard::remove("NEMO_RELAY_GATEWAY_URL");
-    let _timeout = EnvVarGuard::remove("NEMO_RELAY_PLUGIN_IDLE_TIMEOUT_SECS");
-    let _fail_closed = EnvVarGuard::remove("NEMO_RELAY_FAIL_CLOSED");
-
-    assert_eq!(plugin_idle_timeout().unwrap(), Duration::from_secs(300));
-    assert_eq!(
-        plugin_heartbeat_interval().unwrap(),
-        Duration::from_secs(30)
-    );
-    assert_eq!(bootstrap_lock_name(""), "unknown");
-}
-
-#[test]
-fn relay_binary_rejects_missing_override_and_uses_current_exe_fallback() {
-    let dir = tempdir().unwrap();
-    let _home = HomeScope::enter(dir.path());
-    let missing = dir.path().join("missing-nemo-relay");
-    let _binary_override = EnvVarGuard::set_path("NEMO_RELAY_PLUGIN_BINARY", &missing);
-    assert!(
-        relay_binary()
-            .unwrap_err()
-            .contains("NEMO_RELAY_PLUGIN_BINARY does not exist")
-    );
-    drop(_binary_override);
-    let _binary_override = EnvVarGuard::remove("NEMO_RELAY_PLUGIN_BINARY");
-    assert!(relay_binary().unwrap().exists());
-}
-
-#[test]
 fn claude_provider_enable_status_and_restore_cover_managed_backup_paths() {
     let dir = tempdir().unwrap();
     let _home = HomeScope::enter(dir.path());
@@ -3606,13 +3538,16 @@ fn claude_provider_enable_status_and_restore_cover_managed_backup_paths() {
         claude_settings_base_url().as_deref(),
         Some("https://api.anthropic.com")
     );
-    enable_claude_provider(DEFAULT_URL).unwrap();
-    assert_eq!(claude_settings_base_url().as_deref(), Some(DEFAULT_URL));
+    enable_claude_provider(LEGACY_FIXED_URL).unwrap();
+    assert_eq!(
+        claude_settings_base_url().as_deref(),
+        Some(LEGACY_FIXED_URL)
+    );
     assert_eq!(
         json_env_string(&read_json_object(&settings_path).unwrap(), "OTHER"),
         Some("kept")
     );
-    restore_claude_provider(DEFAULT_URL).unwrap();
+    restore_claude_provider(LEGACY_FIXED_URL).unwrap();
     assert_eq!(
         claude_settings_base_url().as_deref(),
         Some("https://api.anthropic.com")
@@ -3651,6 +3586,49 @@ fn claude_setup_snapshot_restores_settings_and_backup_exactly() {
 }
 
 #[test]
+fn setup_snapshot_compare_and_swap_restores_only_the_recorded_result() {
+    let dir = tempdir().unwrap();
+    let _home = HomeScope::enter(dir.path());
+    let settings = claude_settings_path().unwrap();
+    let backup = backup_path(&settings);
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&settings, b"original-settings").unwrap();
+    fs::write(&backup, b"original-backup").unwrap();
+    let original = SetupSnapshot::Claude(snapshot_claude_setup().unwrap());
+
+    fs::write(&settings, b"relay-settings").unwrap();
+    fs::remove_file(&backup).unwrap();
+    let relay_result = capture_current_setup_snapshot(&original).unwrap();
+    restore_setup_snapshot_cas(&original, Some(&relay_result)).unwrap();
+
+    assert_eq!(fs::read(settings).unwrap(), b"original-settings");
+    assert_eq!(fs::read(backup).unwrap(), b"original-backup");
+}
+
+#[test]
+fn setup_snapshot_compare_and_swap_retains_concurrent_user_changes() {
+    let dir = tempdir().unwrap();
+    let _home = HomeScope::enter(dir.path());
+    let settings = claude_settings_path().unwrap();
+    let backup = backup_path(&settings);
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&settings, b"original-settings").unwrap();
+    fs::write(&backup, b"original-backup").unwrap();
+    let original = SetupSnapshot::Claude(snapshot_claude_setup().unwrap());
+
+    fs::write(&settings, b"relay-settings").unwrap();
+    fs::remove_file(&backup).unwrap();
+    let relay_result = capture_current_setup_snapshot(&original).unwrap();
+    fs::write(&settings, b"user-settings").unwrap();
+    fs::write(&backup, b"user-backup").unwrap();
+
+    let error = restore_setup_snapshot_cas(&original, Some(&relay_result)).unwrap_err();
+    assert!(error.contains("changed outside this Relay transaction"));
+    assert_eq!(fs::read(settings).unwrap(), b"user-settings");
+    assert_eq!(fs::read(backup).unwrap(), b"user-backup");
+}
+
+#[test]
 fn claude_provider_restore_noops_without_matching_backup_or_managed_value() {
     let dir = tempdir().unwrap();
     let _home = HomeScope::enter(dir.path());
@@ -3665,14 +3643,14 @@ fn claude_provider_restore_noops_without_matching_backup_or_managed_value() {
     )
     .unwrap();
 
-    restore_claude_provider(DEFAULT_URL).unwrap();
+    restore_claude_provider(LEGACY_FIXED_URL).unwrap();
     assert_eq!(
         claude_settings_base_url().as_deref(),
         Some("https://custom.example")
     );
 
     backup_claude_settings(&settings_path, false).unwrap();
-    restore_claude_provider(DEFAULT_URL).unwrap();
+    restore_claude_provider(LEGACY_FIXED_URL).unwrap();
     assert_eq!(
         claude_settings_base_url().as_deref(),
         Some("https://custom.example")
@@ -3689,7 +3667,7 @@ fn claude_provider_errors_for_non_object_env_and_restore_env_type_mismatch() {
     fs::write(&settings_path, r#"{"env": "bad"}"#).unwrap();
 
     assert!(
-        enable_claude_provider(DEFAULT_URL)
+        enable_claude_provider(LEGACY_FIXED_URL)
             .unwrap_err()
             .contains("non-object env field")
     );
@@ -3710,7 +3688,7 @@ fn claude_provider_errors_for_non_object_env_and_restore_env_type_mismatch() {
     assert!(
         restore_json_env_value(
             &mut value,
-            &json!({"env": {"ANTHROPIC_BASE_URL": DEFAULT_URL}}),
+            &json!({"env": {"ANTHROPIC_BASE_URL": LEGACY_FIXED_URL}}),
             "ANTHROPIC_BASE_URL",
         )
         .unwrap_err()
@@ -3748,9 +3726,9 @@ fn claude_restore_removes_settings_created_from_an_absent_original() {
     let _home = HomeScope::enter(dir.path());
     let settings_path = dir.path().join(".claude/settings.json");
 
-    enable_claude_provider(DEFAULT_URL).unwrap();
+    enable_claude_provider(LEGACY_FIXED_URL).unwrap();
     assert!(settings_path.exists());
-    restore_claude_provider(DEFAULT_URL).unwrap();
+    restore_claude_provider(LEGACY_FIXED_URL).unwrap();
 
     assert!(!settings_path.exists());
 }
@@ -3764,7 +3742,7 @@ fn plugin_host_entrypoints_reject_unsupported_agents_and_report_json() {
     fs::write(
         &settings_path,
         serde_json::to_vec_pretty(&json!({
-            "env": { "ANTHROPIC_BASE_URL": DEFAULT_URL }
+            "env": { "ANTHROPIC_BASE_URL": LEGACY_FIXED_URL }
         }))
         .unwrap(),
     )
@@ -3790,28 +3768,27 @@ fn plugin_host_entrypoints_reject_unsupported_agents_and_report_json() {
     )
     .unwrap();
 
-    let report = doctor_plugin_json(CodingAgent::ClaudeCode, DEFAULT_URL, &plugin_root).unwrap();
-    assert_eq!(report["sidecar_health"], json!("not_running_mcp_start"));
+    let report =
+        doctor_plugin_json(CodingAgent::ClaudeCode, LEGACY_FIXED_URL, &plugin_root).unwrap();
+    assert_eq!(report["proxy_service_health"], json!("not_running"));
     assert_eq!(report["checks"]["claude_provider_routing"], json!(true));
-    let codex_report = doctor_plugin_json(CodingAgent::Codex, DEFAULT_URL, &plugin_root).unwrap();
-    assert_eq!(
-        codex_report["sidecar_health"],
-        json!("not_running_mcp_start")
-    );
+    let codex_report =
+        doctor_plugin_json(CodingAgent::Codex, LEGACY_FIXED_URL, &plugin_root).unwrap();
+    assert_eq!(codex_report["proxy_service_health"], json!("not_running"));
     assert_eq!(codex_report["checks"]["codex_provider_alias"], json!(false));
     assert_eq!(codex_report["checks"]["codex_hooks"], json!(false));
     assert!(
-        doctor_plugin_json(CodingAgent::Hermes, DEFAULT_URL, &plugin_root)
+        doctor_plugin_json(CodingAgent::Hermes, LEGACY_FIXED_URL, &plugin_root)
             .unwrap_err()
             .contains("supports claude and codex")
     );
     assert!(
-        doctor_plugin(CodingAgent::Hermes, DEFAULT_URL, &plugin_root)
+        doctor_plugin(CodingAgent::Hermes, LEGACY_FIXED_URL, &plugin_root)
             .unwrap_err()
             .contains("supports claude and codex")
     );
     assert!(
-        doctor_plugin(CodingAgent::Codex, DEFAULT_URL, &plugin_root)
+        doctor_plugin(CodingAgent::Codex, LEGACY_FIXED_URL, &plugin_root)
             .unwrap_err()
             .contains("codex plugin doctor checks failed")
     );

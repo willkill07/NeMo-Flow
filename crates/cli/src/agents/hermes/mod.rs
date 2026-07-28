@@ -45,7 +45,6 @@ pub(crate) mod doctor;
 mod files;
 pub(crate) mod install;
 mod integration;
-pub(crate) mod launch;
 mod trust;
 
 pub(crate) use integration::*;

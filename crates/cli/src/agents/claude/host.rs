@@ -3,19 +3,32 @@
 
 //! Claude Code-specific provider routing setup.
 
+use std::path::PathBuf;
+
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
+#[cfg(test)]
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
 
-use serde_json::{Value, json};
-
-use crate::agents::shared::host::{home_dir, read_json_object, write_json};
+#[cfg(test)]
+use crate::agents::shared::host::write_json;
+use crate::agents::shared::host::{home_dir, read_json_object};
 use crate::filesystem::{
-    FileSnapshot, backup, backup_path, remove_backup, restore_file_snapshot, snapshot_optional_file,
+    FileSnapshot, backup_path, restore_file_snapshot, restore_file_snapshot_cas,
+    snapshot_optional_file,
 };
+#[cfg(test)]
+use crate::filesystem::{backup, remove_backup};
 
+#[cfg(test)]
 const ABSENT_SETTINGS_BACKUP_KEY: &str = "__nemo_relay_original_settings_absent";
+#[cfg(test)]
 const MANAGED_PROVIDER_BACKUP_KEY: &str = "__nemo_relay_managed_anthropic_base_url";
 
+#[derive(Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct ClaudeSetupSnapshot {
     files: Vec<FileSnapshot>,
 }
@@ -42,6 +55,32 @@ pub(crate) fn restore_claude_setup(snapshot: &ClaudeSetupSnapshot) -> Result<(),
     }
 }
 
+pub(crate) fn restore_claude_setup_cas(
+    snapshot: &ClaudeSetupSnapshot,
+    expected: &ClaudeSetupSnapshot,
+) -> Result<(), String> {
+    for file in &expected.files {
+        file.require_current()?;
+    }
+    let errors = snapshot
+        .files
+        .iter()
+        .filter_map(|file| {
+            let current = expected
+                .files
+                .iter()
+                .find(|expected| expected.path() == file.path());
+            restore_file_snapshot_cas(file, current).err()
+        })
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn enable_claude_provider(gateway_url: &str) -> Result<(), String> {
     let path = claude_settings_path()?;
     let mut settings = read_json_object(&path)?;
@@ -61,7 +100,7 @@ pub(crate) fn enable_claude_provider(gateway_url: &str) -> Result<(), String> {
         || previous_managed_provider
             .as_deref()
             .is_some_and(|previous| current_provider == Some(previous))
-        || (backup_file.exists() && current_provider == Some(crate::bootstrap::DEFAULT_URL));
+        || (backup_file.exists() && current_provider == Some(crate::bootstrap::LEGACY_FIXED_URL));
     if !managed_provider && let Err(error) = backup_claude_settings(&path, true) {
         restore_file_snapshot(&backup_snapshot)?;
         return Err(error);
@@ -87,6 +126,7 @@ pub(crate) fn enable_claude_provider(gateway_url: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn record_managed_provider(backup: &Path, gateway_url: &str) -> Result<(), String> {
     let mut value = read_json_object(backup)?;
     value
@@ -96,6 +136,7 @@ fn record_managed_provider(backup: &Path, gateway_url: &str) -> Result<(), Strin
     write_json(backup, &value)
 }
 
+#[cfg(test)]
 pub(crate) fn restore_claude_provider(gateway_url: &str) -> Result<(), String> {
     let path = claude_settings_path()?;
     let backup = backup_path(&path);
@@ -138,6 +179,7 @@ pub(crate) fn restore_claude_provider(gateway_url: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn json_env_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value
         .get("env")
@@ -146,6 +188,7 @@ pub(crate) fn json_env_string<'a>(value: &'a Value, key: &str) -> Option<&'a str
         .and_then(Value::as_str)
 }
 
+#[cfg(test)]
 pub(crate) fn remove_json_env_string(value: &mut Value, key: &str) -> Result<bool, String> {
     let Some(object) = value.as_object_mut() else {
         return Err("Claude settings must be a JSON object".into());
@@ -163,6 +206,7 @@ pub(crate) fn remove_json_env_string(value: &mut Value, key: &str) -> Result<boo
     Ok(removed)
 }
 
+#[cfg(test)]
 pub(crate) fn restore_json_env_value(
     value: &mut Value,
     backup: &Value,
@@ -188,6 +232,7 @@ pub(crate) fn restore_json_env_value(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn backup_claude_settings(path: &Path, replace_existing: bool) -> Result<(), String> {
     let backup_file = backup_path(path);
     if backup_file.exists() && !replace_existing {

@@ -5,33 +5,22 @@ use std::process::ExitCode;
 
 use clap::Args;
 
-use super::root::AgentArg;
 use crate::error::CliError;
+use crate::plugins::{ConfigurationScope, PluginsEditRequest};
 
-mod model;
-mod wizard;
-
-pub(super) use wizard::run;
-
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Default, Args)]
 pub(crate) struct ConfigCommand {
-    #[arg(value_enum)]
-    pub(crate) agent: Option<AgentArg>,
-    /// Reset Relay configuration for the selected scope. Persistent Hermes integration state is
-    /// managed separately with `nemo-relay uninstall hermes`.
+    /// Edit system-wide plugin policy instead of the default per-user policy.
     #[arg(long)]
-    pub(crate) reset: bool,
-    /// Configuration scope to reset. Defaults to the project configuration.
-    #[arg(long, value_enum, requires = "reset")]
-    pub(crate) scope: Option<model::ConfigScope>,
+    pub(crate) system: bool,
 }
 
 pub(super) async fn execute(command: ConfigCommand) -> Result<ExitCode, CliError> {
-    let agent = command.agent.map(Into::into);
-    if command.reset {
-        model::reset(command.scope.unwrap_or(model::ConfigScope::Project), agent)?;
+    let scope = if command.system {
+        ConfigurationScope::Global
     } else {
-        wizard::run(agent).await?;
-    }
+        ConfigurationScope::User
+    };
+    crate::plugins::edit(PluginsEditRequest { scope })?;
     Ok(ExitCode::SUCCESS)
 }

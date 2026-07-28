@@ -1,14 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Authenticated health and shutdown transport for loopback sidecars.
+//! Authenticated health and shutdown transport for owned loopback services.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
+#[cfg(test)]
+use std::net::Ipv4Addr;
+#[cfg(test)]
+use std::net::SocketAddr;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::Url;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -20,6 +24,7 @@ use crate::bootstrap::{BOOTSTRAP_PROTOCOL_VERSION, HEALTHZ_TIMEOUT};
 
 static CHALLENGE_KEY_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<BootstrapChallengeKey>>>> =
     OnceLock::new();
+#[cfg(test)]
 static TLS_IDENTITY_CACHE: OnceLock<
     Mutex<HashMap<PathBuf, Arc<crate::gateway::tls::RelayTlsIdentity>>>,
 > = OnceLock::new();
@@ -33,16 +38,23 @@ pub(crate) enum RelayHealth {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "test-only response for the retired verified transport"
+)]
 pub(crate) struct VerifiedHttpResponse {
     pub(crate) status: u16,
     pub(crate) body: Vec<u8>,
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct VerifiedHttpError {
     message: String,
 }
 
+#[cfg(test)]
 impl VerifiedHttpError {
     fn before_payload(message: impl Into<String>) -> Self {
         Self {
@@ -55,12 +67,9 @@ impl VerifiedHttpError {
             message: message.into(),
         }
     }
-
-    pub(crate) fn missing_fingerprint() -> Self {
-        Self::after_payload("managed Relay gateway is missing its bootstrap fingerprint")
-    }
 }
 
+#[cfg(test)]
 impl std::fmt::Display for VerifiedHttpError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
@@ -73,6 +82,7 @@ impl std::fmt::Display for VerifiedHttpError {
 /// gap between an authenticated health probe and hook delivery. A foreign listener can receive
 /// the challenge, but the payload is not written until Relay proves possession of the per-user
 /// bootstrap key on the connection that will receive it.
+#[cfg(test)]
 pub(crate) fn post_verified(
     url: &str,
     bootstrap_fingerprint: &str,
@@ -82,6 +92,7 @@ pub(crate) fn post_verified(
     timeout: Duration,
     max_response_bytes: usize,
 ) -> Result<VerifiedHttpResponse, VerifiedHttpError> {
+    let deadline = Instant::now() + timeout;
     let (host, port) = parse_loopback_url(url).map_err(VerifiedHttpError::after_payload)?;
     let addresses = (host.as_str(), port).to_socket_addrs().map_err(|error| {
         VerifiedHttpError::before_payload(format!(
@@ -131,7 +142,7 @@ pub(crate) fn post_verified(
             "failed to request the Relay TLS tunnel: {error}"
         ))
     })?;
-    let (tunnel_headers, _) = read_http_message(&mut stream, 0).map_err(|error| {
+    let (tunnel_headers, _) = read_http_message(&mut stream, 0, deadline).map_err(|error| {
         VerifiedHttpError::before_payload(format!(
             "failed to read the Relay TLS tunnel response: {error}"
         ))
@@ -166,8 +177,8 @@ pub(crate) fn post_verified(
             "Relay TLS handshake or health request failed: {error}"
         ))
     })?;
-    let (health_headers, health_body) =
-        read_http_message(&mut stream, 16 * 1024).map_err(|error| {
+    let (health_headers, health_body) = read_http_message(&mut stream, 16 * 1024, deadline)
+        .map_err(|error| {
             VerifiedHttpError::before_payload(format!(
                 "failed to read health response through Relay TLS: {error}"
             ))
@@ -219,8 +230,8 @@ pub(crate) fn post_verified(
             "verified gateway payload delivery became indeterminate: {error}"
         ))
     })?;
-    let (response_headers, response_body) = read_http_message(&mut stream, max_response_bytes)
-        .map_err(|error| {
+    let (response_headers, response_body) =
+        read_http_message(&mut stream, max_response_bytes, deadline).map_err(|error| {
             VerifiedHttpError::after_payload(format!(
                 "failed to read verified gateway response: {error}"
             ))
@@ -238,32 +249,15 @@ pub(crate) fn healthz(url: &str) -> bool {
     probe(url, None) == RelayHealth::Compatible
 }
 
-pub(crate) fn healthz_compatible(url: &str, bootstrap_fingerprint: &str) -> bool {
-    probe(url, Some(bootstrap_fingerprint)) == RelayHealth::Compatible
-}
-
-pub(crate) fn authenticated_instance_id(url: &str, bootstrap_fingerprint: &str) -> Option<String> {
-    compatible_instance_id(url, Some(bootstrap_fingerprint))
-}
-
 pub(crate) fn probe(url: &str, bootstrap_fingerprint: Option<&str>) -> RelayHealth {
     probe_with_instance(url, bootstrap_fingerprint).0
-}
-
-pub(crate) fn compatible_instance_id(
-    url: &str,
-    bootstrap_fingerprint: Option<&str>,
-) -> Option<String> {
-    let (health, instance_id) = probe_with_instance(url, bootstrap_fingerprint);
-    (health == RelayHealth::Compatible)
-        .then_some(instance_id)
-        .flatten()
 }
 
 pub(crate) fn probe_with_instance(
     url: &str,
     bootstrap_fingerprint: Option<&str>,
 ) -> (RelayHealth, Option<String>) {
+    let deadline = Instant::now() + HEALTHZ_TIMEOUT;
     let Ok((host, port)) = parse_loopback_url(url) else {
         return (RelayHealth::Unavailable, None);
     };
@@ -272,7 +266,10 @@ pub(crate) fn probe_with_instance(
     };
     let mut stream = None;
     for addr in addrs.filter(|addr| addr.ip().is_loopback()) {
-        match TcpStream::connect_timeout(&addr, HEALTHZ_TIMEOUT) {
+        let Ok(remaining) = remaining_until(deadline) else {
+            break;
+        };
+        match TcpStream::connect_timeout(&addr, remaining) {
             Ok(candidate) => {
                 stream = Some(candidate);
                 break;
@@ -317,7 +314,7 @@ pub(crate) fn probe_with_instance(
     if stream.write_all(request.as_bytes()).is_err() {
         return (RelayHealth::Foreign, None);
     }
-    let Ok((headers, body)) = read_http_message(&mut stream, 16 * 1024) else {
+    let Ok((headers, body)) = read_http_message(&mut stream, 16 * 1024, deadline) else {
         return (RelayHealth::Foreign, None);
     };
     classify_health_response(
@@ -329,23 +326,25 @@ pub(crate) fn probe_with_instance(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn request_shutdown(
     url: &str,
     bootstrap_fingerprint: &str,
     token: &str,
 ) -> Result<(), String> {
+    let deadline = Instant::now() + HEALTHZ_TIMEOUT;
     let (host, port) = parse_loopback_url(url)?;
     let addresses = (host.as_str(), port)
         .to_socket_addrs()
-        .map_err(|error| format!("failed to resolve managed sidecar {url}: {error}"))?;
+        .map_err(|error| format!("failed to resolve managed service {url}: {error}"))?;
     let mut stream = connect_loopback(addresses, HEALTHZ_TIMEOUT)
-        .map_err(|error| format!("failed to connect to managed sidecar {url}: {error}"))?;
+        .map_err(|error| format!("failed to connect to managed service {url}: {error}"))?;
     stream
         .set_read_timeout(Some(HEALTHZ_TIMEOUT))
-        .map_err(|error| format!("failed to configure sidecar shutdown read timeout: {error}"))?;
+        .map_err(|error| format!("failed to configure service shutdown read timeout: {error}"))?;
     stream
         .set_write_timeout(Some(HEALTHZ_TIMEOUT))
-        .map_err(|error| format!("failed to configure sidecar shutdown write timeout: {error}"))?;
+        .map_err(|error| format!("failed to configure service shutdown write timeout: {error}"))?;
     let key = cached_bootstrap_challenge_key()
         .map_err(|error| format!("failed to load the Relay bootstrap challenge key: {error}"))?;
     let mut nonce = [0_u8; 32];
@@ -362,9 +361,9 @@ pub(crate) fn request_shutdown(
     );
     stream
         .write_all(challenge.as_bytes())
-        .map_err(|error| format!("failed to authenticate managed sidecar shutdown: {error}"))?;
-    let (health_headers, health_body) = read_http_message(&mut stream, 16 * 1024)
-        .map_err(|error| format!("failed to read managed sidecar shutdown proof: {error}"))?;
+        .map_err(|error| format!("failed to authenticate managed service shutdown: {error}"))?;
+    let (health_headers, health_body) = read_http_message(&mut stream, 16 * 1024, deadline)
+        .map_err(|error| format!("failed to read managed service shutdown proof: {error}"))?;
     if classify_health_response(
         &health_headers,
         &health_body,
@@ -372,12 +371,12 @@ pub(crate) fn request_shutdown(
     )
     .0 != RelayHealth::Compatible
     {
-        return Err("managed sidecar did not authenticate the shutdown connection".into());
+        return Err("managed service did not authenticate the shutdown connection".into());
     }
     if http_header(&health_headers, "connection")
         .is_some_and(|value| value.eq_ignore_ascii_case("close"))
     {
-        return Err("managed sidecar closed the authenticated shutdown connection".into());
+        return Err("managed service closed the authenticated shutdown connection".into());
     }
     let request = format!(
         "POST /bootstrap/shutdown HTTP/1.1\r\nHost: {}\r\nX-NeMo-Relay-Bootstrap-Token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -385,21 +384,15 @@ pub(crate) fn request_shutdown(
     );
     stream
         .write_all(request.as_bytes())
-        .map_err(|error| format!("failed to request managed sidecar shutdown: {error}"))?;
-    let mut response = Vec::new();
-    stream
-        .take(16 * 1024)
-        .read_to_end(&mut response)
-        .map_err(|error| format!("failed to read managed sidecar shutdown response: {error}"))?;
-    let Some((headers, _)) = split_http_response(&response) else {
-        return Err("managed sidecar returned a malformed shutdown response".into());
-    };
+        .map_err(|error| format!("failed to request managed service shutdown: {error}"))?;
+    let (headers, _) = read_http_message(&mut stream, 16 * 1024, deadline)
+        .map_err(|error| format!("failed to read managed service shutdown response: {error}"))?;
     if headers.starts_with(b"HTTP/1.1 204") || headers.starts_with(b"HTTP/1.0 204") {
         Ok(())
     } else {
         Err(format!(
-            "managed sidecar rejected shutdown: {}",
-            String::from_utf8_lossy(headers)
+            "managed service rejected shutdown: {}",
+            String::from_utf8_lossy(&headers)
                 .lines()
                 .next()
                 .unwrap_or("unknown response")
@@ -421,6 +414,7 @@ fn cached_bootstrap_challenge_key() -> Result<Arc<BootstrapChallengeKey>, String
     Ok(key)
 }
 
+#[cfg(test)]
 fn cached_tls_identity() -> Result<Arc<crate::gateway::tls::RelayTlsIdentity>, String> {
     let state = crate::bootstrap::state::state_dir()?;
     let cache = TLS_IDENTITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -491,6 +485,7 @@ fn classify_health_response(
     (RelayHealth::Compatible, Some(instance_id.to_owned()))
 }
 
+#[cfg(test)]
 fn connect_loopback(
     addresses: impl IntoIterator<Item = SocketAddr>,
     timeout: Duration,
@@ -513,9 +508,34 @@ fn connect_loopback(
     }))
 }
 
+trait DeadlineRead: Read {
+    fn set_read_deadline(&mut self, deadline: Instant) -> std::io::Result<()>;
+}
+
+impl DeadlineRead for TcpStream {
+    fn set_read_deadline(&mut self, deadline: Instant) -> std::io::Result<()> {
+        self.set_read_timeout(Some(remaining_until(deadline)?))
+    }
+}
+
+#[cfg(test)]
+impl DeadlineRead for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    fn set_read_deadline(&mut self, deadline: Instant) -> std::io::Result<()> {
+        self.sock.set_read_timeout(Some(remaining_until(deadline)?))
+    }
+}
+
+fn remaining_until(deadline: Instant) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline expired"))
+}
+
 fn read_http_message(
-    stream: &mut impl Read,
+    stream: &mut impl DeadlineRead,
     max_body_bytes: usize,
+    deadline: Instant,
 ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     const MAX_HEADER_BYTES: usize = 16 * 1024;
 
@@ -531,6 +551,7 @@ fn read_http_message(
             ));
         }
         let mut chunk = [0_u8; 1024];
+        stream.set_read_deadline(deadline)?;
         let read = stream.read(&mut chunk)?;
         if read == 0 {
             return Err(std::io::Error::new(
@@ -577,6 +598,7 @@ fn read_http_message(
     while body.len() < content_length {
         let mut chunk = [0_u8; 4096];
         let needed = (content_length - body.len()).min(chunk.len());
+        stream.set_read_deadline(deadline)?;
         let read = stream.read(&mut chunk[..needed])?;
         if read == 0 {
             return Err(std::io::Error::new(
@@ -589,19 +611,12 @@ fn read_http_message(
     Ok((headers, body))
 }
 
-fn split_http_response(response: &[u8]) -> Option<(&[u8], &[u8])> {
-    response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| (&response[..index], &response[index + 4..]))
-}
-
 pub(crate) fn parse_loopback_url(url: &str) -> Result<(String, u16), String> {
     let parsed = Url::parse(url)
-        .map_err(|error| format!("invalid shared gateway loopback URL {url}: {error}"))?;
+        .map_err(|error| format!("invalid agent proxy loopback URL {url}: {error}"))?;
     if parsed.scheme() != "http" {
         return Err(format!(
-            "shared gateway recovery only supports http loopback URLs: {url}"
+            "agent proxy recovery only supports http loopback URLs: {url}"
         ));
     }
     let host = parsed
@@ -615,7 +630,7 @@ pub(crate) fn parse_loopback_url(url: &str) -> Result<(String, u16), String> {
             .is_ok_and(|address| address.is_loopback());
     if !loopback {
         return Err(format!(
-            "shared gateway recovery only supports loopback gateway URLs: {url}"
+            "agent proxy recovery only supports loopback URLs: {url}"
         ));
     }
     let port = parsed
@@ -624,6 +639,7 @@ pub(crate) fn parse_loopback_url(url: &str) -> Result<(String, u16), String> {
     Ok((host.to_string(), port))
 }
 
+#[cfg(test)]
 pub(crate) fn loopback_bind(url: &str) -> Result<SocketAddr, String> {
     let (host, port) = parse_loopback_url(url)?;
     let address = if host.eq_ignore_ascii_case("localhost") {

@@ -24,14 +24,19 @@ use crate::agents::shared::host::{
     shell_quote, write_json,
 };
 use crate::filesystem::{
-    FileSnapshot, backup, backup_path, remove_backup, restore_file_snapshot, snapshot_optional_file,
+    FileSnapshot, backup, backup_path, remove_backup, restore_file_snapshot,
+    restore_file_snapshot_cas, snapshot_optional_file,
 };
 use crate::process::{portable_executable_path, shell_quote_arg_for_platform};
 
 pub(crate) const CODEX_PLUGIN_ID: &str = RELAY_PLUGIN_ID;
+pub(crate) const AGENT_AUTHORIZATION_HEADER: &str = "x-nemo-relay-agent-authorization";
+#[cfg(test)]
+pub(crate) const TEST_AGENT_AUTHORIZATION: &str = "Basic dGVzdC1jb2RleDp0ZXN0LXRva2Vu";
 pub(crate) const CODEX_PLUGIN_HOOK_KEY_PREFIX: &str =
     "nemo-relay-plugin@nemo-relay-local:hooks/hooks.json:";
 
+#[derive(Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct CodexSetupSnapshot {
     files: Vec<FileSnapshot>,
     hooks: Vec<CodexHookMetadata>,
@@ -55,8 +60,31 @@ pub(crate) fn snapshot_codex_setup() -> Result<CodexSetupSnapshot, String> {
 }
 
 pub(crate) fn restore_codex_setup(snapshot: &CodexSetupSnapshot) -> Result<(), String> {
+    restore_codex_setup_with_expected(snapshot, None)
+}
+
+pub(crate) fn restore_codex_setup_cas(
+    snapshot: &CodexSetupSnapshot,
+    expected: &CodexSetupSnapshot,
+) -> Result<(), String> {
+    if snapshot_codex_setup()? != *expected {
+        return Err(
+            "Codex host configuration changed outside this Relay transaction; retained the current configuration"
+                .into(),
+        );
+    }
+    restore_codex_setup_with_expected(snapshot, Some(expected))
+}
+
+fn restore_codex_setup_with_expected(
+    snapshot: &CodexSetupSnapshot,
+    expected: Option<&CodexSetupSnapshot>,
+) -> Result<(), String> {
     let mut errors = Vec::new();
-    if let Err(error) = restore_codex_install_snapshots(&snapshot.files) {
+    if let Err(error) = restore_codex_install_snapshots_with_expected(
+        &snapshot.files,
+        expected.map(|expected| expected.files.as_slice()),
+    ) {
         errors.push(format!("failed to restore Codex files: {error}"));
     }
     match (home_dir(), CodexAppServerClient::start()) {
@@ -71,7 +99,10 @@ pub(crate) fn restore_codex_setup(snapshot: &CodexSetupSnapshot) -> Result<(), S
         }
         (Err(error), _) | (_, Err(error)) => errors.push(error),
     }
-    if let Err(error) = restore_codex_install_snapshots(&snapshot.files) {
+    if let Err(error) = restore_codex_install_snapshots_with_expected(
+        &snapshot.files,
+        expected.map(|expected| expected.files.as_slice()),
+    ) {
         errors.push(format!("failed to restore exact Codex files: {error}"));
     }
     if errors.is_empty() {
@@ -138,7 +169,7 @@ where
     if hooks_path.exists() {
         println!("updated {}", hooks_path.display());
     }
-    println!("configured Codex Relay provider and plugin hooks; no daemon was installed.");
+    println!("configured Codex Relay provider and hooks for the per-user agent proxy.");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -698,9 +729,27 @@ fn codex_install_snapshots(
 }
 
 fn restore_codex_install_snapshots(snapshots: &[FileSnapshot]) -> Result<(), String> {
+    restore_codex_install_snapshots_with_expected(snapshots, None)
+}
+
+fn restore_codex_install_snapshots_with_expected(
+    snapshots: &[FileSnapshot],
+    expected: Option<&[FileSnapshot]>,
+) -> Result<(), String> {
     let errors = snapshots
         .iter()
-        .filter_map(|snapshot| restore_file_snapshot(snapshot).err())
+        .filter_map(|snapshot| {
+            let result = match expected {
+                Some(expected) => restore_file_snapshot_cas(
+                    snapshot,
+                    expected
+                        .iter()
+                        .find(|expected| expected.path() == snapshot.path()),
+                ),
+                None => restore_file_snapshot(snapshot),
+            };
+            result.err()
+        })
         .collect::<Vec<_>>();
     if errors.is_empty() {
         Ok(())
@@ -716,20 +765,43 @@ pub(crate) fn prepare_codex_config(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("invalid TOML in {}: {error}", path.display()))
 }
 
+pub(crate) fn ensure_no_legacy_mcp_state() -> Result<(), String> {
+    let path = codex_home_dir()?.join("config.toml");
+    let raw = read_optional_text(&path)?;
+    let doc = raw
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("invalid TOML in {}: {error}", path.display()))?;
+    if codex_provider_client_token(&doc).is_some() {
+        return Err(format!(
+            "legacy Codex MCP-gateway client proof exists at {}; close Codex, uninstall this integration with the previous Relay binary, then run `nemo-relay install codex`",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn install_codex_config(path: &Path, gateway_url: &str) -> Result<(), String> {
-    let challenge = BootstrapChallengeKey::load().map_err(|error| error.to_string())?;
-    let client_token = challenge.client_token();
     let raw = read_optional_text(path)?;
     let mut doc = raw
         .parse::<DocumentMut>()
         .map_err(|error| format!("invalid TOML in {}: {error}", path.display()))?;
+    if codex_provider_client_token(&doc).is_some() {
+        return Err(format!(
+            "legacy Codex MCP-gateway client proof exists at {}; close Codex, uninstall this integration with the previous Relay binary, then run `nemo-relay install codex`",
+            path.display()
+        ));
+    }
+    let agent_authorization = current_codex_agent_authorization(gateway_url)?.ok_or_else(|| {
+        "Codex is not enrolled at the selected per-user coding-agent proxy endpoint".to_string()
+    })?;
     let backup_snapshot = snapshot_optional_file(&backup_path(path))?;
     let has_managed_proof =
-        codex_provider_client_token(&doc).is_some_and(|token| challenge.verify_client_token(token));
+        codex_provider_agent_authorization(&doc) == Some(agent_authorization.as_str());
     let provider_extensions = codex_provider_user_extensions(&doc, gateway_url);
     let unmodified_managed_install = codex_config_doc_has_managed_install(&doc, gateway_url)
         && has_managed_proof
         && codex_provider_has_only_generated_fields(&doc);
+    let challenge = BootstrapChallengeKey::load_existing().map_err(|error| error.to_string())?;
     if !unmodified_managed_install
         && let Err(error) = refresh_codex_config_backup(
             path,
@@ -737,7 +809,8 @@ pub(crate) fn install_codex_config(path: &Path, gateway_url: &str) -> Result<(),
             &doc,
             gateway_url,
             has_managed_proof,
-            &challenge,
+            challenge.as_ref(),
+            &agent_authorization,
         )
     {
         return match restore_file_snapshot(&backup_snapshot) {
@@ -757,9 +830,12 @@ pub(crate) fn install_codex_config(path: &Path, gateway_url: &str) -> Result<(),
     provider["base_url"] = value(gateway_url);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
-    provider["supports_websockets"] = value(false);
+    provider["supports_websockets"] = value(true);
     let mut headers = InlineTable::new();
-    headers.insert(BOOTSTRAP_CLIENT_TOKEN_HEADER, TomlValue::from(client_token));
+    headers.insert(
+        AGENT_AUTHORIZATION_HEADER,
+        TomlValue::from(agent_authorization),
+    );
     provider["http_headers"] = Item::Value(TomlValue::InlineTable(headers));
     providers["nemo-relay-openai"] = Item::Table(provider);
     if let Some(extensions) = provider_extensions.as_ref() {
@@ -785,10 +861,12 @@ fn refresh_codex_config_backup(
     current: &DocumentMut,
     gateway_url: &str,
     has_managed_proof: bool,
-    challenge: &BootstrapChallengeKey,
+    challenge: Option<&BootstrapChallengeKey>,
+    agent_authorization: &str,
 ) -> Result<(), String> {
-    let previous = read_codex_backup_doc_for_refresh(path)?
-        .map(|backup| sanitize_codex_backup_doc(backup, gateway_url, Some(challenge)));
+    let previous = read_codex_backup_doc_for_refresh(path)?.map(|backup| {
+        sanitize_codex_backup_doc(backup, gateway_url, challenge, Some(agent_authorization))
+    });
     if previous.is_none() && !has_managed_proof {
         if !path.exists() {
             return Ok(());
@@ -802,7 +880,12 @@ fn refresh_codex_config_backup(
     let preserved_provider = codex_extended_provider_without_proof(&baseline, gateway_url);
     let provider_is_managed = codex_provider_item_is_managed(&baseline, gateway_url);
     restore_codex_config_from_backup(&mut baseline, previous, provider_is_managed, false);
-    restore_codex_client_proof_from_backup(&mut baseline, previous, Some(challenge));
+    restore_codex_client_proof_from_backup(&mut baseline, previous, challenge);
+    restore_codex_agent_authorization_from_backup(
+        &mut baseline,
+        previous,
+        Some(agent_authorization),
+    );
     if let Some(provider) = preserved_provider {
         ensure_table(&mut baseline, "model_providers")
             .insert("nemo-relay-openai", Item::Table(provider));
@@ -892,6 +975,78 @@ fn restore_codex_client_proof_from_backup(
     }
 }
 
+fn restore_codex_agent_authorization_from_backup(
+    doc: &mut DocumentMut,
+    backup: &DocumentMut,
+    expected: Option<&str>,
+) {
+    restore_codex_managed_header_from_backup(doc, backup, AGENT_AUTHORIZATION_HEADER, |value| {
+        expected == Some(value)
+    });
+}
+
+fn restore_codex_managed_header_from_backup(
+    doc: &mut DocumentMut,
+    backup: &DocumentMut,
+    header: &str,
+    is_managed: impl Fn(&str) -> bool,
+) {
+    let current_is_managed = codex_provider_header(doc, header)
+        .and_then(TomlValue::as_str)
+        .is_some_and(&is_managed);
+    if !current_is_managed {
+        return;
+    }
+    let replacement = codex_provider_header(backup, header)
+        .filter(|value| !value.as_str().is_some_and(&is_managed))
+        .cloned();
+    replace_codex_provider_header(doc, header, replacement);
+}
+
+fn replace_codex_provider_header(
+    doc: &mut DocumentMut,
+    header: &str,
+    replacement: Option<TomlValue>,
+) {
+    let Some(provider) = doc
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        .and_then(|providers| providers.get_mut("nemo-relay-openai"))
+        .and_then(Item::as_table_mut)
+    else {
+        return;
+    };
+    let Some(headers) = provider.get_mut("http_headers") else {
+        return;
+    };
+    let remove_headers = if let Some(headers) = headers.as_inline_table_mut() {
+        match replacement {
+            Some(value) => {
+                headers.insert(header, value);
+            }
+            None => {
+                headers.remove(header);
+            }
+        }
+        headers.is_empty()
+    } else if let Some(headers) = headers.as_table_mut() {
+        match replacement {
+            Some(value) => {
+                headers.insert(header, Item::Value(value));
+            }
+            None => {
+                headers.remove(header);
+            }
+        }
+        headers.is_empty()
+    } else {
+        false
+    };
+    if remove_headers {
+        provider.remove("http_headers");
+    }
+}
+
 /// Remove installer-owned state from a backup produced by an older partial-reinstall bug.
 ///
 /// The client proof is the ownership signal: only a token authenticated by this user's current
@@ -901,14 +1056,17 @@ fn sanitize_codex_backup_doc(
     mut backup: DocumentMut,
     gateway_url: &str,
     challenge: Option<&BootstrapChallengeKey>,
+    agent_authorization: Option<&str>,
 ) -> DocumentMut {
     let reserved_token =
         codex_provider_header(&backup, BOOTSTRAP_CLIENT_TOKEN_HEADER).and_then(TomlValue::as_str);
     let has_managed_proof = reserved_token.is_some_and(|token| {
         challenge.is_some_and(|challenge| challenge.verify_client_token(token))
-    });
+    }) || codex_provider_agent_authorization(&backup)
+        .is_some_and(|value| agent_authorization == Some(value));
     let provider_is_managed = codex_provider_item_is_managed(&backup, gateway_url);
-    let has_generated_lineage = provider_is_managed && reserved_token.is_some();
+    let has_generated_lineage = provider_is_managed
+        && (reserved_token.is_some() || codex_provider_agent_authorization(&backup).is_some());
     if !has_managed_proof && !has_generated_lineage {
         return backup;
     }
@@ -931,6 +1089,7 @@ fn sanitize_codex_backup_doc(
     } else {
         let empty = DocumentMut::new();
         restore_codex_client_proof_from_backup(&mut backup, &empty, challenge);
+        restore_codex_agent_authorization_from_backup(&mut backup, &empty, agent_authorization);
     }
     remove_table_item_if_bool(&mut backup, "features", "hooks", true);
     remove_managed_multi_agent_v2_enabled(&mut backup);
@@ -960,6 +1119,7 @@ fn codex_provider_user_extensions(doc: &DocumentMut, gateway_url: &str) -> Optio
         extensions.remove(key);
     }
     remove_codex_provider_header(&mut extensions, BOOTSTRAP_CLIENT_TOKEN_HEADER);
+    remove_codex_provider_header(&mut extensions, AGENT_AUTHORIZATION_HEADER);
     (!extensions.is_empty()).then_some(extensions)
 }
 
@@ -972,6 +1132,7 @@ fn codex_extended_provider_without_proof(doc: &DocumentMut, gateway_url: &str) -
         .as_table()?
         .clone();
     remove_codex_provider_header(&mut provider, BOOTSTRAP_CLIENT_TOKEN_HEADER);
+    remove_codex_provider_header(&mut provider, AGENT_AUTHORIZATION_HEADER);
     Some(provider)
 }
 
@@ -1083,11 +1244,22 @@ fn codex_provider_has_only_generated_fields(doc: &DocumentMut) -> bool {
     let Some(headers) = provider.get("http_headers") else {
         return false;
     };
-    headers.as_inline_table().is_some_and(|headers| {
-        headers.len() == 1 && headers.contains_key(BOOTSTRAP_CLIENT_TOKEN_HEADER)
-    }) || headers.as_table().is_some_and(|headers| {
-        headers.len() == 1 && headers.contains_key(BOOTSTRAP_CLIENT_TOKEN_HEADER)
-    })
+    headers
+        .as_inline_table()
+        .is_some_and(generated_codex_headers)
+        || headers.as_table().is_some_and(|headers| {
+            let keys = headers.iter().map(|(key, _)| key).collect::<Vec<_>>();
+            generated_codex_header_names(&keys)
+        })
+}
+
+fn generated_codex_headers(headers: &InlineTable) -> bool {
+    let keys = headers.iter().map(|(key, _)| key).collect::<Vec<_>>();
+    generated_codex_header_names(&keys)
+}
+
+fn generated_codex_header_names(keys: &[&str]) -> bool {
+    keys.len() == 1 && keys[0].eq_ignore_ascii_case(AGENT_AUTHORIZATION_HEADER)
 }
 
 pub(crate) fn codex_provider_header<'a>(doc: &'a DocumentMut, name: &str) -> Option<&'a TomlValue> {
@@ -1128,17 +1300,78 @@ pub(crate) fn uninstall_codex_config(
     gateway_url: &str,
     preserve_hooks: bool,
 ) -> Result<(), String> {
-    if !path.exists() {
+    uninstall_codex_config_with_hook(path, gateway_url, preserve_hooks, || {})
+}
+
+pub(crate) fn uninstall_codex_config_with_hook(
+    path: &Path,
+    gateway_url: &str,
+    preserve_hooks: bool,
+    mut before_commit: impl FnMut(),
+) -> Result<(), String> {
+    let challenge = BootstrapChallengeKey::load_existing().map_err(|error| error.to_string())?;
+    let agent_authorization = current_codex_agent_authorization(gateway_url)?;
+    for _ in 0..4 {
+        let revision = crate::filesystem::snapshot_optional_file(path)?;
+        let Some(raw) = revision.bytes() else {
+            return Ok(());
+        };
+        let backup_revision = crate::filesystem::snapshot_optional_file(&backup_path(path))?;
+        let doc = prepare_codex_uninstall_doc(
+            path,
+            raw,
+            backup_revision.bytes(),
+            gateway_url,
+            preserve_hooks,
+            challenge.as_ref(),
+            agent_authorization.as_deref(),
+        )?;
+        before_commit();
+        if !revision.is_current()? || !backup_revision.is_current()? {
+            continue;
+        }
+        revision.require_current()?;
+        atomic_write(path, doc.to_string().as_bytes())?;
+        backup_revision.require_current()?;
+        remove_backup(path)?;
         return Ok(());
     }
-    let raw = fs::read_to_string(path)
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    Err(format!(
+        "{} kept changing while Relay tried to restore Codex configuration; retained the current file",
+        path.display()
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_codex_uninstall_doc(
+    path: &Path,
+    raw: &[u8],
+    backup_raw: Option<&[u8]>,
+    gateway_url: &str,
+    preserve_hooks: bool,
+    challenge: Option<&BootstrapChallengeKey>,
+    agent_authorization: Option<&str>,
+) -> Result<DocumentMut, String> {
+    let raw = std::str::from_utf8(raw)
+        .map_err(|error| format!("invalid UTF-8 in {}: {error}", path.display()))?;
     let mut doc = raw
         .parse::<DocumentMut>()
         .map_err(|error| format!("invalid TOML in {}: {error}", path.display()))?;
-    let challenge = BootstrapChallengeKey::load_existing().map_err(|error| error.to_string())?;
-    let backup_doc = read_codex_backup_doc(path)?
-        .map(|backup| sanitize_codex_backup_doc(backup, gateway_url, challenge.as_ref()));
+    let backup_doc = backup_raw
+        .map(|raw| {
+            std::str::from_utf8(raw)
+                .map_err(|error| {
+                    format!("invalid UTF-8 in {}: {error}", backup_path(path).display())
+                })?
+                .parse::<DocumentMut>()
+                .map_err(|error| {
+                    format!("invalid TOML in {}: {error}", backup_path(path).display())
+                })
+        })
+        .transpose()?
+        .map(|backup| {
+            sanitize_codex_backup_doc(backup, gateway_url, challenge, agent_authorization)
+        });
     let preserved_provider = codex_extended_provider_without_proof(&doc, gateway_url);
     let provider_is_managed = codex_provider_item_is_managed(&doc, gateway_url);
     match backup_doc.as_ref() {
@@ -1160,25 +1393,17 @@ pub(crate) fn uninstall_codex_config(
     restore_codex_client_proof_from_backup(
         &mut doc,
         backup_doc.as_ref().unwrap_or(&empty_backup),
-        challenge.as_ref(),
+        challenge,
+    );
+    restore_codex_agent_authorization_from_backup(
+        &mut doc,
+        backup_doc.as_ref().unwrap_or(&empty_backup),
+        agent_authorization,
     );
 
     remove_empty_table(&mut doc, "model_providers");
     remove_empty_table(&mut doc, "features");
-    atomic_write(path, doc.to_string().as_bytes())?;
-    remove_backup(path)
-}
-
-fn read_codex_backup_doc(path: &Path) -> Result<Option<DocumentMut>, String> {
-    let backup = backup_path(path);
-    if !backup.exists() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(&backup)
-        .map_err(|error| format!("failed to read {}: {error}", backup.display()))?;
-    raw.parse::<DocumentMut>()
-        .map(Some)
-        .map_err(|error| format!("invalid TOML in {}: {error}", backup.display()))
+    Ok(doc)
 }
 
 fn restore_codex_config_from_backup(
@@ -1498,7 +1723,7 @@ pub(crate) fn codex_provider_table_is_managed_for_gateway(
             .get("supports_websockets")
             .and_then(Item::as_value)
             .and_then(|value| value.as_bool())
-            == Some(false)
+            == Some(true)
 }
 
 pub(crate) fn feature_hooks_enabled(doc: &DocumentMut) -> Option<bool> {
@@ -1615,15 +1840,38 @@ pub(crate) fn codex_provider_installed(gateway_url: &str) -> bool {
     let Ok(doc) = raw.parse::<DocumentMut>() else {
         return false;
     };
-    let Ok(Some(key)) = BootstrapChallengeKey::load_existing() else {
+    let Ok(Some(authorization)) = current_codex_agent_authorization(gateway_url) else {
         return false;
     };
     codex_config_doc_has_managed_install(&doc, gateway_url)
-        && codex_provider_client_token(&doc).is_some_and(|token| key.verify_client_token(token))
+        && codex_provider_agent_authorization(&doc) == Some(authorization.as_str())
 }
 
+fn current_codex_agent_authorization(gateway_url: &str) -> Result<Option<String>, String> {
+    let enrollment = crate::claude_desktop::enrollment(CodingAgent::Codex)?;
+    if let Some(enrollment) = enrollment.filter(|enrollment| {
+        enrollment.gateway_url.trim_end_matches('/') == gateway_url.trim_end_matches('/')
+    }) {
+        return Ok(Some(enrollment.authorization));
+    }
+    #[cfg(test)]
+    {
+        let _ = gateway_url;
+        Ok(Some(TEST_AGENT_AUTHORIZATION.into()))
+    }
+    #[cfg(not(test))]
+    {
+        Ok(None)
+    }
+}
+
+/// Legacy MCP-gateway proof retained only to recognize and remove old owned fields.
 pub(crate) fn codex_provider_client_token(doc: &DocumentMut) -> Option<&str> {
     codex_provider_header(doc, BOOTSTRAP_CLIENT_TOKEN_HEADER).and_then(TomlValue::as_str)
+}
+
+pub(crate) fn codex_provider_agent_authorization(doc: &DocumentMut) -> Option<&str> {
+    codex_provider_header(doc, AGENT_AUTHORIZATION_HEADER).and_then(TomlValue::as_str)
 }
 
 pub(crate) fn codex_hooks_installed(path: &Path) -> Result<bool, String> {

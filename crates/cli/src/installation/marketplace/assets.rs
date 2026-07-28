@@ -3,7 +3,6 @@
 
 //! Generated local marketplace and plugin manifest files.
 
-use std::env;
 use std::fs;
 use std::path::Path;
 
@@ -45,7 +44,6 @@ pub(super) fn write_plugin_marketplace_for_generation(
     if options.dry_run {
         println!("write {}", layout.marketplace_manifest.display());
         println!("write {}", layout.plugin_manifest.display());
-        println!("write {}", layout.mcp_config.display());
         println!("write {}", layout.generation_fence.display());
         println!("write {}", layout.hooks_path.display());
         return Ok(());
@@ -68,10 +66,6 @@ pub(super) fn write_plugin_marketplace_for_generation(
         write_staged_generation_with_token(&layout.generation_fence, active_generation_lock)
     }?;
     write_json(
-        &layout.mcp_config,
-        &plugin_mcp_config(host, relay, active_generation_fence, &generation_token)?,
-    )?;
-    write_json(
         &layout.hooks_path,
         &plugin_hooks(host, relay, active_generation_fence, &generation_token)?,
     )?;
@@ -86,22 +80,11 @@ pub(super) fn plugin_manifest(host: impl MarketplaceHost) -> Value {
     host.plugin_manifest(PLUGIN_NAME)
 }
 
-pub(super) fn plugin_mcp_config(
-    host: impl MarketplaceHost,
-    relay: &Path,
-    generation_fence: &Path,
-    generation_token: &str,
-) -> Result<Value, String> {
-    let generation_fence = absolute_or_self(generation_fence)?;
-    let server = crate::mcp::persistent_server(relay, &generation_fence, generation_token);
-    host.plugin_mcp_config(server)
-}
-
 fn absolute_or_self(path: &Path) -> Result<std::path::PathBuf, String> {
     if path.is_absolute() {
         return Ok(path.to_owned());
     }
-    env::current_dir()
+    std::env::current_dir()
         .map(|current| current.join(path))
         .map_err(|error| format!("failed to resolve relative generation fence: {error}"))
 }

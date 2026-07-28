@@ -109,7 +109,8 @@ with the optional feature explicitly:
 cargo build -p nemo-relay-cli --features switchyard
 ```
 
-Run the real-service compatibility test from the NeMo Relay repository root:
+Run the repository-only real-service compatibility test from the NeMo Relay
+repository root:
 
 ```bash
 examples/switchyard/run-real-e2e.sh
@@ -122,12 +123,14 @@ line when routing succeeds:
 real Switchyard E2E passed: ['provider/weak', 'provider/strong', 'provider/strong']
 ```
 
-The test starts these local processes:
+The test builds Relay's separate `internal-test-server` feature-gated binary.
+That binary is absent from normal release builds and is not a supported
+standalone deployment path. The test starts these local processes:
 
 | Process | Port | Readiness Check or Purpose |
 | --- | --- | --- |
 | Switchyard Decision API | `4000` | Serves `/health`, routing decisions, and ATOF ingestion. |
-| NeMo Relay | `4041` | Serves `/healthz` and the OpenAI-compatible gateway. |
+| NeMo Relay test harness | `4041` | Serves `/healthz` and OpenAI-compatible test traffic. |
 | Deterministic provider | `4101` | Records the model selected for each provider request. |
 
 The first request has no accumulated ATOF history and routes to

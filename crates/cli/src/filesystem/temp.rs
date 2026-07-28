@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(
+    dead_code,
+    reason = "private wrapper temporary directories remain only in legacy regression tests"
+)]
+
 use std::path::{Path, PathBuf};
 
 use crate::error::CliError;

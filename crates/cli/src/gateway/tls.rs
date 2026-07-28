@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(test)]
+
 //! Pinned per-user TLS identity for authenticated bootstrap hook delivery.
 
 use std::sync::Arc;
@@ -21,6 +23,10 @@ pub(crate) struct RelayTlsIdentity {
 }
 
 impl RelayTlsIdentity {
+    #[allow(
+        dead_code,
+        reason = "legacy standalone gateway TLS remains for cleanup regression coverage"
+    )]
     pub(crate) fn load_or_create() -> Result<Self, String> {
         let path = identity_path()?;
         if path.exists() {
@@ -55,6 +61,10 @@ impl RelayTlsIdentity {
         Ok(Self { record })
     }
 
+    #[allow(
+        dead_code,
+        reason = "legacy standalone gateway TLS remains for cleanup regression coverage"
+    )]
     pub(crate) fn server_config(&self) -> Result<Arc<rustls::ServerConfig>, String> {
         let certificate = CertificateDer::from(self.record.certificate_der.clone());
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(

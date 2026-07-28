@@ -13,10 +13,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 fn gateway_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_nemo-relay")
+    env!("CARGO_BIN_EXE_nemo-relay-internal-managed-server")
 }
 
 struct ChildGuard(Child);
@@ -183,7 +185,8 @@ async fn switchyard_plugin_routes_buffered_and_streaming_then_fails_open() {
     .await;
 
     let temp = tempfile::tempdir().unwrap();
-    let config_path = temp.path().join("plugins.toml");
+    let plugin_config_path = temp.path().join("plugins.toml");
+    let config_path = temp.path().join("config.toml");
     let config = format!(
         r#"version = 1
 
@@ -211,6 +214,9 @@ protocol = "openai_chat"
 endpoint = "/v1/chat/completions"
 base_url = "{provider_url}"
 
+[components.config.targets.selected-chat.header_env]
+x-custom-signature = "SWITCHYARD_PROVIDER_SECRET"
+
 [components.config.targets.fallback-chat]
 model = "provider/fallback"
 protocol = "openai_chat"
@@ -230,16 +236,18 @@ endpoint = "/v1/messages"
 base_url = "{provider_url}"
 "#
     );
-    std::fs::write(&config_path, config).unwrap();
+    std::fs::write(&plugin_config_path, config).unwrap();
+    std::fs::write(&config_path, "").unwrap();
 
     let address = unused_address();
     let gateway_url = format!("http://{address}");
     let stderr = std::fs::File::create(temp.path().join("gateway.log")).unwrap();
     let child = Command::new(gateway_bin())
-        .arg("--plugin-config-path")
+        .arg("--config")
         .arg(&config_path)
         .arg("--bind")
         .arg(address.to_string())
+        .env("SWITCHYARD_PROVIDER_SECRET", "target-secret")
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr))
         .spawn()
@@ -267,8 +275,13 @@ base_url = "{provider_url}"
     };
 
     let buffered = send_chat("buffered-request", false).await.unwrap();
-    assert!(buffered.status().is_success());
-    let buffered: Value = buffered.json().await.unwrap();
+    let buffered_status = buffered.status();
+    let buffered_body = buffered.text().await.unwrap();
+    assert!(
+        buffered_status.is_success(),
+        "buffered request failed with {buffered_status}: {buffered_body}"
+    );
+    let buffered: Value = serde_json::from_str(&buffered_body).unwrap();
     assert_eq!(buffered["model"], "provider/selected");
 
     let translated = client
@@ -357,11 +370,123 @@ base_url = "{provider_url}"
         malformed_models,
         vec!["provider/selected", "provider/fallback"]
     );
-    for (headers, _) in providers.iter() {
+    for (headers, body) in providers.iter() {
         assert!(!headers.contains_key("x-nemo-relay-internal-dispatch-url"));
         assert!(!headers.contains_key("x-nemo-relay-internal-dispatch-route"));
+        assert!(!headers.contains_key("x-nemo-relay-internal-provider-credential-headers"));
+        if body["model"] == "provider/selected" {
+            assert_eq!(
+                headers.get("x-custom-signature").unwrap().to_str().unwrap(),
+                "target-secret"
+            );
+        } else {
+            assert!(!headers.contains_key("x-custom-signature"));
+        }
     }
 
     decision_task.abort();
     provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn internal_server_process_supports_managed_loopback_websockets() {
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream_listener.local_addr().unwrap();
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = upstream_listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let request = socket.next().await.unwrap().unwrap().into_text().unwrap();
+        request_tx
+            .send(serde_json::from_str::<Value>(&request).unwrap())
+            .unwrap();
+        for event in [
+            json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": "process-ws", "model": "gpt-5"}
+            }),
+            json!({
+                "type": "response.completed",
+                "sequence_number": 1,
+                "response": {
+                    "id": "process-ws",
+                    "model": "gpt-5",
+                    "status": "completed",
+                    "output": []
+                }
+            }),
+        ] {
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    event.to_string().into(),
+                ))
+                .await
+                .unwrap();
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!("[upstream]\nopenai_base_url = \"http://{upstream_address}/v1\"\n"),
+    )
+    .unwrap();
+    let address = unused_address();
+    let gateway_url = format!("http://{address}");
+    let stderr = std::fs::File::create(temp.path().join("gateway.log")).unwrap();
+    let child = Command::new(gateway_bin())
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--bind")
+        .arg(address.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .unwrap();
+    let mut gateway = ChildGuard(child);
+    let client = reqwest::Client::new();
+    wait_for_gateway(&client, &gateway_url, &mut gateway.0).await;
+
+    let mut request = format!("ws://{address}/responses")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        "Bearer process-provider-key".parse().unwrap(),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({
+                "type": "response.create",
+                "model": "gpt-5",
+                "input": "process WebSocket test"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut event_types = Vec::new();
+    while event_types.len() < 2 {
+        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+            let event: Value = serde_json::from_str(&text).unwrap();
+            event_types.push(event["type"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(event_types, ["response.created", "response.completed"]);
+    let upstream_request = request_rx.await.unwrap();
+    assert_eq!(upstream_request["type"], "response.create");
+    assert_eq!(upstream_request["input"], "process WebSocket test");
+
+    let _ = socket.close(None).await;
+    upstream_task.await.unwrap();
 }

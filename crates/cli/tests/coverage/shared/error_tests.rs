@@ -31,10 +31,6 @@ fn log_kinds_cover_every_operational_error_class() {
             CliError::PayloadTooLarge("large".into()),
             "payload_too_large",
         ),
-        (
-            CliError::Unauthorized("missing token".into()),
-            "unauthorized",
-        ),
         (CliError::Upstream(upstream), "upstream"),
         (
             CliError::ProviderFailure(UpstreamFailure {

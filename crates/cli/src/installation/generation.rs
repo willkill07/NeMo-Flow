@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Private install-generation fencing for lifecycle-bound plugin MCP clients.
+//! Private install-generation fencing for lifecycle-bound coding-agent hooks.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -17,8 +17,8 @@ use crate::filesystem::{
     LockAttempt, atomic_write, try_lock_exclusive, try_lock_shared, unlock_file,
 };
 
-pub(crate) const GENERATION_FILE_ENV: &str = "NEMO_RELAY_MCP_GENERATION_FILE";
-pub(crate) const GENERATION_TOKEN_ENV: &str = "NEMO_RELAY_MCP_GENERATION";
+pub(crate) const LEGACY_MCP_GENERATION_FILE_ENV: &str = "NEMO_RELAY_MCP_GENERATION_FILE";
+pub(crate) const LEGACY_MCP_GENERATION_TOKEN_ENV: &str = "NEMO_RELAY_MCP_GENERATION";
 pub(crate) const GENERATION_FILE_NAME: &str = ".nemo-relay-generation";
 const MAX_GENERATION_TOKEN_BYTES: usize = 128;
 const MAX_GENERATION_MARKER_BYTES: usize = 16 * 1024;
@@ -33,10 +33,12 @@ const GENERATION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 pub(crate) struct InstallGeneration {
     path: PathBuf,
     marker: GenerationMarker,
+    #[cfg(test)]
     lock_id: String,
     // The lock lives outside movable plugin trees while the marker remains plugin-owned.
     // Retaining this handle preserves fencing across replacement and rollback without preventing
     // Windows from moving the marketplace that contains the marker.
+    #[cfg(test)]
     file: Arc<File>,
 }
 
@@ -56,28 +58,6 @@ impl Drop for ActiveGenerationGuard {
 }
 
 impl InstallGeneration {
-    pub(crate) fn capture_guarded_from_env() -> Result<Option<(Self, ActiveGenerationGuard)>, String>
-    {
-        match (
-            env::var_os(GENERATION_FILE_ENV),
-            env::var_os(GENERATION_TOKEN_ENV),
-        ) {
-            (None, None) => Ok(None),
-            (Some(path), Some(expected)) => {
-                let expected = expected.into_string().map_err(|_| {
-                    format!("{GENERATION_TOKEN_ENV} is not valid Unicode; reinstall the plugin")
-                })?;
-                Self::capture_guarded_expected(PathBuf::from(path), &expected).map(Some)
-            }
-            (Some(_), None) => Err(format!(
-                "{GENERATION_TOKEN_ENV} is required with {GENERATION_FILE_ENV}; reinstall the plugin"
-            )),
-            (None, Some(_)) => Err(format!(
-                "{GENERATION_FILE_ENV} is required with {GENERATION_TOKEN_ENV}; reinstall the plugin"
-            )),
-        }
-    }
-
     pub(crate) fn capture(path: PathBuf) -> Result<Self, String> {
         let (generation, guard) = Self::capture_guarded(path)?;
         drop(guard);
@@ -143,7 +123,9 @@ impl InstallGeneration {
             Self {
                 path,
                 marker: visible_marker,
+                #[cfg(test)]
                 lock_id,
+                #[cfg(test)]
                 file: file.clone(),
             },
             ActiveGenerationGuard { lock: file },
@@ -161,6 +143,7 @@ impl InstallGeneration {
     }
 
     /// Check one lifecycle snapshot without waiting when an installer owns the transaction lock.
+    #[cfg(test)]
     pub(crate) fn try_verify_current(&self) -> Result<bool, String> {
         match try_lock_shared(&self.file) {
             Ok(LockAttempt::Contended) => return Ok(false),
@@ -174,6 +157,7 @@ impl InstallGeneration {
             .map_err(|_| retired_generation_error(&self.path))
     }
 
+    #[cfg(test)]
     pub(crate) fn guard_current(&self) -> Result<ActiveGenerationGuard, String> {
         lock_shared_with_timeout(&self.file, &self.path, DEFAULT_GENERATION_LOCK_TIMEOUT)
             .map_err(|_| retired_generation_error(&self.path))?;
@@ -186,6 +170,7 @@ impl InstallGeneration {
         })
     }
 
+    #[cfg(test)]
     fn try_validate_locked(&self) -> Result<(), String> {
         let current_marker = read_generation_marker_path(&self.path)?;
         let current_lock_matches =
@@ -1214,7 +1199,7 @@ fn decode_lock_path(encoded: &str) -> Result<PathBuf, String> {
 
 fn retired_generation_error(path: &Path) -> String {
     format!(
-        "plugin MCP install generation at {} has been retired",
+        "plugin hook install generation at {} has been retired",
         path.display()
     )
 }

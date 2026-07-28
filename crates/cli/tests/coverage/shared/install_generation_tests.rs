@@ -205,82 +205,6 @@ fn expected_token_rejects_a_stale_launcher_after_same_path_rotation() {
 }
 
 #[test]
-fn generation_environment_requires_and_verifies_the_complete_identity_pair() {
-    struct EnvironmentRestore {
-        file: Option<std::ffi::OsString>,
-        token: Option<std::ffi::OsString>,
-    }
-    impl Drop for EnvironmentRestore {
-        fn drop(&mut self) {
-            // SAFETY: This test holds the repository-wide environment mutex.
-            unsafe {
-                match self.file.take() {
-                    Some(value) => std::env::set_var(GENERATION_FILE_ENV, value),
-                    None => std::env::remove_var(GENERATION_FILE_ENV),
-                }
-                match self.token.take() {
-                    Some(value) => std::env::set_var(GENERATION_TOKEN_ENV, value),
-                    None => std::env::remove_var(GENERATION_TOKEN_ENV),
-                }
-            }
-        }
-    }
-
-    let _environment = crate::test_support::ENV_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _restore = EnvironmentRestore {
-        file: std::env::var_os(GENERATION_FILE_ENV),
-        token: std::env::var_os(GENERATION_TOKEN_ENV),
-    };
-    // SAFETY: This test holds the repository-wide environment mutex.
-    unsafe {
-        std::env::remove_var(GENERATION_FILE_ENV);
-        std::env::remove_var(GENERATION_TOKEN_ENV);
-    }
-    assert!(
-        InstallGeneration::capture_guarded_from_env()
-            .unwrap()
-            .is_none()
-    );
-
-    let dir = tempdir().unwrap();
-    let path = dir.path().join(GENERATION_FILE_NAME);
-    let token = write_new_generation_with_token(&path).unwrap();
-    // SAFETY: This test holds the repository-wide environment mutex.
-    unsafe { std::env::set_var(GENERATION_FILE_ENV, &path) };
-    let error = InstallGeneration::capture_guarded_from_env()
-        .err()
-        .expect("generation path without identity was accepted");
-    assert!(error.contains(GENERATION_TOKEN_ENV), "{error}");
-
-    // SAFETY: This test holds the repository-wide environment mutex.
-    unsafe {
-        std::env::remove_var(GENERATION_FILE_ENV);
-        std::env::set_var(GENERATION_TOKEN_ENV, &token);
-    }
-    let error = InstallGeneration::capture_guarded_from_env()
-        .err()
-        .expect("generation identity without path was accepted");
-    assert!(error.contains(GENERATION_FILE_ENV), "{error}");
-
-    // SAFETY: This test holds the repository-wide environment mutex.
-    unsafe { std::env::set_var(GENERATION_FILE_ENV, &path) };
-    let (generation, guard) = InstallGeneration::capture_guarded_from_env()
-        .unwrap()
-        .unwrap();
-    assert_eq!(generation.token(), token);
-    drop(guard);
-
-    // SAFETY: This test holds the repository-wide environment mutex.
-    unsafe { std::env::set_var(GENERATION_TOKEN_ENV, "stale-generation") };
-    let error = InstallGeneration::capture_guarded_from_env()
-        .err()
-        .expect("stale generation identity was accepted");
-    assert!(error.contains("has been retired"), "{error}");
-}
-
-#[test]
 fn guarded_capture_rejects_a_marker_and_lock_replaced_after_open() {
     let dir = tempdir().unwrap();
     let old_path = dir.path().join("old").join(GENERATION_FILE_NAME);
@@ -857,52 +781,6 @@ fn generation_lock_identity_reader_rejects_oversized_records() {
         retirement_error.contains("byte limit"),
         "{retirement_error}"
     );
-}
-
-#[cfg(unix)]
-#[test]
-fn generation_environment_rejects_non_unicode_expected_identity() {
-    use std::os::unix::ffi::OsStringExt;
-
-    struct Restore {
-        path: Option<std::ffi::OsString>,
-        token: Option<std::ffi::OsString>,
-    }
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            // SAFETY: The test holds the process-wide environment lock.
-            unsafe {
-                match self.path.take() {
-                    Some(value) => std::env::set_var(GENERATION_FILE_ENV, value),
-                    None => std::env::remove_var(GENERATION_FILE_ENV),
-                }
-                match self.token.take() {
-                    Some(value) => std::env::set_var(GENERATION_TOKEN_ENV, value),
-                    None => std::env::remove_var(GENERATION_TOKEN_ENV),
-                }
-            }
-        }
-    }
-
-    let _environment = crate::test_support::ENV_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _restore = Restore {
-        path: std::env::var_os(GENERATION_FILE_ENV),
-        token: std::env::var_os(GENERATION_TOKEN_ENV),
-    };
-    unsafe {
-        std::env::set_var(GENERATION_FILE_ENV, "/unused/generation");
-        std::env::set_var(
-            GENERATION_TOKEN_ENV,
-            std::ffi::OsString::from_vec(vec![0xff]),
-        );
-    }
-
-    let error = InstallGeneration::capture_guarded_from_env()
-        .err()
-        .expect("non-Unicode expected identity was accepted");
-    assert!(error.contains("not valid Unicode"), "{error}");
 }
 
 #[test]

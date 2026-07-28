@@ -1,27 +1,45 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-user startup lock and ownership record for the shared gateway.
+//! Per-user startup lock and ownership record for the agent proxy.
 
+#[cfg(test)]
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(test)]
+use std::fs::OpenOptions;
+#[cfg(test)]
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(test)]
 use std::thread;
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use reqwest::Url;
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
 
-use crate::filesystem::{LockAttempt, atomic_write, try_lock_exclusive};
+#[cfg(test)]
+use crate::filesystem::atomic_write;
+#[cfg(test)]
+use crate::filesystem::{LockAttempt, try_lock_exclusive};
 
+#[cfg(test)]
 use super::{BOOTSTRAP_LOCK_TIMEOUT, BOOTSTRAP_PROTOCOL_VERSION};
+#[cfg(test)]
 use crate::gateway::client::{RelayHealth, probe, request_shutdown};
 
+#[cfg(test)]
 pub(crate) const BOOTSTRAP_STATE_DIR_ENV: &str = "NEMO_RELAY_BOOTSTRAP_STATE_DIR";
 pub(crate) const BOOTSTRAP_SHUTDOWN_TOKEN_ENV: &str = "NEMO_RELAY_BOOTSTRAP_SHUTDOWN_TOKEN";
+#[cfg(test)]
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(super) struct OwnerRecord {
     service: String,
@@ -33,6 +51,7 @@ pub(super) struct OwnerRecord {
     bootstrap_fingerprint: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(super) struct RecoveryRecord {
     pub(super) from_instance: String,
@@ -40,6 +59,7 @@ pub(super) struct RecoveryRecord {
     pub(super) to_instance: String,
 }
 
+#[cfg(test)]
 impl OwnerRecord {
     fn new(pid: u32, url: &str, shutdown_token: &str, fingerprint: Option<&str>) -> Self {
         Self {
@@ -67,11 +87,13 @@ impl OwnerRecord {
 
 /// Removes this process's ownership record when the gateway server exits.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct OwnerGuard {
     path: PathBuf,
     record: OwnerRecord,
 }
 
+#[cfg(test)]
 impl Drop for OwnerGuard {
     fn drop(&mut self) {
         let _ = remove_if_matches(&self.path, &self.record);
@@ -87,6 +109,28 @@ pub(crate) fn state_dir() -> Result<PathBuf, String> {
         })
 }
 
+pub(crate) fn legacy_gateway_artifact() -> Result<Option<PathBuf>, String> {
+    let state = state_dir()?;
+    let endpoint = "127.0.0.1-47632";
+    for path in [
+        state.join(format!("sidecar-{endpoint}.owner.json")),
+        state.join(format!("gateway-{endpoint}.recovery.json")),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(Some(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect legacy gateway state {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
 pub(crate) fn create_private_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path)
         .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
@@ -100,18 +144,22 @@ pub(crate) fn create_private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn owner_path(state: &Path, url: &str) -> PathBuf {
     state.join(format!("sidecar-{}.owner.json", lock_name(url)))
 }
 
+#[cfg(test)]
 pub(crate) fn lock_path(state: &Path, url: &str) -> PathBuf {
     state.join(format!("gateway-{}.lock", lock_name(url)))
 }
 
+#[cfg(test)]
 fn recovery_path(state: &Path, url: &str) -> PathBuf {
     state.join(format!("gateway-{}.recovery.json", lock_name(url)))
 }
 
+#[cfg(test)]
 pub(super) fn read_recovery(state: &Path, url: &str) -> Result<Option<RecoveryRecord>, String> {
     let path = recovery_path(state, url);
     match fs::read(&path) {
@@ -129,6 +177,7 @@ pub(super) fn read_recovery(state: &Path, url: &str) -> Result<Option<RecoveryRe
     }
 }
 
+#[cfg(test)]
 pub(super) fn write_recovery(
     state: &Path,
     url: &str,
@@ -140,10 +189,12 @@ pub(super) fn write_recovery(
     atomic_write(&path, &bytes)
 }
 
+#[cfg(test)]
 pub(crate) fn lock_endpoint(state: &Path, url: &str) -> Result<fs::File, String> {
     lock_endpoint_for(state, url, BOOTSTRAP_LOCK_TIMEOUT)
 }
 
+#[cfg(test)]
 pub(crate) fn lock_endpoint_for(
     state: &Path,
     url: &str,
@@ -181,6 +232,7 @@ pub(crate) fn lock_endpoint_for(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn publish_owner_from_env(
     address: SocketAddr,
     shutdown_token: Option<&str>,
@@ -219,6 +271,7 @@ pub(crate) fn publish_owner_from_env(
     Ok(Some(OwnerGuard { path, record }))
 }
 
+#[cfg(test)]
 pub(crate) fn stop_owned_and_reset(url: &str) -> Result<(), String> {
     let state = state_dir()?;
     if !state.exists() {
@@ -275,12 +328,14 @@ pub(crate) fn stop_owned_and_reset(url: &str) -> Result<(), String> {
     remove_if_matches(&path, &owner)
 }
 
+#[cfg(test)]
 fn write_owner_record(path: &Path, record: &OwnerRecord) -> Result<(), String> {
     let bytes = serde_json::to_vec(record)
         .map_err(|error| format!("failed to encode gateway ownership: {error}"))?;
     atomic_write(path, &bytes)
 }
 
+#[cfg(test)]
 pub(super) fn read_owner_record(path: &Path) -> Result<Option<OwnerRecord>, String> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
@@ -297,6 +352,7 @@ pub(super) fn read_owner_record(path: &Path) -> Result<Option<OwnerRecord>, Stri
     }
 }
 
+#[cfg(test)]
 fn remove_if_matches(path: &Path, expected: &OwnerRecord) -> Result<(), String> {
     if read_owner_record(path)?.as_ref() != Some(expected) {
         return Ok(());
@@ -311,6 +367,7 @@ fn remove_if_matches(path: &Path, expected: &OwnerRecord) -> Result<(), String> 
     }
 }
 
+#[cfg(test)]
 pub(crate) fn lock_name(url: &str) -> String {
     let raw = Url::parse(url)
         .ok()

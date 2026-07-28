@@ -85,11 +85,9 @@ fn enrich_routing_identity_headers(
     request: &mut LlmRequest,
     context: RoutingIdentityHeaderContext<'_>,
 ) {
-    request.headers.retain(|name, _| {
-        !ROUTING_IDENTITY_HEADERS
-            .iter()
-            .any(|reserved| name.eq_ignore_ascii_case(reserved))
-    });
+    request
+        .headers
+        .retain(|name, _| !is_routing_identity_header(name));
     insert_routing_identity_header(
         &mut request.headers,
         "x-nemo-relay-session-id",
@@ -144,6 +142,12 @@ fn enrich_routing_identity_headers(
         "native",
     );
     insert_routing_identity_header(&mut request.headers, "x-nemo-relay-source", "gateway");
+}
+
+pub(crate) fn is_routing_identity_header(name: &str) -> bool {
+    ROUTING_IDENTITY_HEADERS
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 fn insert_routing_identity_header(headers: &mut Map<String, Value>, name: &str, value: &str) {
@@ -282,6 +286,18 @@ impl SessionManager {
             alignment: Arc::new(Mutex::new(SessionAlignmentState::default())),
             default_config,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn session_instance_id(&self, session_id: &str) -> Option<String> {
+        self.inner.lock().await.get(session_id).map(|session| {
+            session
+                .scope_stack
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .root_uuid()
+                .to_string()
+        })
     }
 
     /// Starts the fail-safe idle closer used by the HTTP gateway.
@@ -534,9 +550,10 @@ impl SessionManager {
     ///
     /// Host sessions can remain durable after their current turn ends: Codex may omit `SessionEnd`,
     /// while Hermes keeps a session open for later resumption. A dormant agent scope must therefore
-    /// not keep the MCP-managed sidecar alive forever. Active turns, subagents, tools, LLMs, and
+    /// not keep the persistent agent proxy alive forever. Active turns, subagents, tools, LLMs, and
     /// gateway calls still block idle shutdown; [`Self::close_all`] balances the dormant agent scope
     /// when the gateway exits.
+    #[allow(dead_code, reason = "retained for legacy sidecar shutdown diagnostics")]
     pub(crate) async fn has_open_sessions(&self) -> bool {
         self.inner
             .lock()
@@ -622,7 +639,8 @@ impl SessionManager {
     ///
     /// Some harnesses can exit without a native `SessionEnd` hook. Gateway shutdown is the last
     /// deterministic lifecycle boundary for those sessions, so close open scopes while
-    /// observability plugins are still active. Applies to Codex transparent runs today.
+    /// observability plugins are still active. This covers Codex hook sessions that end without a
+    /// terminal lifecycle event.
     pub(crate) async fn close_all(&self, reason: &str) -> Result<(), CliError> {
         self.alignment.lock().await.clear();
         let mut sessions = {

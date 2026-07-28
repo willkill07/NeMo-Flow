@@ -35,7 +35,7 @@ For how Relay complements OpenTelemetry GenAI conventions and observability or
 evaluation products, see [How NeMo Relay Relates to Other Tooling](/about-nemo-relay/ecosystem#how-nemo-relay-relates-to-other-tooling).
 
 The first design question is simple: where can Relay observe or control the real
-work? The answer determines whether you should use a CLI sidecar, direct SDK
+work? The answer determines whether you should use the local coding-agent proxy, direct SDK
 instrumentation, a maintained integration, a framework wrapper, or a plugin.
 
 ## Choose Your First Path
@@ -44,7 +44,7 @@ Pick the row closest to what you are trying to do.
 
 | Goal | Start With | Why |
 |---|---|---|
-| Observe Codex, Claude Code, or Hermes locally | [NeMo Relay CLI](/nemo-relay-cli/about) and [Basic Usage](/nemo-relay-cli/basic-usage) | Relay runs as a local sidecar, forwards hooks, routes provider traffic when configured, and writes observability artifacts without changing application code. |
+| Observe Codex, Claude Code, or Hermes locally | [NeMo Relay CLI](/nemo-relay-cli/about) and [Basic Usage](/nemo-relay-cli/basic-usage) | Relay enrolls the client in one authenticated per-user proxy, forwards hooks, manages supported native provider traffic, and writes observability artifacts without changing application code. |
 | Run the smallest binding-specific example | [Quick Start](/getting-started/quick-start) | Use this when you want a minimal Rust, Python, or Node.js workflow before adding Relay to real application code. |
 | Instrument application-owned LLM or tool calls | [Instrument Applications](/instrument-applications/about) | Direct SDK instrumentation gives Relay full managed-call semantics around callbacks your code owns. |
 | Use LangChain, LangGraph, Deep Agents, or OpenClaw | [Supported Integrations](/supported-integrations/about) | Maintained integrations use public framework or plugin APIs where they preserve enough lifecycle fidelity. |

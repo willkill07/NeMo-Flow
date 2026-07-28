@@ -3,6 +3,8 @@
 
 //! Observable header policy and downstream response construction.
 
+use std::collections::BTreeSet;
+
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, Response, StatusCode};
 use serde_json::{Map, Value, json};
@@ -11,15 +13,28 @@ use crate::configuration::BOOTSTRAP_CLIENT_TOKEN_HEADER;
 use crate::error::CliError;
 
 pub(super) fn observable_headers(headers: &HeaderMap) -> Map<String, Value> {
+    let private_headers = declared_provider_credential_headers(headers);
     let mut output = Map::new();
     for (name, value) in headers {
         if should_record_header(name, headers)
+            && !private_headers.contains(name.as_str())
             && let Ok(value) = value.to_str()
         {
             output.insert(name.as_str().to_string(), json!(value));
         }
     }
     output
+}
+
+pub(super) fn declared_provider_credential_headers(headers: &HeaderMap) -> BTreeSet<String> {
+    headers
+        .get_all(nemo_relay::api::llm::PROVIDER_CREDENTIAL_HEADER_NAMES_HEADER)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty() && HeaderName::from_bytes(name.as_bytes()).is_ok())
+        .collect()
 }
 
 // Copies upstream response headers except hop-by-hop transport headers that Axum/hyper must manage
@@ -62,7 +77,6 @@ pub(super) fn should_forward_request_header(name: &HeaderName, headers: &HeaderM
         && name != http::header::HOST
         && name != http::header::CONTENT_LENGTH
         && name.as_str() != BOOTSTRAP_CLIENT_TOKEN_HEADER
-        && name.as_str() != crate::provider_auth::TRANSPARENT_PROXY_CREDENTIAL_HEADER
         // Strip Accept-Encoding so upstreams return identity-encoded bodies; otherwise the
         // observability capture (`output.value` on LLM spans, ATIF trajectory bodies) records
         // gzip/br/zstd bytes that downstream consumers can't read. Bandwidth cost is paid only
@@ -71,20 +85,12 @@ pub(super) fn should_forward_request_header(name: &HeaderName, headers: &HeaderM
         && name != http::header::ACCEPT_ENCODING
 }
 
-// Allows headers into observability metadata only after removing credentials and provider API keys.
-// The forwarding filter runs first so hop-by-hop transport headers are also excluded from recorded
-// LLM request attributes. The credential blocklist covers the four canonical cases we see in
-// practice: `Authorization` (most providers), `Cookie` (session credentials), `x-api-key` (OpenAI
-// SDK and similar), `anthropic-api-key` (Anthropic), and the generic `api-key` alias used by some
-// providers/proxies (e.g., Azure OpenAI). `HeaderName::as_str()` already returns the canonical
-// lowercase form so string comparisons are case-insensitive by construction.
+// Allows headers into observability metadata only after removing credentials and provider API
+// keys. The shared classifier covers canonical and provider-specific secret-bearing names.
 pub(super) fn should_record_header(name: &HeaderName, headers: &HeaderMap) -> bool {
     should_forward_request_header(name, headers)
-        && name != http::header::AUTHORIZATION
-        && name != http::header::COOKIE
-        && name.as_str() != "x-api-key"
-        && name.as_str() != "api-key"
-        && name.as_str() != "anthropic-api-key"
+        && !super::is_internal_dispatch_header(name)
+        && !nemo_relay::api::llm::is_provider_credential_header_name(name.as_str())
 }
 
 fn named_by_connection_header(name: &HeaderName, headers: &HeaderMap) -> bool {

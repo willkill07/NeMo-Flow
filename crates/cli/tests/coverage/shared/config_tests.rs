@@ -37,6 +37,7 @@ struct PluginConfigDiscoveryScope {
     previous_xdg_config_home: Option<OsString>,
     previous_config_scope: Option<OsString>,
     previous_openai_api_key: Option<OsString>,
+    previous_gateway_bind: Option<OsString>,
     previous_openai_base_url: Option<OsString>,
     previous_openai_auth_header: Option<OsString>,
     previous_anthropic_base_url: Option<OsString>,
@@ -55,6 +56,7 @@ impl PluginConfigDiscoveryScope {
         let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let previous_config_scope = std::env::var_os("NEMO_RELAY_CONFIG_SCOPE");
         let previous_openai_api_key = std::env::var_os("OPENAI_API_KEY");
+        let previous_gateway_bind = std::env::var_os("NEMO_RELAY_GATEWAY_BIND");
         let previous_openai_base_url = std::env::var_os("NEMO_RELAY_OPENAI_BASE_URL");
         let previous_openai_auth_header = std::env::var_os("NEMO_RELAY_OPENAI_AUTH_HEADER");
         let previous_anthropic_base_url = std::env::var_os("NEMO_RELAY_ANTHROPIC_BASE_URL");
@@ -65,6 +67,7 @@ impl PluginConfigDiscoveryScope {
             std::env::set_var("XDG_CONFIG_HOME", xdg_config_home);
             std::env::remove_var("NEMO_RELAY_CONFIG_SCOPE");
             std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("NEMO_RELAY_GATEWAY_BIND");
             std::env::remove_var("NEMO_RELAY_OPENAI_BASE_URL");
             std::env::remove_var("NEMO_RELAY_OPENAI_AUTH_HEADER");
             std::env::remove_var("NEMO_RELAY_ANTHROPIC_BASE_URL");
@@ -80,6 +83,7 @@ impl PluginConfigDiscoveryScope {
             previous_xdg_config_home,
             previous_config_scope,
             previous_openai_api_key,
+            previous_gateway_bind,
             previous_openai_base_url,
             previous_openai_auth_header,
             previous_anthropic_base_url,
@@ -118,6 +122,15 @@ impl PluginConfigDiscoveryScope {
             std::env::set_var("NEMO_RELAY_ANTHROPIC_BASE_URL", anthropic);
         }
     }
+
+    fn set_retired_gateway_environment(&self, bind: &str, openai: &str, anthropic: &str) {
+        // SAFETY: This scope holds the process-wide environment mutex.
+        unsafe {
+            std::env::set_var("NEMO_RELAY_GATEWAY_BIND", bind);
+            std::env::set_var("NEMO_RELAY_OPENAI_BASE_URL", openai);
+            std::env::set_var("NEMO_RELAY_ANTHROPIC_BASE_URL", anthropic);
+        }
+    }
 }
 
 impl Drop for PluginConfigDiscoveryScope {
@@ -135,6 +148,10 @@ impl Drop for PluginConfigDiscoveryScope {
             match self.previous_openai_api_key.take() {
                 Some(value) => std::env::set_var("OPENAI_API_KEY", value),
                 None => std::env::remove_var("OPENAI_API_KEY"),
+            }
+            match self.previous_gateway_bind.take() {
+                Some(value) => std::env::set_var("NEMO_RELAY_GATEWAY_BIND", value),
+                None => std::env::remove_var("NEMO_RELAY_GATEWAY_BIND"),
             }
             match self.previous_openai_base_url.take() {
                 Some(value) => std::env::set_var("NEMO_RELAY_OPENAI_BASE_URL", value),
@@ -226,6 +243,22 @@ fn effective_plugin_toml_sources_reports_empty_and_sorted_contributors() {
 
 fn isolated_config_path(temp: &tempfile::TempDir) -> std::path::PathBuf {
     temp.path().join("config.toml")
+}
+
+fn protect_provider_auth_config(path: &std::path::Path) {
+    let parent = path.parent().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        crate::filesystem::protect_private_windows_path(parent).unwrap();
+        crate::filesystem::protect_private_windows_path(path).unwrap();
+    }
 }
 
 // Escapes a path for embedding in a TOML basic string (Windows `\U` sequences are invalid otherwise).
@@ -483,21 +516,16 @@ command = "hermes --yolo chat"
 "#,
     )
     .unwrap();
-    let command = RunOverrides {
-        agent: None,
+    let args = GatewayOverrides {
         config: Some(path),
         openai_base_url: None,
         anthropic_base_url: None,
-        session_metadata: None,
         plugin_config_path: None,
-        dry_run: false,
-        print: false,
-        command: vec![],
+        ..GatewayOverrides::default()
     };
 
-    let resolved = resolve_run_config(&command, None).unwrap();
+    let resolved = resolve_server_config(&args).unwrap();
 
-    assert_eq!(resolved.gateway.bind.to_string(), "127.0.0.1:0");
     assert_eq!(resolved.gateway.openai_base_url, "http://openai");
     assert_eq!(
         resolved.gateway.openai_auth_header.as_deref(),
@@ -703,19 +731,12 @@ fn invalid_provider_auth_environment_errors_do_not_expose_secret_values() {
 fn explicit_config_must_exist() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("missing-config.toml");
-    let command = RunOverrides {
-        agent: None,
+    let args = GatewayOverrides {
         config: Some(path.clone()),
-        openai_base_url: None,
-        anthropic_base_url: None,
-        session_metadata: None,
-        plugin_config_path: None,
-        dry_run: true,
-        print: false,
-        command: vec![],
+        ..GatewayOverrides::default()
     };
 
-    let error = resolve_run_config(&command, None).unwrap_err().to_string();
+    let error = resolve_server_config(&args).unwrap_err().to_string();
 
     assert!(error.contains("does not exist"), "{error}");
     assert!(error.contains(path.to_string_lossy().as_ref()), "{error}");
@@ -744,18 +765,11 @@ fn unreadable_config_errors_include_the_source_path() {
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "").unwrap();
     std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let command = RunOverrides {
-        agent: None,
+    let args = GatewayOverrides {
         config: Some(config_path.clone()),
-        openai_base_url: None,
-        anthropic_base_url: None,
-        session_metadata: None,
-        plugin_config_path: None,
-        dry_run: true,
-        print: false,
-        command: vec![],
+        ..GatewayOverrides::default()
     };
-    let config_error = resolve_run_config(&command, None).unwrap_err().to_string();
+    let config_error = resolve_server_config(&args).unwrap_err().to_string();
     std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     assert!(config_error.contains("failed to read configuration file"));
@@ -801,19 +815,12 @@ fn legacy_observability_config_sections_fail_clearly() {
     ] {
         let path = temp.path().join(name);
         std::fs::write(&path, contents).unwrap();
-        let command = RunOverrides {
-            agent: None,
+        let args = GatewayOverrides {
             config: Some(path),
-            openai_base_url: None,
-            anthropic_base_url: None,
-            session_metadata: None,
-            plugin_config_path: None,
-            dry_run: false,
-            print: false,
-            command: vec![],
+            ..GatewayOverrides::default()
         };
 
-        let error = resolve_run_config(&command, None).unwrap_err().to_string();
+        let error = resolve_server_config(&args).unwrap_err().to_string();
 
         assert!(error.contains("legacy observability config"));
         assert!(error.contains(expected));
@@ -854,19 +861,12 @@ mode = "overwrite"
 "#,
     )
     .unwrap();
-    let command = RunOverrides {
-        agent: Some(CodingAgent::Codex),
+    let args = GatewayOverrides {
         config: Some(config_path),
-        openai_base_url: None,
-        anthropic_base_url: None,
-        session_metadata: None,
-        plugin_config_path: None,
-        dry_run: false,
-        print: false,
-        command: vec!["codex".into()],
+        ..GatewayOverrides::default()
     };
 
-    let resolved = resolve_run_config(&command, None).unwrap();
+    let resolved = resolve_server_config(&args).unwrap();
 
     assert_eq!(
         resolved.gateway.plugin_config,
@@ -1747,19 +1747,13 @@ fn plugin_config_path_overrides_sibling_plugin_file() {
     std::fs::write(&config_path, "").unwrap();
     std::fs::write(&sibling_path, "version = 1\n").unwrap();
     std::fs::write(&override_path, "version = 2\n").unwrap();
-    let command = RunOverrides {
-        agent: Some(CodingAgent::Codex),
+    let args = GatewayOverrides {
         config: Some(config_path),
-        openai_base_url: None,
-        anthropic_base_url: None,
-        session_metadata: None,
         plugin_config_path: Some(override_path),
-        dry_run: true,
-        print: false,
-        command: vec!["codex".into()],
+        ..GatewayOverrides::default()
     };
 
-    let resolved = resolve_run_config(&command, None).unwrap();
+    let resolved = resolve_server_config(&args).unwrap();
 
     assert_eq!(
         resolved.gateway.plugin_config,
@@ -1768,7 +1762,7 @@ fn plugin_config_path_overrides_sibling_plugin_file() {
 }
 
 #[test]
-fn cli_run_overrides_config_values() {
+fn server_flags_override_config_values() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.toml");
     std::fs::write(
@@ -1779,26 +1773,19 @@ openai_base_url = "http://file-openai"
 "#,
     )
     .unwrap();
-    let command = RunOverrides {
-        agent: Some(CodingAgent::Codex),
+    let args = GatewayOverrides {
         config: Some(path),
         openai_base_url: Some("http://cli-openai".into()),
-        anthropic_base_url: None,
-        session_metadata: Some(r#"{"team":"cli"}"#.into()),
-        plugin_config_path: None,
-        dry_run: false,
-        print: false,
-        command: vec!["codex".into()],
+        ..GatewayOverrides::default()
     };
 
-    let resolved = resolve_run_config(&command, None).unwrap();
+    let resolved = resolve_server_config(&args).unwrap();
 
     assert_eq!(resolved.gateway.openai_base_url, "http://cli-openai");
-    assert_eq!(resolved.gateway.metadata, Some(json!({ "team": "cli" })));
 }
 
 #[test]
-fn run_inherits_top_level_server_flags_when_subcommand_flags_are_absent() {
+fn server_resolution_applies_top_level_flags() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.toml");
     std::fs::write(
@@ -1809,24 +1796,13 @@ openai_base_url = "http://file-openai"
 "#,
     )
     .unwrap();
-    let server = GatewayOverrides {
+    let args = GatewayOverrides {
         config: Some(path),
         openai_base_url: Some("http://top-level-openai".into()),
         ..GatewayOverrides::default()
     };
-    let command = RunOverrides {
-        agent: Some(CodingAgent::Codex),
-        config: None,
-        openai_base_url: None,
-        anthropic_base_url: None,
-        session_metadata: None,
-        plugin_config_path: None,
-        dry_run: false,
-        print: false,
-        command: vec!["codex".into()],
-    };
 
-    let resolved = resolve_run_config(&command, Some(&server)).unwrap();
+    let resolved = resolve_server_config(&args).unwrap();
 
     assert_eq!(resolved.gateway.openai_base_url, "http://top-level-openai");
 }
@@ -1904,8 +1880,8 @@ fn ordinary_server_ignores_managed_bootstrap_fingerprint_environment() {
 }
 
 #[test]
-fn managed_bootstrap_environment_is_not_forwarded_from_codex() {
-    let names = crate::mcp_environment::forwarded_names(
+fn managed_bootstrap_environment_is_not_part_of_the_proxy_fingerprint() {
+    let names = crate::environment_policy::fingerprinted_names(
         [
             "NEMO_RELAY_BOOTSTRAP_AGENT".to_string(),
             "NEMO_RELAY_BOOTSTRAP_FINGERPRINT".to_string(),
@@ -1928,68 +1904,6 @@ fn managed_bootstrap_environment_is_not_forwarded_from_codex() {
             .iter()
             .any(|name| name == "NEMO_RELAY_CLAUDE_DESKTOP_STATE")
     );
-}
-
-#[test]
-fn mcp_environment_policy_handles_unresolved_values_and_historical_names_per_platform() {
-    assert!(
-        crate::mcp_environment::unresolved_self_placeholder_for_platform(
-            "AWS_ROLE_ARN",
-            "${AWS_ROLE_ARN}",
-            false,
-        )
-    );
-    assert!(
-        !crate::mcp_environment::unresolved_self_placeholder_for_platform(
-            "AWS_ROLE_ARN",
-            "${aws_role_arn}",
-            false,
-        )
-    );
-    assert!(
-        crate::mcp_environment::unresolved_self_placeholder_for_platform(
-            "AWS_ROLE_ARN",
-            "${aws_role_arn}",
-            true,
-        )
-    );
-    assert!(
-        !crate::mcp_environment::unresolved_self_placeholder_for_platform(
-            "AWS_ROLE_ARN",
-            "real-value",
-            true,
-        )
-    );
-
-    for allowed in ["AWS_PROFILE", "NEMO_RELAY_CUSTOM", "OTEL_CUSTOM"] {
-        assert!(
-            crate::mcp_environment::previously_forwardable_name_for_platform(allowed, false),
-            "rejected {allowed}"
-        );
-    }
-    assert!(crate::mcp_environment::previously_forwardable_name_for_platform("Aws_Custom", true,));
-    for rejected in [
-        "UNRELATED_SECRET",
-        "NEMO_RELAY_WORKER_TOKEN",
-        "NEMO_RELAY_TEST_CAPTURE",
-    ] {
-        assert!(
-            !crate::mcp_environment::previously_forwardable_name_for_platform(rejected, true),
-            "accepted {rejected}"
-        );
-    }
-}
-
-#[test]
-fn transparent_gateway_fingerprint_is_stable_and_endpoint_specific() {
-    let first = transparent_gateway_fingerprint("http://127.0.0.1:41001");
-    let repeated = transparent_gateway_fingerprint("http://127.0.0.1:41001");
-    let second = transparent_gateway_fingerprint("http://127.0.0.1:41002");
-
-    assert_eq!(first, repeated);
-    assert_ne!(first, second);
-    assert!(first.starts_with("transparent-sha256:"));
-    assert_eq!(first.len(), "transparent-sha256:".len() + 64);
 }
 
 #[test]
@@ -2116,7 +2030,7 @@ fn bounded_identity_reader_reports_missing_unreadable_and_invalid_utf8_inputs() 
 }
 
 #[test]
-fn persistent_server_resolution_excludes_project_config_and_fingerprints_credentials() {
+fn persistent_server_resolution_excludes_project_config_and_shell_credentials() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     let xdg = temp.path().join("xdg");
@@ -2159,11 +2073,53 @@ fn persistent_server_resolution_excludes_project_config_and_fingerprints_credent
 
     unsafe { std::env::set_var("OPENAI_API_KEY", "credential-two") };
     let second = resolve_persistent_server_config(&args).unwrap();
-    assert_ne!(first.bootstrap_fingerprint, second.bootstrap_fingerprint);
+    assert_eq!(first.bootstrap_fingerprint, second.bootstrap_fingerprint);
+    assert!(first.gateway.openai_auth_header.is_none());
+    assert!(second.gateway.openai_auth_header.is_none());
 }
 
 #[test]
-fn persistent_fingerprint_tracks_provider_auth_headers() {
+fn persistent_server_resolution_ignores_retired_gateway_environment() {
+    let temp = tempfile::tempdir().unwrap();
+    let xdg = temp.path().join("xdg");
+    std::fs::create_dir_all(&xdg).unwrap();
+    let scope = PluginConfigDiscoveryScope::enter(temp.path(), &xdg);
+    scope.set_retired_gateway_environment(
+        "not-a-socket-address",
+        "https://retired-openai.invalid/v1",
+        "https://retired-anthropic.invalid",
+    );
+    let installed_bind = "127.0.0.1:39123".parse().unwrap();
+    let persistent = resolve_persistent_server_config(&GatewayOverrides {
+        bind: Some(installed_bind),
+        ..GatewayOverrides::default()
+    })
+    .unwrap();
+
+    assert_eq!(persistent.gateway.bind, installed_bind);
+    assert_eq!(
+        persistent.gateway.openai_base_url,
+        "https://api.openai.com/v1"
+    );
+    assert_eq!(
+        persistent.gateway.anthropic_base_url,
+        "https://api.anthropic.com"
+    );
+
+    let ordinary = resolve_server_config(&GatewayOverrides::default()).unwrap();
+    assert_eq!(ordinary.gateway.bind, GatewayConfig::default().bind);
+    assert_eq!(
+        ordinary.gateway.openai_base_url,
+        "https://retired-openai.invalid/v1"
+    );
+    assert_eq!(
+        ordinary.gateway.anthropic_base_url,
+        "https://retired-anthropic.invalid"
+    );
+}
+
+#[test]
+fn persistent_proxy_loads_provider_auth_headers_from_protected_user_config() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     let xdg = temp.path().join("xdg");
@@ -2177,32 +2133,55 @@ fn persistent_fingerprint_tracks_provider_auth_headers() {
         "[upstream]\nopenai_auth_header = \"Bearer one\"\nanthropic_auth_header = \"Basic one\"\n",
     )
     .unwrap();
+    protect_provider_auth_config(&config_path);
 
-    let first = resolve_persistent_server_config(&GatewayOverrides::default())
-        .unwrap()
-        .bootstrap_fingerprint
-        .unwrap();
+    let resolved = resolve_persistent_server_config(&GatewayOverrides::default()).unwrap();
+    assert_eq!(
+        resolved.gateway.openai_auth_header.as_deref(),
+        Some("Bearer one")
+    );
+    assert_eq!(
+        resolved.gateway.anthropic_auth_header.as_deref(),
+        Some("Basic one")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn persistent_proxy_rejects_exposed_provider_auth_config() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let xdg = temp.path().join("xdg");
+    std::fs::create_dir_all(&project).unwrap();
+    let user_config_dir = xdg.join("nemo-relay");
+    std::fs::create_dir_all(&user_config_dir).unwrap();
+    let _scope = PluginConfigDiscoveryScope::enter(&project, &xdg);
+    let config_path = user_config_dir.join("config.toml");
     std::fs::write(
         &config_path,
-        "[upstream]\nopenai_auth_header = \"Bearer two\"\nanthropic_auth_header = \"Basic one\"\n",
+        "[upstream]\nopenai_auth_header = \"Bearer exposed\"\n",
     )
     .unwrap();
-    let openai_changed = resolve_persistent_server_config(&GatewayOverrides::default())
-        .unwrap()
-        .bootstrap_fingerprint
-        .unwrap();
-    std::fs::write(
-        &config_path,
-        "[upstream]\nopenai_auth_header = \"Bearer two\"\nanthropic_auth_header = \"Basic two\"\n",
-    )
-    .unwrap();
-    let anthropic_changed = resolve_persistent_server_config(&GatewayOverrides::default())
-        .unwrap()
-        .bootstrap_fingerprint
-        .unwrap();
+    std::fs::set_permissions(&user_config_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    assert_ne!(first, openai_changed);
-    assert_ne!(openai_changed, anthropic_changed);
+    let error = resolve_persistent_server_config(&GatewayOverrides::default())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("owner-only file"), "{error}");
+}
+
+#[test]
+fn persistent_proxy_rejects_provider_auth_outside_user_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("system-config.toml");
+    let user_path = temp.path().join("user-config.toml");
+    let error = validate_persistent_provider_auth_source(&path, false, &user_path)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("protected user configuration"), "{error}");
 }
 
 #[test]
@@ -2232,23 +2211,20 @@ fn managed_bootstrap_canonicalizes_unset_and_zero_padded_default_idle_timeout() 
 }
 
 #[test]
-fn plugin_launch_carries_effective_hook_limit_below_and_above_default() {
+fn persistent_proxy_identity_carries_effective_hook_limit_below_and_above_default() {
     let temp = tempfile::tempdir().unwrap();
     let xdg = temp.path().join("xdg");
     let user_config = xdg.join("nemo-relay/config.toml");
     std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
     let _scope = PluginConfigDiscoveryScope::enter(temp.path(), &xdg);
-    let bind = "127.0.0.1:47632".parse().unwrap();
-
     for limit in [1024, DEFAULT_MAX_HOOK_PAYLOAD_BYTES + 4096] {
         std::fs::write(
             &user_config,
             format!("[gateway]\nmax_hook_payload_bytes = {limit}\n"),
         )
         .unwrap();
-        let launch =
-            crate::bootstrap::resolve_plugin_gateway(&GatewayOverrides::default(), bind).unwrap();
-        assert_eq!(launch.max_hook_payload_bytes, limit);
+        let resolved = resolve_persistent_server_config(&GatewayOverrides::default()).unwrap();
+        assert_eq!(resolved.gateway.max_hook_payload_bytes, limit);
     }
 }
 
@@ -2655,42 +2631,8 @@ fn persistent_server_resolution_rejects_project_specific_flags() {
         resolve_persistent_server_config(&args)
             .unwrap_err()
             .to_string()
-            .contains("nemo-relay run")
+            .contains("system and user configuration only")
     );
-}
-
-#[test]
-fn server_resolution_fails_when_required_enabled_dynamic_plugin_is_blocked_by_policy() {
-    let temp = tempfile::tempdir().unwrap();
-    let plugin_dir = temp.path().join("plugins/acme");
-    std::fs::create_dir_all(&plugin_dir).unwrap();
-    write_dynamic_manifest(&plugin_dir, "acme.worker");
-    let config_path = temp.path().join("config.toml");
-    let plugins_toml_path = temp.path().join("plugins.toml");
-    std::fs::write(&config_path, "").unwrap();
-    std::fs::write(
-        &plugins_toml_path,
-        r#"
-[[plugins.dynamic]]
-manifest = "plugins/acme/relay-plugin.toml"
-
-[plugins.policy.defaults]
-startup = "required"
-allowed = false
-"#,
-    )
-    .unwrap();
-    write_dynamic_plugin_state(&plugins_toml_path, "acme.worker", true);
-    let args = GatewayOverrides {
-        config: Some(config_path),
-        ..GatewayOverrides::default()
-    };
-
-    let error = resolve_server_config(&args).unwrap_err().to_string();
-
-    assert!(error.contains("required dynamic plugin startup preflight failed"));
-    assert!(error.contains("acme.worker"));
-    assert!(error.contains("blocked by host policy"));
 }
 
 #[test]
@@ -3010,31 +2952,25 @@ fn gateway_body_limit_file_values_must_be_nonzero() {
 }
 
 #[test]
-fn run_resolution_applies_all_run_overrides() {
+fn server_resolution_applies_provider_overrides() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = isolated_config_path(&temp);
     std::fs::write(&config_path, "").unwrap();
-    let command = RunOverrides {
-        agent: Some(CodingAgent::Codex),
+    let args = GatewayOverrides {
         config: Some(config_path),
         openai_base_url: Some("http://run-openai".into()),
         anthropic_base_url: Some("http://run-anthropic".into()),
-        session_metadata: Some(r#"{"team":"run"}"#.into()),
-        plugin_config_path: None,
-        dry_run: false,
-        print: false,
-        command: vec!["codex".into()],
+        ..GatewayOverrides::default()
     };
 
-    let resolved = resolve_run_config(&command, None).unwrap();
+    let resolved = resolve_server_config(&args).unwrap();
 
     assert_eq!(resolved.gateway.openai_base_url, "http://run-openai");
     assert_eq!(resolved.gateway.anthropic_base_url, "http://run-anthropic");
-    assert_eq!(resolved.gateway.metadata, Some(json!({ "team": "run" })));
 }
 
 #[test]
-fn run_resolution_fails_when_required_enabled_dynamic_plugin_is_blocked_by_policy() {
+fn server_resolution_fails_when_required_enabled_dynamic_plugin_is_blocked_by_policy() {
     let temp = tempfile::tempdir().unwrap();
     let plugin_dir = temp.path().join("plugins/acme");
     std::fs::create_dir_all(&plugin_dir).unwrap();
@@ -3055,19 +2991,12 @@ allowed = false
     )
     .unwrap();
     write_dynamic_plugin_state(&plugins_toml_path, "acme.worker", true);
-    let command = RunOverrides {
-        agent: Some(CodingAgent::Codex),
+    let args = GatewayOverrides {
         config: Some(config_path),
-        openai_base_url: None,
-        anthropic_base_url: None,
-        session_metadata: None,
-        plugin_config_path: None,
-        dry_run: false,
-        print: false,
-        command: vec!["codex".into()],
+        ..GatewayOverrides::default()
     };
 
-    let error = resolve_run_config(&command, None).unwrap_err().to_string();
+    let error = resolve_server_config(&args).unwrap_err().to_string();
 
     assert!(error.contains("required dynamic plugin startup preflight failed"));
     assert!(error.contains("acme.worker"));

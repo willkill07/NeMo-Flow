@@ -7,16 +7,19 @@ use std::ffi::OsString;
 use super::completions::CompletionsCommand;
 use super::serve::ServerArgs;
 use super::*;
+use crate::agents::CodingAgent;
+use crate::commands::diagnostics::AgentsCommand;
 use crate::commands::model_pricing::{PricingSubcommand, PricingValidateCommand};
 use crate::commands::plugins::{
     PluginsCommand, PluginsInspectCommand, PluginsListCommand, PluginsSubcommand,
     PluginsValidateCommand,
 };
+use crate::commands::root::AgentProxyServiceCommand;
 
 #[test]
 fn operational_command_names_cover_logging_exempt_commands() {
     for (args, expected) in [
-        (vec!["nemo-relay", "codex"], "codex"),
+        (vec!["nemo-relay", "agents"], "agents"),
         (vec!["nemo-relay", "config"], "config"),
     ] {
         let cli = Cli::try_parse_from(args).unwrap();
@@ -111,16 +114,22 @@ fn completions_helper_reports_missing_shell_and_generates_requested_shell() {
 }
 
 #[test]
-fn cli_parses_native_mcp_subcommand_and_bind_override() {
-    let cli = Cli::try_parse_from(["nemo-relay", "mcp"]).unwrap();
-    assert!(matches!(cli.command, Some(Command::Mcp)));
-    assert!(cli.server.bind.is_none());
-
-    let cli = Cli::try_parse_from(["nemo-relay", "--bind", "127.0.0.1:4041", "mcp"]).unwrap();
-    assert!(matches!(cli.command, Some(Command::Mcp)));
-    assert_eq!(cli.server.bind.unwrap().to_string(), "127.0.0.1:4041");
-
-    assert!(Cli::try_parse_from(["nemo-relay", "mcp", "--agent", "codex"]).is_err());
+fn cli_rejects_removed_wrapper_mcp_and_standalone_commands() {
+    for command in [
+        "mcp",
+        "run",
+        "claude",
+        "codex",
+        "hermes",
+        "serve",
+        "internal-managed-server",
+    ] {
+        assert!(
+            Cli::try_parse_from(["nemo-relay", command]).is_err(),
+            "{command} unexpectedly remains public"
+        );
+    }
+    assert!(Cli::try_parse_from(["nemo-relay", "--bind", "127.0.0.1:4041", "agents"]).is_ok());
 }
 
 #[test]
@@ -138,15 +147,72 @@ fn cli_parses_claude_desktop_contract_and_keeps_it_out_of_all() {
             .all(|agent| agent.install_arg() != "claude-desktop")
     );
 
-    let doctor = Cli::try_parse_from([
+    let doctor = Cli::try_parse_from(["nemo-relay", "doctor", "claude-desktop", "--json"]).unwrap();
+    assert!(matches!(doctor.command, Some(Command::Doctor(_))));
+}
+
+#[test]
+fn internal_proxy_service_ignores_inherited_retired_gateway_overrides() {
+    let _environment = crate::test_support::EnvScope::set(&[
+        (
+            "NEMO_RELAY_GATEWAY_BIND",
+            Some(std::ffi::OsStr::new("not-a-socket-address")),
+        ),
+        (
+            "NEMO_RELAY_OPENAI_BASE_URL",
+            Some(std::ffi::OsStr::new("https://retired.invalid")),
+        ),
+    ]);
+    let parsed = Cli::try_parse_from([
         "nemo-relay",
-        "doctor",
-        "--plugin",
-        "claude-desktop",
-        "--json",
+        "agent-proxy-service",
+        "--state",
+        "/tmp/agent-proxy/state.json",
     ])
     .unwrap();
-    assert!(matches!(doctor.command, Some(Command::Doctor(_))));
+    assert!(!parsed.server.has_overrides());
+
+    let server = ServerArgs {
+        bind: Some("127.0.0.1:4041".parse().unwrap()),
+        ..Default::default()
+    };
+    let service = Command::AgentProxyService(AgentProxyServiceCommand {
+        state: "/tmp/agent-proxy/state.json".into(),
+    });
+
+    validate_server_override_policy(&service, &server).unwrap();
+    for command in [
+        Command::Agents(AgentsCommand { json: false }),
+        Command::ClaudeDesktop(crate::commands::root::ClaudeDesktopCommand { folder: None }),
+    ] {
+        let error = validate_server_override_policy(&command, &server)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("root gateway/config overrides are not supported"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn batch_marketplace_root_follows_the_active_proxy_locator() {
+    let temp = tempfile::tempdir().unwrap();
+    let _environment = EnvScope::hermetic(&temp);
+    let marketplace = temp.path().join("custom-marketplace");
+    let state = marketplace.join("agent-proxy").join("state.json");
+    let mut locator = state.display().to_string().into_bytes();
+    locator.push(b'\n');
+    crate::filesystem::atomic_write_private(
+        &temp.path().join(".nemo-relay-agent-proxy-state-path"),
+        &locator,
+    )
+    .unwrap();
+
+    assert_eq!(
+        install::selected_marketplace_install_dir(None).unwrap(),
+        marketplace
+    );
 }
 
 #[test]
@@ -245,10 +311,10 @@ fn command_logging_policy_excludes_only_configuration_editors() {
 }
 
 #[test]
-fn doctor_rejects_conflicting_agent_and_plugin_targets() {
-    let error =
-        Cli::try_parse_from(["nemo-relay", "doctor", "codex", "--plugin", "all"]).unwrap_err();
-    assert!(error.to_string().contains("cannot be used with"));
+fn doctor_accepts_one_unified_enrollment_target_and_rejects_the_removed_plugin_flag() {
+    assert!(Cli::try_parse_from(["nemo-relay", "doctor", "codex"]).is_ok());
+    assert!(Cli::try_parse_from(["nemo-relay", "doctor", "all"]).is_ok());
+    assert!(Cli::try_parse_from(["nemo-relay", "doctor", "--plugin", "all"]).is_err());
 }
 
 #[test]
@@ -267,6 +333,77 @@ fn multi_agent_operations_attempt_every_target_before_reporting_errors() {
 
     assert_eq!(*visited.borrow(), CodingAgent::ALL);
     assert!(error.contains("codex failure"), "{error}");
+}
+
+#[test]
+fn committed_batch_recovery_finalizes_without_restoring_its_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let _environment = EnvScope::hermetic(&temp);
+    let journal = install::batch_transaction_path().unwrap();
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    let unsafe_state_path = temp.path().join("not-an-agent-proxy/state.json");
+    std::fs::write(
+        &journal,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 6,
+            "operation": "install",
+            "stage": "committed",
+            "snapshot": {
+                "proxy": {
+                    "state_path": unsafe_state_path,
+                    "state": null
+                },
+                "agents": [],
+                "claude_desktop_host": null,
+                "marketplaces": []
+            },
+            "deferred_proxy_retirements": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    install::recover_batch_transaction().unwrap();
+
+    assert!(!journal.exists());
+}
+
+#[test]
+fn invalid_batch_stage_is_rejected_without_erasing_the_journal() {
+    let temp = tempfile::tempdir().unwrap();
+    let _environment = EnvScope::hermetic(&temp);
+    let journal = install::batch_transaction_path().unwrap();
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    std::fs::write(
+        &journal,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 6,
+            "operation": "install",
+            "stage": "unknown",
+            "snapshot": {
+                "proxy": {
+                    "state_path": temp.path().join("agent-proxy/state.json"),
+                    "state": null
+                },
+                "agents": [],
+                "claude_desktop_host": null,
+                "marketplaces": []
+            },
+            "deferred_proxy_retirements": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = install::recover_batch_transaction()
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("invalid batch transaction identity"),
+        "{error}"
+    );
+    assert!(journal.exists());
 }
 
 #[test]

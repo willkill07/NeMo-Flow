@@ -17,9 +17,9 @@ SPDX-License-Identifier: Apache-2.0
 # NeMo Relay
 
 `nemo-relay-cli` installs the NeMo Relay CLI, the `nemo-relay` binary for local
-coding-agent observability. It can configure supported coding-agent hooks, run
-agents through an ephemeral gateway, and diagnose local agent and exporter
-readiness.
+coding-agent observability and policy enforcement. It enrolls supported local
+agents in one persistent proxy for the current OS user and diagnoses agent,
+proxy, certificate, hook, and exporter readiness.
 
 The CLI is a Rust package in this repository, but most users should interact
 with the installed `nemo-relay` command rather than link against the crate.
@@ -28,16 +28,16 @@ with the installed `nemo-relay` command rather than link against the crate.
 
 The CLI is designed for these tasks:
 
-- **Observe existing coding agents**: Run Claude Code, Codex, or Hermes
-  Agent through a local NeMo Relay gateway without changing the agent
-  itself.
-- **Configure transparent runs interactively**: Use the setup wizard to write
-  project or user configuration for supported agents.
+- **Observe existing coding agents**: Enroll Claude Code/Desktop, Codex, or
+  Hermes Agent once, then continue starting each client normally.
+- **Apply managed policy**: Route supported native Anthropic and OpenAI HTTP,
+  SSE, and WebSocket traffic through Relay's guardrails and interceptors.
 - **Export local sessions**: Write ATIF trajectory files, ATOF event JSONL
-  streams, or OpenInference spans from one shared config model.
+  streams, or OpenInference spans from one system/user configuration model.
 - **Diagnose setup readiness**: Check config layers, `plugins.toml` discovery,
-  agent binaries, persistent coding-agent integrations, hook status,
-  observability outputs, and shell completions with `nemo-relay doctor`.
+  agent binaries, the per-user service, TLS trust, persistent coding-agent
+  integrations, hook status, observability outputs, and shell completions with
+  `nemo-relay doctor`.
 
 ## What You Get
 
@@ -45,20 +45,25 @@ The CLI provides these capabilities:
 
 - **`nemo-relay` binary**: The executable installed by the `nemo-relay-cli`
   Cargo package.
-- **First-run setup**: Bare `nemo-relay` launches setup when no config exists,
-  then runs doctor once config is present.
-- **Agent shortcuts**: `nemo-relay claude`, `nemo-relay codex`, and
-  `nemo-relay hermes` start observed agent runs.
-- **Config-driven launch**: `nemo-relay run` resolves config, environment, and
-  CLI overrides for deterministic non-interactive use.
-- **Hook forwarding server**: A local gateway accepts agent hook events and
-  provider-shaped OpenAI or Anthropic requests.
-- **Persistent agent integration**: `nemo-relay install` configures Codex,
-  Claude Code, or Hermes Agent with one generated MCP bootstrap and the host's
-  canonical lifecycle hooks.
-- **Shared gateway lifecycle**: Every persistent integration launches the same
-  host-neutral `nemo-relay mcp` client. Concurrent clients share one native
-  gateway on `127.0.0.1:47632`.
+- **Per-user proxy service**: The first enrollment discovers and persists an
+  available loopback port. Multiple OS users do not share a static port,
+  credentials, service state, or trust material during normal operation. The
+  listener authenticates itself with TLS before receiving enrollment or
+  provider credentials. A different local account can still occupy a
+  candidate port and cause denial of service, so use OS isolation or separate
+  machines for hostile multi-tenant workloads.
+- **Agent-specific enrollment**: `nemo-relay install` patches only the selected
+  agent, assigns it a distinct proxy credential and corporate-proxy route, and
+  installs fail-closed lifecycle hooks.
+- **Managed provider traffic**: The proxy handles supported Anthropic and
+  OpenAI HTTP/SSE calls plus Codex Responses WebSockets.
+- **Dynamic TLS**: A constrained current-user CA mints short-lived certificates
+  only for the supported native host set.
+- **Independent cleanup**: Uninstall restores only the selected agent's owned
+  fields. The service, macOS/Windows current-user trust or Linux agent CA
+  bundles, keys, and shared state are removed after the last enrollment. Linux
+  Codex uninstall prints the launch variable to remove and any recorded prior
+  CA selection to restore.
 
 ## Installation Options
 
@@ -68,20 +73,33 @@ Cargo:
 cargo install nemo-relay-cli
 ```
 
-Unix curl:
+Pinned Unix installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/main/install.sh | sh
+RELAY_VERSION="<release-tag>"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  "https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/${RELAY_VERSION}/install.sh" \
+  --output nemo-relay-install.sh
+less nemo-relay-install.sh
+NEMO_RELAY_VERSION="${RELAY_VERSION}" sh nemo-relay-install.sh
 ```
 
-Windows PowerShell:
+Pinned Windows PowerShell installer:
 
 ```powershell
-irm https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/main/install.ps1 | iex
+$RelayVersion = "<release-tag>"
+$Installer = "nemo-relay-install.ps1"
+Invoke-WebRequest `
+  -Uri "https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/$RelayVersion/install.ps1" `
+  -OutFile $Installer
+Get-Content -LiteralPath $Installer
+$env:NEMO_RELAY_VERSION = $RelayVersion
+& ".\$Installer"
 ```
 
-For version pinning, custom installation directories, verification,
-troubleshooting, and CLI usage, refer to the
+Do not execute an installer directly from the moving `main` branch. For custom
+installation directories, verification, troubleshooting, and CLI usage, refer
+to the
 [NeMo Relay installation guide](https://docs.nvidia.com/nemo/relay/getting-started/installation).
 
 After installation, verify the binary with:
@@ -92,48 +110,57 @@ nemo-relay --version
 
 ## Getting Started
 
-Run the first-time setup wizard:
+Open the user policy editor, or the equivalent explicit plugin editor:
 
 ```bash
-nemo-relay
+nemo-relay config
+nemo-relay plugins edit --user
 ```
 
-After setup, inspect local readiness:
+Enroll one agent or all supported CLI agents. `all` includes Claude Code,
+Codex, and Hermes; Claude Desktop remains an explicit opt-in:
 
 ```bash
-nemo-relay doctor
-```
-
-Run a supported agent through the gateway:
-
-```bash
-nemo-relay codex
-nemo-relay claude -- "summarize this repository"
-```
-
-Install persistent integrations for the supported agent CLIs on `PATH`:
-
-```bash
+nemo-relay install codex
 nemo-relay install all
+nemo-relay install claude-desktop
 ```
 
-Use `run --dry-run` to inspect resolved config without spawning the agent:
+Start the enrolled CLI, GUI, cron job, or other supported local mode normally.
+Then inspect installation health:
 
 ```bash
-nemo-relay run --agent codex --dry-run
+nemo-relay doctor codex
+```
+
+Remove one enrollment without disturbing the others:
+
+```bash
+nemo-relay uninstall codex
+```
+
+Claude Desktop retains one explicit protected deep-link launcher:
+
+```bash
+nemo-relay claude-desktop --folder ./my-project
 ```
 
 ## Configuration
 
-Project config lives at `./.nemo-relay/config.toml`; user config lives at
-`~/.config/nemo-relay/config.toml` or `$XDG_CONFIG_HOME/nemo-relay/config.toml`.
-The project layer overrides system config, and the user layer overrides the
-project layer.
+The persistent coding-agent proxy deliberately loads only Relay system and
+user configuration. It does not load project `.nemo-relay` configuration or
+inherit provider credentials and provider base URLs from the service process
+environment. Unrelated in-process/library configuration behavior is unchanged.
 
-General options are configured through the top-level config. Edit the config with:
+User config lives at `~/.config/nemo-relay/config.toml` or
+`$XDG_CONFIG_HOME/nemo-relay/config.toml`.
+
+`nemo-relay config` is the user-policy editor alias. Add `--system` for the
+system policy file:
 
 ```bash
 nemo-relay config
+nemo-relay config --system
 ```
 
 Observability exporters are configured through the plugin config. Edit the user
@@ -150,8 +177,8 @@ Other dynamic plugins use a raw JSON object editor.
 
 The canonical plugin file is `plugins.toml`; user config lives at
 `~/.config/nemo-relay/plugins.toml` or
-`$XDG_CONFIG_HOME/nemo-relay/plugins.toml`. Project config lives at
-`.nemo-relay/plugins.toml`.
+`$XDG_CONFIG_HOME/nemo-relay/plugins.toml`. Coding-agent proxy execution does
+not load the project plugin layer.
 
 Minimal ATIF example:
 
@@ -164,7 +191,7 @@ enabled = true
 
 [components.config.atif]
 enabled = true
-output_directory = "./atif"
+output_directory = "/absolute/path/to/relay-output/atif"
 ```
 
 ## Documentation

@@ -20,6 +20,7 @@ pub(super) struct ProviderForwarding {
     pub(super) authorization: crate::provider_auth::ProviderRequestAuthorization,
     openai_auth_header: Option<String>,
     anthropic_auth_header: Option<String>,
+    allow_test_loopback_dispatch: bool,
 }
 
 impl ProviderForwarding {
@@ -27,12 +28,14 @@ impl ProviderForwarding {
         source_route: ProviderRoute,
         authorization: crate::provider_auth::ProviderRequestAuthorization,
         config: &crate::configuration::GatewayConfig,
+        allow_test_loopback_dispatch: bool,
     ) -> Self {
         Self {
             source_route,
             authorization,
             openai_auth_header: config.openai_auth_header.clone(),
             anthropic_auth_header: config.anthropic_auth_header.clone(),
+            allow_test_loopback_dispatch,
         }
     }
 
@@ -43,9 +46,24 @@ impl ProviderForwarding {
             self.anthropic_auth_header.as_deref(),
         )
     }
+
+    pub(super) const fn allows_test_loopback_dispatch(&self) -> bool {
+        self.allow_test_loopback_dispatch
+    }
 }
 
 impl ProviderRoute {
+    pub(super) fn allowed_for_agent(self, agent: &str) -> bool {
+        match self {
+            Self::OpenAiResponses | Self::OpenAiChatCompletions | Self::OpenAiModels => {
+                matches!(agent, "codex" | "hermes")
+            }
+            Self::AnthropicMessages | Self::AnthropicCountTokens => {
+                matches!(agent, "claude-code" | "claude-desktop" | "hermes")
+            }
+        }
+    }
+
     // Maps public gateway paths to known upstream provider routes. Unsupported paths return `None`
     // so the caller can fail as a bad hook/gateway payload instead of constructing arbitrary URLs.
     pub(super) fn from_path(path: &str) -> Option<Self> {
@@ -190,6 +208,7 @@ pub(super) fn gateway_upstream_url_override(
     route: ProviderRoute,
     headers: &HeaderMap,
     path_and_query: &str,
+    allow_configured_provider_auth: bool,
     allow_environment_provider_auth: bool,
     config: &crate::configuration::GatewayConfig,
 ) -> Option<String> {
@@ -199,6 +218,7 @@ pub(super) fn gateway_upstream_url_override(
         path_and_query,
         has_openai_replacement_auth(
             route,
+            allow_configured_provider_auth,
             allow_environment_provider_auth,
             route.configured_auth_header(config),
         ),
@@ -225,6 +245,7 @@ pub(super) fn gateway_upstream_url_override_with_openai_key_state(
 pub(super) fn strip_replaceable_agent_auth_headers(
     headers: &HeaderMap,
     route: ProviderRoute,
+    allow_configured_provider_auth: bool,
     allow_environment_provider_auth: bool,
     configured_auth_header: Option<&str>,
 ) -> HeaderMap {
@@ -233,6 +254,7 @@ pub(super) fn strip_replaceable_agent_auth_headers(
         route,
         has_openai_replacement_auth(
             route,
+            allow_configured_provider_auth,
             allow_environment_provider_auth,
             configured_auth_header,
         ),
@@ -256,17 +278,17 @@ pub(super) fn env_var_is_nonempty(name: &str) -> bool {
 
 fn has_openai_replacement_auth(
     route: ProviderRoute,
+    allow_configured_provider_auth: bool,
     allow_environment_provider_auth: bool,
     configured_auth_header: Option<&str>,
 ) -> bool {
-    allow_environment_provider_auth
-        && matches!(
-            route,
-            ProviderRoute::OpenAiResponses
-                | ProviderRoute::OpenAiChatCompletions
-                | ProviderRoute::OpenAiModels
-        )
-        && (configured_auth_header.is_some() || env_var_is_nonempty("OPENAI_API_KEY"))
+    matches!(
+        route,
+        ProviderRoute::OpenAiResponses
+            | ProviderRoute::OpenAiChatCompletions
+            | ProviderRoute::OpenAiModels
+    ) && ((allow_configured_provider_auth && configured_auth_header.is_some())
+        || (allow_environment_provider_auth && env_var_is_nonempty("OPENAI_API_KEY")))
 }
 
 // Delegates provider-specific session fallbacks to `alignment` so request construction stays
@@ -297,6 +319,3 @@ pub(super) fn gateway_identifier(
 ) -> Option<String> {
     alignment::gateway_identifier(headers, body, header_name, body_paths)
 }
-
-// Copies only non-sensitive, forwardable request headers into LLM request metadata. This preserves
-// correlation headers while excluding credentials and hop-by-hop transport details.

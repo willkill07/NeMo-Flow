@@ -9,7 +9,6 @@ use crate::sessions::{LlmGatewayStart, SessionManager};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
-use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use reqwest::Client;
 use serde_json::Map;
@@ -23,8 +22,35 @@ fn test_http_client() -> Client {
 fn environment_authorization() -> crate::provider_auth::ProviderRequestAuthorization {
     crate::provider_auth::ProviderRequestAuthorization {
         source_credential: crate::provider_auth::SourceCredentialDisposition::Absent,
+        allow_configured_provider_auth: true,
         allow_environment_provider_auth: true,
     }
+}
+
+#[tokio::test]
+async fn upstream_body_idle_timeout_resets_for_continuous_streams() {
+    let active = Body::from_stream(async_stream::stream! {
+        for byte in [b'a', b'b', b'c'] {
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            yield Ok::<_, std::io::Error>(Bytes::from(vec![byte]));
+        }
+    });
+    let bytes = body_with_idle_timeout_for(active, std::time::Duration::from_millis(25))
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(bytes, "abc");
+
+    let idle = Body::from_stream(async_stream::stream! {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        yield Ok::<_, std::io::Error>(Bytes::from_static(b"late"));
+    });
+    let error = body_with_idle_timeout_for(idle, std::time::Duration::from_millis(10))
+        .collect()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("activity idle limit"));
 }
 
 #[test]
@@ -70,6 +96,10 @@ fn removes_hop_by_hop_headers() {
         &HeaderName::from_static("api-key"),
         &headers
     ));
+    assert!(!should_record_header(
+        &HeaderName::from_static("x-provider-key"),
+        &headers
+    ));
     assert!(should_record_header(
         &HeaderName::from_static("x-request-id"),
         &headers
@@ -106,6 +136,7 @@ async fn prepared_gateway_request_consumes_private_client_proof() {
         crate::provider_auth::ProviderRequestAuthorization {
             source_credential:
                 crate::provider_auth::SourceCredentialDisposition::ProviderCredential,
+            allow_configured_provider_auth: true,
             allow_environment_provider_auth: true,
         },
     )
@@ -148,10 +179,51 @@ async fn prepared_gateway_request_decodes_zstd_for_observability() {
         })
     );
     assert!(prepared.streaming);
+    assert_eq!(prepared.transport, "http_sse");
     assert_eq!(
         prepared.headers.get(header::CONTENT_ENCODING).unwrap(),
         "zstd"
     );
+}
+
+#[tokio::test]
+async fn prepared_gateway_request_records_websocket_transport() {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/responses")
+        .body(Body::from(
+            r#"{"type":"response.create","model":"gpt-test"}"#,
+        ))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ManagedRequestTransport::WebSocket);
+
+    let prepared = prepare_gateway_request(
+        &GatewayConfig::default(),
+        request,
+        environment_authorization(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(prepared.transport, "websocket");
+    assert!(prepared.streaming);
+    let start = build_llm_gateway_start(&prepared);
+    assert!(start.streaming);
+    assert_eq!(start.metadata["transport"], json!("websocket"));
+    let manager = crate::sessions::SessionManager::new(GatewayConfig::default());
+    let prep = manager
+        .prepare_gateway_call(&prepared.headers, start)
+        .await
+        .unwrap();
+    assert!(
+        prep.attributes
+            .contains(nemo_relay::api::llm::LlmAttributes::STREAMING)
+    );
+    manager
+        .finish_gateway_call(&prep.session_id, prep.session_finish)
+        .await;
 }
 
 #[tokio::test]
@@ -213,10 +285,17 @@ async fn request_observability_decode_is_bounded_and_encoding_aware() {
         .header(header::CONTENT_ENCODING, "zstd")
         .body(Body::from(compressed))
         .unwrap();
-    let prepared = prepare_gateway_request(&config, request, environment_authorization())
-        .await
-        .unwrap();
-    assert!(prepared.request_json.is_null());
+    let error = match prepare_gateway_request(&config, request, environment_authorization()).await {
+        Ok(_) => panic!("oversized decoded body should fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            error,
+            CliError::PayloadTooLarge(_) | CliError::InvalidPayload(_)
+        ),
+        "oversized compressed content must fail before managed execution"
+    );
 
     let request = Request::builder()
         .method(Method::POST)
@@ -224,10 +303,11 @@ async fn request_observability_decode_is_bounded_and_encoding_aware() {
         .header(header::CONTENT_ENCODING, "gzip")
         .body(Body::from(r#"{"model":"opaque"}"#))
         .unwrap();
-    let prepared = prepare_gateway_request(&config, request, environment_authorization())
-        .await
-        .unwrap();
-    assert!(prepared.request_json.is_null());
+    let error = match prepare_gateway_request(&config, request, environment_authorization()).await {
+        Ok(_) => panic!("unsupported encoding should fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("unsupported Content-Encoding"));
 
     let request = Request::builder()
         .method(Method::POST)
@@ -247,28 +327,47 @@ async fn request_observability_decode_is_bounded_and_encoding_aware() {
 }
 
 #[tokio::test]
-async fn malformed_encoded_request_remains_a_raw_passthrough() {
+async fn malformed_encoded_request_fails_closed() {
     let request = Request::builder()
         .method(Method::POST)
         .uri("/v1/responses")
         .header(header::CONTENT_ENCODING, "zstd")
         .body(Body::from("not-a-zstd-frame"))
         .unwrap();
-    let prepared = prepare_gateway_request(
+    let error = match prepare_gateway_request(
         &GatewayConfig::default(),
         request,
         environment_authorization(),
     )
     .await
-    .unwrap();
-    let managed = build_llm_gateway_start(&prepared).request;
+    {
+        Ok(_) => panic!("malformed encoding should fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("invalid zstd request body"));
+}
 
-    let (body, headers) =
-        effective_upstream_request(&prepared.body_bytes, &prepared.headers, Some(&managed));
+#[tokio::test]
+async fn encoded_count_tokens_request_cannot_bypass_managed_decoding() {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages/count_tokens")
+        .header(header::CONTENT_ENCODING, "gzip")
+        .body(Body::from(r#"{"model":"claude-test","messages":[]}"#))
+        .unwrap();
 
-    assert!(managed.content.is_null());
-    assert_eq!(body, prepared.body_bytes);
-    assert_eq!(headers.get(header::CONTENT_ENCODING).unwrap(), "zstd");
+    let error = match prepare_gateway_request(
+        &GatewayConfig::default(),
+        request,
+        environment_authorization(),
+    )
+    .await
+    {
+        Ok(_) => panic!("unsupported count_tokens encoding should fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("unsupported Content-Encoding"));
 }
 
 #[test]
@@ -592,7 +691,7 @@ fn effective_upstream_request_returns_original_without_runtime_request() {
 }
 
 #[test]
-fn effective_upstream_request_preserves_original_body_for_null_runtime_content() {
+fn effective_upstream_request_preserves_original_body_and_replaces_observable_headers() {
     let original_body = Bytes::from_static(b"not-json-but-still-upstream-body");
     let mut original_headers = HeaderMap::new();
     original_headers.insert("x-original", HeaderValue::from_static("kept"));
@@ -605,7 +704,7 @@ fn effective_upstream_request_preserves_original_body_for_null_runtime_content()
         effective_upstream_request(&original_body, &original_headers, Some(&request));
 
     assert_eq!(body, original_body);
-    assert_eq!(headers.get("x-original").unwrap(), "kept");
+    assert!(headers.get("x-original").is_none());
     assert_eq!(headers.get("x-runtime").unwrap(), "enabled");
 }
 
@@ -628,10 +727,35 @@ fn effective_upstream_request_skips_invalid_runtime_headers() {
     let body: Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(body["model"], json!("rewritten"));
-    assert_eq!(headers.get("x-original").unwrap(), "kept");
+    assert!(headers.get("x-original").is_none());
     assert_eq!(headers.get("x-good").unwrap(), "ok");
     assert!(headers.get("x-invalid-value").is_none());
     assert!(headers.keys().all(|name| name.as_str() != "bad header"));
+}
+
+#[test]
+fn inbound_internal_dispatch_controls_are_not_exposed_to_managed_execution() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        INTERNAL_DISPATCH_URL_HEADER,
+        HeaderValue::from_static("https://chatgpt.com/backend-api/codex/responses"),
+    );
+    headers.insert(
+        INTERNAL_DISPATCH_ROUTE_HEADER,
+        HeaderValue::from_static("openai_responses"),
+    );
+    headers.insert(
+        INTERNAL_RETRY_AWARE_HEADER,
+        HeaderValue::from_static("true"),
+    );
+    headers.insert("x-request-id", HeaderValue::from_static("request-1"));
+
+    let observed = response::observable_headers(&headers);
+
+    assert_eq!(observed.get("x-request-id"), Some(&json!("request-1")));
+    assert!(!observed.contains_key(INTERNAL_DISPATCH_URL_HEADER));
+    assert!(!observed.contains_key(INTERNAL_DISPATCH_ROUTE_HEADER));
+    assert!(!observed.contains_key(INTERNAL_RETRY_AWARE_HEADER));
 }
 
 #[test]
@@ -668,7 +792,8 @@ fn internal_dispatch_controls_are_consumed_and_never_forwarded() {
         Some(&request),
         "http://default.invalid/v1/chat/completions",
         ProviderRoute::OpenAiChatCompletions,
-    );
+    )
+    .unwrap();
     assert_eq!(effective.url, "http://127.0.0.1:9000/v1/responses");
     assert_eq!(effective.target_route, ProviderRoute::OpenAiResponses);
     assert_eq!(effective.headers.get("x-backend").unwrap(), "selected");
@@ -696,6 +821,10 @@ fn explicit_keyless_target_drops_source_credentials() {
         HeaderValue::from_static("Bearer source-provider-key"),
     );
     source_headers.insert("x-api-key", HeaderValue::from_static("source-api-key"));
+    source_headers.insert(
+        header::COOKIE,
+        HeaderValue::from_static("session=source-cookie"),
+    );
     let request = LlmRequest {
         headers: Map::from_iter([
             (
@@ -716,7 +845,8 @@ fn explicit_keyless_target_drops_source_credentials() {
         Some(&request),
         "http://source.invalid/v1/responses",
         ProviderRoute::OpenAiResponses,
-    );
+    )
+    .unwrap();
 
     assert_eq!(
         effective.credential_policy,
@@ -755,7 +885,8 @@ fn cross_protocol_target_uses_only_binding_owned_authentication() {
         Some(&request),
         "http://source.invalid/v1/responses",
         ProviderRoute::OpenAiResponses,
-    );
+    )
+    .unwrap();
 
     assert_eq!(effective.target_route, ProviderRoute::AnthropicMessages);
     assert_eq!(
@@ -773,6 +904,7 @@ fn cross_protocol_target_uses_only_binding_owned_authentication() {
         effective.target_route,
         &effective.headers,
         false,
+        false,
         None,
         |_: &str| Some("ambient-key-must-not-win".into()),
     )
@@ -782,11 +914,116 @@ fn cross_protocol_target_uses_only_binding_owned_authentication() {
 }
 
 #[test]
+fn explicit_target_replaces_declared_noncanonical_provider_credentials() {
+    let mut source_headers = HeaderMap::new();
+    source_headers.insert(
+        "x-custom-signature",
+        HeaderValue::from_static("source-secret"),
+    );
+    source_headers.insert(
+        INTERNAL_PROVIDER_CREDENTIAL_HEADERS,
+        HeaderValue::from_static("X-Custom-Signature"),
+    );
+    let request = LlmRequest {
+        headers: Map::from_iter([
+            (
+                INTERNAL_DISPATCH_URL_HEADER.to_string(),
+                json!("http://target.invalid/v1/chat/completions"),
+            ),
+            (
+                INTERNAL_DISPATCH_ROUTE_HEADER.to_string(),
+                json!("openai_chat"),
+            ),
+            (
+                INTERNAL_PROVIDER_CREDENTIAL_HEADERS.to_string(),
+                json!(["X-Custom-Signature"]),
+            ),
+            (
+                "x-custom-signature".to_string(),
+                json!("target-binding-secret"),
+            ),
+        ]),
+        content: Value::Null,
+    };
+
+    let effective = effective_dispatch_request(
+        &Bytes::from_static(br#"{"model":"source"}"#),
+        &source_headers,
+        Some(&request),
+        "http://source.invalid/v1/responses",
+        ProviderRoute::OpenAiResponses,
+    )
+    .unwrap();
+
+    assert_eq!(
+        effective.headers.get("x-custom-signature").unwrap(),
+        "target-binding-secret"
+    );
+    assert!(
+        effective
+            .headers
+            .get(INTERNAL_PROVIDER_CREDENTIAL_HEADERS)
+            .is_none()
+    );
+}
+
+#[test]
+fn explicit_target_drops_source_declared_noncanonical_provider_credentials() {
+    let mut source_headers = HeaderMap::new();
+    source_headers.insert(
+        "x-custom-signature",
+        HeaderValue::from_static("source-secret"),
+    );
+    source_headers.insert(
+        INTERNAL_PROVIDER_CREDENTIAL_HEADERS,
+        HeaderValue::from_static("X-Custom-Signature"),
+    );
+    let request = LlmRequest {
+        headers: Map::from_iter([
+            (
+                INTERNAL_DISPATCH_URL_HEADER.to_string(),
+                json!("http://target.invalid/v1/chat/completions"),
+            ),
+            (
+                INTERNAL_DISPATCH_ROUTE_HEADER.to_string(),
+                json!("openai_chat"),
+            ),
+        ]),
+        content: Value::Null,
+    };
+
+    let effective = effective_dispatch_request(
+        &Bytes::from_static(br#"{"model":"source"}"#),
+        &source_headers,
+        Some(&request),
+        "http://source.invalid/v1/responses",
+        ProviderRoute::OpenAiResponses,
+    )
+    .unwrap();
+
+    assert!(effective.headers.get("x-custom-signature").is_none());
+    assert!(
+        effective
+            .headers
+            .get(INTERNAL_PROVIDER_CREDENTIAL_HEADERS)
+            .is_none()
+    );
+}
+
+#[test]
 fn same_route_rewrite_without_explicit_dispatch_preserves_source_auth_policy() {
     let mut source_headers = HeaderMap::new();
     source_headers.insert(
         header::AUTHORIZATION,
         HeaderValue::from_static("Bearer source-provider-key"),
+    );
+    source_headers.insert(
+        "x-custom-signature",
+        HeaderValue::from_static("source-custom-secret"),
+    );
+    source_headers.insert(
+        INTERNAL_PROVIDER_CREDENTIAL_HEADERS,
+        HeaderValue::from_static("X-Custom-Signature"),
     );
     let request = LlmRequest {
         headers: Map::from_iter([("x-plugin-metadata".to_string(), json!("present"))]),
@@ -799,7 +1036,8 @@ fn same_route_rewrite_without_explicit_dispatch_preserves_source_auth_policy() {
         Some(&request),
         "http://source.invalid/v1/responses",
         ProviderRoute::OpenAiResponses,
-    );
+    )
+    .unwrap();
 
     assert_eq!(
         effective.credential_policy,
@@ -809,10 +1047,20 @@ fn same_route_rewrite_without_explicit_dispatch_preserves_source_auth_policy() {
         effective.headers.get(header::AUTHORIZATION).unwrap(),
         "Bearer source-provider-key"
     );
+    assert_eq!(
+        effective.headers.get("x-custom-signature").unwrap(),
+        "source-custom-secret"
+    );
+    assert!(
+        effective
+            .headers
+            .get(INTERNAL_PROVIDER_CREDENTIAL_HEADERS)
+            .is_none()
+    );
 }
 
 #[test]
-fn malformed_dispatch_route_discards_the_override_url() {
+fn malformed_dispatch_route_fails_closed() {
     let original_body = Bytes::from_static(br#"{"model":"original"}"#);
     let request = LlmRequest {
         headers: Map::from_iter([
@@ -828,27 +1076,18 @@ fn malformed_dispatch_route_discards_the_override_url() {
         content: Value::Null,
     };
 
-    let effective = effective_dispatch_request(
+    let error = effective_dispatch_request(
         &original_body,
         &HeaderMap::new(),
         Some(&request),
         "http://default.invalid/v1/chat/completions",
         ProviderRoute::OpenAiChatCompletions,
-    );
+    )
+    .unwrap_err();
 
-    assert_eq!(effective.url, "http://default.invalid/v1/chat/completions");
-    assert_eq!(effective.target_route, ProviderRoute::OpenAiChatCompletions);
     assert!(
-        effective
-            .headers
-            .get(INTERNAL_DISPATCH_URL_HEADER)
-            .is_none()
-    );
-    assert!(
-        effective
-            .headers
-            .get(INTERNAL_DISPATCH_ROUTE_HEADER)
-            .is_none()
+        error.contains("unsupported managed dispatch route"),
+        "{error}"
     );
 }
 
@@ -869,10 +1108,81 @@ fn dispatch_url_without_a_route_remains_supported() {
         Some(&request),
         "http://default.invalid/v1/chat/completions",
         ProviderRoute::OpenAiChatCompletions,
-    );
+    )
+    .unwrap();
 
     assert_eq!(effective.url, "http://127.0.0.1:9000/v1/chat/completions");
     assert_eq!(effective.target_route, ProviderRoute::OpenAiChatCompletions);
+    validate_managed_dispatch_target(
+        &effective.url,
+        effective.target_route,
+        ManagedDispatchTransport::Http,
+        true,
+    )
+    .unwrap();
+}
+
+#[test]
+fn managed_dispatch_url_must_agree_with_the_selected_provider_route() {
+    for (url, route) in [
+        (
+            "https://api.openai.com/v1/responses",
+            ProviderRoute::OpenAiResponses,
+        ),
+        (
+            "https://chatgpt.com/backend-api/codex/responses",
+            ProviderRoute::OpenAiResponses,
+        ),
+        (
+            "https://api.anthropic.com/v1/messages",
+            ProviderRoute::AnthropicMessages,
+        ),
+    ] {
+        validate_managed_dispatch_target(url, route, ManagedDispatchTransport::Http, false)
+            .unwrap();
+    }
+
+    for (url, route) in [
+        (
+            "https://api.openai.com/v1/responses",
+            ProviderRoute::AnthropicMessages,
+        ),
+        (
+            "https://api.anthropic.com/v1/messages",
+            ProviderRoute::OpenAiResponses,
+        ),
+        (
+            "https://api.openai.com/v1/chat/completions",
+            ProviderRoute::OpenAiResponses,
+        ),
+        (
+            "http://api.openai.com/v1/responses",
+            ProviderRoute::OpenAiResponses,
+        ),
+        (
+            "https://api.openai.com:8443/v1/responses",
+            ProviderRoute::OpenAiResponses,
+        ),
+    ] {
+        assert!(
+            validate_managed_dispatch_target(url, route, ManagedDispatchTransport::Http, false)
+                .is_err(),
+            "{url} should not match {route:?}"
+        );
+    }
+}
+
+#[test]
+fn public_dispatch_policy_rejects_loopback_even_when_test_server_feature_is_built() {
+    assert!(
+        validate_managed_dispatch_target(
+            "http://127.0.0.1:9000/v1/chat/completions",
+            ProviderRoute::OpenAiChatCompletions,
+            ManagedDispatchTransport::Http,
+            false,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -983,7 +1293,7 @@ async fn sse_json_stream_yields_valid_event_before_later_batch_error() {
         .send()
         .await
         .unwrap();
-    let mut stream = sse_json_stream(response);
+    let mut stream = sse_json_stream(GatewayUpstreamResponse::from_reqwest(response));
 
     assert_eq!(
         stream.next().await.unwrap().unwrap(),
@@ -995,6 +1305,15 @@ async fn sse_json_stream_yields_valid_event_before_later_batch_error() {
     assert!(stream.next().await.is_none());
 
     server.await.unwrap();
+}
+
+#[test]
+fn sse_frame_guard_bounds_one_event_across_chunks_and_resets_on_blank_lines() {
+    let mut guard = SseFrameSizeGuard::default();
+    guard.push(b"data: {}\r\n\r\n").unwrap();
+    guard.push(&vec![b'x'; MAX_SSE_FRAME_BYTES]).unwrap();
+    let error = guard.push(b"x").unwrap_err().to_string();
+    assert!(error.contains("SSE frame exceeds"), "{error}");
 }
 
 #[tokio::test]
@@ -1024,10 +1343,13 @@ async fn retry_aware_buffered_body_read_failure_stays_structured() {
         body_bytes: Bytes::from_static(b"{}"),
         request_json: json!({}),
         streaming: false,
+        transport: "http",
         authorization: crate::provider_auth::ProviderRequestAuthorization {
             source_credential: crate::provider_auth::SourceCredentialDisposition::Absent,
+            allow_configured_provider_auth: false,
             allow_environment_provider_auth: false,
         },
+        agent_route: None,
     };
     let upstream_info = Arc::new(Mutex::new(None));
     let upstream_error = Arc::new(Mutex::new(None));
@@ -1080,10 +1402,13 @@ async fn retry_aware_buffered_invalid_json_stays_structured() {
         body_bytes: Bytes::from_static(b"{}"),
         request_json: json!({}),
         streaming: false,
+        transport: "http",
         authorization: crate::provider_auth::ProviderRequestAuthorization {
             source_credential: crate::provider_auth::SourceCredentialDisposition::Absent,
+            allow_configured_provider_auth: false,
             allow_environment_provider_auth: false,
         },
+        agent_route: None,
     };
     let upstream_info = Arc::new(Mutex::new(None));
     let upstream_error = Arc::new(Mutex::new(None));
@@ -1113,6 +1438,54 @@ async fn retry_aware_buffered_invalid_json_stays_structured() {
         Some(&"provider-request".to_string())
     );
     assert!(upstream_error.lock().unwrap().is_none());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_streaming_provider_error_preserves_native_response() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let provider_body = r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#;
+    let response = format!(
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 7\r\nx-request-id: provider-request\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        provider_body.len(),
+        provider_body
+    );
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let config = GatewayConfig {
+        openai_base_url: format!("http://{address}"),
+        ..GatewayConfig::default()
+    };
+    let state = AppState::new(config);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/responses")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-test","input":"hello","stream":true}"#,
+        ))
+        .unwrap();
+
+    let response = passthrough(State(state), request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers().get("retry-after").unwrap(), "7");
+    assert_eq!(
+        response.headers().get("x-request-id").unwrap(),
+        "provider-request"
+    );
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, provider_body);
     server.await.unwrap();
 }
 
@@ -1258,6 +1631,14 @@ fn build_llm_gateway_start_uses_alignment_identifiers_and_metadata() {
     );
     headers.insert("x-request-id", HeaderValue::from_static("transport-req"));
     headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
+    headers.insert(
+        INTERNAL_PROVIDER_CREDENTIAL_HEADERS,
+        HeaderValue::from_static("X-Custom-Signature"),
+    );
+    headers.insert(
+        "x-custom-signature",
+        HeaderValue::from_static("declared-secret"),
+    );
     let request_json = json!({
         "model": "gpt-test",
         "stream": true,
@@ -1280,10 +1661,13 @@ fn build_llm_gateway_start_uses_alignment_identifiers_and_metadata() {
         body_bytes: axum::body::Bytes::new(),
         request_json: request_json.clone(),
         streaming: true,
+        transport: "http_sse",
         authorization: crate::provider_auth::ProviderRequestAuthorization {
             source_credential: crate::provider_auth::SourceCredentialDisposition::Absent,
+            allow_configured_provider_auth: true,
             allow_environment_provider_auth: true,
         },
+        agent_route: None,
     };
 
     let start = build_llm_gateway_start(&prepared);
@@ -1297,10 +1681,22 @@ fn build_llm_gateway_start_uses_alignment_identifiers_and_metadata() {
     assert_eq!(start.request_id.as_deref(), Some("transport-req"));
     assert!(start.streaming);
     assert_eq!(start.metadata["gateway_path"], json!("/responses"));
+    assert_eq!(start.metadata["transport"], json!("http_sse"));
     assert_eq!(start.request.content, request_json);
     assert!(
         !start.request.headers.contains_key("authorization"),
         "observable headers should not leak auth secrets"
+    );
+    assert!(
+        !start
+            .request
+            .headers
+            .contains_key(INTERNAL_PROVIDER_CREDENTIAL_HEADERS),
+        "credential declarations are internal transport controls"
+    );
+    assert!(
+        !start.request.headers.contains_key("x-custom-signature"),
+        "dynamically declared credentials must not enter managed event snapshots"
     );
 
     let mut metadata_owned = prepared;
@@ -1315,7 +1711,15 @@ fn observable_headers_omit_secrets_and_transport_headers() {
     headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
     headers.insert("x-api-key", HeaderValue::from_static("secret"));
     headers.insert(
-        crate::provider_auth::TRANSPARENT_PROXY_CREDENTIAL_HEADER,
+        INTERNAL_PROVIDER_CREDENTIAL_HEADERS,
+        HeaderValue::from_static("X-Custom-Signature"),
+    );
+    headers.insert(
+        "x-custom-signature",
+        HeaderValue::from_static("declared-secret"),
+    );
+    headers.insert(
+        "proxy-authorization",
         HeaderValue::from_static("proxy-secret"),
     );
     headers.insert("connection", HeaderValue::from_static("close"));
@@ -1326,7 +1730,9 @@ fn observable_headers_omit_secrets_and_transport_headers() {
     assert_eq!(observed.get("x-request-id"), Some(&json!("req-1")));
     assert!(!observed.contains_key("authorization"));
     assert!(!observed.contains_key("x-api-key"));
-    assert!(!observed.contains_key(crate::provider_auth::TRANSPARENT_PROXY_CREDENTIAL_HEADER));
+    assert!(!observed.contains_key(INTERNAL_PROVIDER_CREDENTIAL_HEADERS));
+    assert!(!observed.contains_key("x-custom-signature"));
+    assert!(!observed.contains_key("proxy-authorization"));
     assert!(!observed.contains_key("connection"));
 }
 
@@ -1423,102 +1829,13 @@ fn foreground_gateway_does_not_interpret_agent_specific_placeholder_credentials(
 }
 
 #[test]
-fn generated_transparent_proxy_credentials_are_random_and_high_entropy() {
-    let first = crate::provider_auth::TransparentProxyCredential::generate().unwrap();
-    let second = crate::provider_auth::TransparentProxyCredential::generate().unwrap();
+fn generated_proxy_credentials_are_random_and_high_entropy() {
+    let first = crate::provider_auth::ProxyCredential::generate().unwrap();
+    let second = crate::provider_auth::ProxyCredential::generate().unwrap();
 
     assert!(first.expose().starts_with("nrp_"));
     assert_eq!(first.expose().len(), 68);
     assert_ne!(first.expose(), second.expose());
-}
-
-#[test]
-fn transparent_proxy_dedicated_header_is_consumed_before_plugins() {
-    let credential =
-        crate::provider_auth::TransparentProxyCredential::from_static("test-proxy-token");
-    let mut inbound = HeaderMap::new();
-    inbound.insert(
-        "authorization",
-        HeaderValue::from_static("Bearer real-provider-key"),
-    );
-    inbound.insert(
-        crate::provider_auth::TRANSPARENT_PROXY_CREDENTIAL_HEADER,
-        HeaderValue::from_static("test-proxy-token"),
-    );
-
-    let disposition = credential.consume(&mut inbound).unwrap();
-
-    assert_eq!(
-        disposition,
-        crate::provider_auth::SourceCredentialDisposition::RelayProxyCredential {
-            provider_credential_present: true
-        }
-    );
-    assert_eq!(
-        inbound.get("authorization").unwrap(),
-        "Bearer real-provider-key"
-    );
-    assert!(
-        inbound
-            .get(crate::provider_auth::TRANSPARENT_PROXY_CREDENTIAL_HEADER)
-            .is_none()
-    );
-}
-
-#[test]
-fn transparent_proxy_accepts_standard_openai_and_anthropic_auth_shapes() {
-    let credential =
-        crate::provider_auth::TransparentProxyCredential::from_static("test-proxy-token");
-    for (name, value) in [
-        ("authorization", "Bearer test-proxy-token"),
-        ("x-api-key", "test-proxy-token"),
-        ("api-key", "test-proxy-token"),
-        ("anthropic-api-key", "test-proxy-token"),
-    ] {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            HeaderName::from_bytes(name.as_bytes()).unwrap(),
-            HeaderValue::from_str(value).unwrap(),
-        );
-
-        let disposition = credential.consume(&mut headers).unwrap();
-
-        assert_eq!(
-            disposition,
-            crate::provider_auth::SourceCredentialDisposition::RelayProxyCredential {
-                provider_credential_present: false
-            },
-            "header={name}"
-        );
-        assert!(headers.is_empty(), "header={name}");
-    }
-}
-
-#[test]
-fn transparent_proxy_rejects_missing_or_foreign_credentials() {
-    let credential =
-        crate::provider_auth::TransparentProxyCredential::from_static("test-proxy-token");
-    let missing = credential.consume(&mut HeaderMap::new()).unwrap_err();
-    assert!(matches!(&missing, CliError::Unauthorized(_)));
-    assert_eq!(missing.into_response().status(), StatusCode::UNAUTHORIZED);
-
-    let mut foreign = HeaderMap::new();
-    foreign.insert(
-        crate::provider_auth::TRANSPARENT_PROXY_CREDENTIAL_HEADER,
-        HeaderValue::from_static("different-run-token"),
-    );
-    let foreign_error = credential.consume(&mut foreign).unwrap_err();
-    assert!(matches!(&foreign_error, CliError::Unauthorized(_)));
-    assert_eq!(
-        foreign_error.into_response().status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        foreign
-            .get(crate::provider_auth::TRANSPARENT_PROXY_CREDENTIAL_HEADER)
-            .unwrap(),
-        "different-run-token"
-    );
 }
 
 #[test]
@@ -1535,6 +1852,7 @@ fn injects_openai_bearer_when_inbound_has_no_auth() {
         builder,
         ProviderRoute::OpenAiResponses,
         &inbound,
+        true,
         true,
         None,
         env,
@@ -1561,6 +1879,7 @@ fn injects_anthropic_x_api_key_for_anthropic_routes() {
         ProviderRoute::AnthropicMessages,
         &inbound,
         true,
+        true,
         None,
         env,
     )
@@ -1584,9 +1903,11 @@ fn configured_auth_headers_are_provider_specific_and_precede_environment_keys() 
         ProviderRoute::OpenAiResponses,
         crate::provider_auth::ProviderRequestAuthorization {
             source_credential: crate::provider_auth::SourceCredentialDisposition::Absent,
+            allow_configured_provider_auth: true,
             allow_environment_provider_auth: true,
         },
         &config,
+        false,
     );
 
     for (route, expected) in [
@@ -1604,6 +1925,7 @@ fn configured_auth_headers_are_provider_specific_and_precede_environment_keys() 
             route,
             &HeaderMap::new(),
             true,
+            true,
             forwarding.configured_auth_header(route),
             |_| Some("standard-env-key".into()),
         )
@@ -1613,6 +1935,26 @@ fn configured_auth_headers_are_provider_specific_and_precede_environment_keys() 
         assert_eq!(built.headers().get("authorization").unwrap(), expected);
         assert!(built.headers().get("x-api-key").is_none());
     }
+}
+
+#[test]
+fn configured_auth_is_eligible_when_environment_auth_is_disabled() {
+    let request = inject_provider_auth_with_env(
+        test_http_client().post("http://upstream"),
+        ProviderRoute::OpenAiResponses,
+        &HeaderMap::new(),
+        true,
+        false,
+        Some("Bearer protected-config"),
+        |_| Some("ambient-key-must-not-win".into()),
+    )
+    .build()
+    .unwrap();
+
+    assert_eq!(
+        request.headers().get(header::AUTHORIZATION).unwrap(),
+        "Bearer protected-config"
+    );
 }
 
 #[test]
@@ -1631,6 +1973,7 @@ fn configured_openai_auth_replaces_chatgpt_jwt() {
         &inbound,
         ProviderRoute::OpenAiResponses,
         true,
+        true,
         configured_auth_header,
     );
     assert!(sanitized.get("authorization").is_none());
@@ -1639,6 +1982,7 @@ fn configured_openai_auth_replaces_chatgpt_jwt() {
             ProviderRoute::OpenAiResponses,
             &inbound,
             "/responses",
+            true,
             true,
             &config,
         ),
@@ -1649,6 +1993,7 @@ fn configured_openai_auth_replaces_chatgpt_jwt() {
         test_http_client().post("http://upstream"),
         ProviderRoute::OpenAiResponses,
         &sanitized,
+        true,
         true,
         configured_auth_header,
         |_| None,
@@ -1678,6 +2023,7 @@ fn skips_injection_when_inbound_already_has_authorization() {
         ProviderRoute::OpenAiResponses,
         &inbound,
         true,
+        true,
         None,
         env,
     )
@@ -1700,6 +2046,7 @@ fn skips_injection_when_env_var_unset() {
         ProviderRoute::OpenAiResponses,
         &inbound,
         true,
+        true,
         None,
         env,
     )
@@ -1718,6 +2065,7 @@ fn managed_sidecar_never_injects_forwarded_provider_credentials() {
         builder,
         ProviderRoute::OpenAiResponses,
         &inbound,
+        false,
         false,
         None,
         env,
@@ -1856,7 +2204,7 @@ async fn passthrough_rejects_unsupported_provider_path_directly() {
         bootstrap_fingerprint: None,
         bootstrap_challenge_key: None,
         require_provider_client_token: false,
-        transparent_proxy_credential: None,
+        allow_environment_provider_auth: true,
         http: test_http_client(),
         sessions: SessionManager::new(config),
         last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
@@ -1864,6 +2212,7 @@ async fn passthrough_rejects_unsupported_provider_path_directly() {
         instance_id: "test-instance".into(),
         bootstrap_tls: None,
         local_address: None,
+        allow_test_loopback_dispatch: false,
     };
     let request = Request::builder()
         .method(Method::POST)
@@ -1894,7 +2243,7 @@ async fn models_rejects_non_get_requests_directly() {
         bootstrap_fingerprint: None,
         bootstrap_challenge_key: None,
         require_provider_client_token: false,
-        transparent_proxy_credential: None,
+        allow_environment_provider_auth: true,
         http: test_http_client(),
         sessions: SessionManager::new(config),
         last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
@@ -1902,6 +2251,7 @@ async fn models_rejects_non_get_requests_directly() {
         instance_id: "test-instance".into(),
         bootstrap_tls: None,
         local_address: None,
+        allow_test_loopback_dispatch: false,
     };
     let request = Request::builder()
         .method(Method::POST)

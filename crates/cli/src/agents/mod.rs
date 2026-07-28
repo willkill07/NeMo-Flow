@@ -11,7 +11,8 @@ pub(crate) mod shared;
 use semver::Version;
 
 /// Coding-agent hosts supported by the CLI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum CodingAgent {
     /// `claude-code` remains an input alias for older Relay configuration.
     ClaudeCode,
@@ -58,7 +59,7 @@ impl CodingAgent {
         self.descriptor().label
     }
 
-    /// Default executable name used for discovery and transparent launch.
+    /// Default executable name used for enrollment discovery and version checks.
     pub(crate) const fn executable(self) -> &'static str {
         self.descriptor().executable
     }
@@ -76,11 +77,6 @@ impl CodingAgent {
     /// Hermes stores direct command entries; plugin hosts use nested command-hook groups.
     pub(crate) const fn uses_direct_hook_entries(self) -> bool {
         self.descriptor().direct_hook_entries
-    }
-
-    /// Whether this host can inherit the persistent Claude Desktop protection environment.
-    pub(crate) const fn uses_claude_desktop_protection(self) -> bool {
-        matches!(self, Self::ClaudeCode)
     }
 
     pub(crate) fn minimum_version(self) -> Version {
@@ -159,6 +155,23 @@ impl crate::installation::marketplace::MarketplaceHost for CodingAgent {
         self.label()
     }
 
+    fn enrolled_proxy_url(self) -> Result<String, String> {
+        let enrollment = match self {
+            Self::ClaudeCode => crate::claude_desktop::claude_plugin_enrollment(),
+            Self::Codex | Self::Hermes => crate::claude_desktop::enrollment(self),
+        }?;
+        match enrollment {
+            Some(enrollment) => Ok(enrollment.gateway_url),
+            #[cfg(test)]
+            None => Ok(crate::bootstrap::LEGACY_FIXED_URL.into()),
+            #[cfg(not(test))]
+            None => Err(format!(
+                "{} is not enrolled in the per-user coding-agent proxy",
+                self.label()
+            )),
+        }
+    }
+
     fn executable(self) -> &'static str {
         self.executable()
     }
@@ -193,10 +206,6 @@ impl crate::installation::marketplace::MarketplaceHost for CodingAgent {
 
     fn plugin_manifest(self, plugin: &str) -> serde_json::Value {
         plugin_manifest(self, plugin)
-    }
-
-    fn plugin_mcp_config(self, server: serde_json::Value) -> Result<serde_json::Value, String> {
-        plugin_mcp_config(self, server)
     }
 
     fn plugin_hooks(
@@ -259,21 +268,13 @@ impl crate::installation::marketplace::MarketplaceHost for CodingAgent {
     fn unsafe_generation_fence_error(self, problem: &str) -> String {
         match self {
             Self::Codex => format!(
-                "cannot safely replace or uninstall an existing Codex plugin because its MCP generation marker {problem}; close all Codex clients and standalone `nemo-relay mcp` processes, run `codex plugin remove nemo-relay-plugin@nemo-relay-local` and `codex plugin marketplace remove nemo-relay-local`, remove the stale marketplace and state from the selected install directory, then run `nemo-relay install codex --force` to create a fenced install (and `nemo-relay uninstall codex` afterward if removal was intended)"
+                "cannot safely replace or uninstall an existing Codex plugin because its installation generation marker {problem}; close all Codex clients, run `codex plugin remove nemo-relay-plugin@nemo-relay-local` and `codex plugin marketplace remove nemo-relay-local`, remove the stale marketplace and state from the selected install directory, then run `nemo-relay install codex --force` to create a fenced install (and `nemo-relay uninstall codex` afterward if removal was intended)"
             ),
             Self::ClaudeCode => format!(
-                "cannot safely replace or uninstall an existing Claude Code plugin because its MCP generation marker {problem}; close all Claude Code clients and standalone `nemo-relay mcp` processes, run `claude plugin uninstall nemo-relay-plugin` and `claude plugin marketplace remove nemo-relay-local`, remove the stale marketplace and state from the selected install directory, then run `nemo-relay install claude-code --force` to create a fenced install (and `nemo-relay uninstall claude-code` afterward if removal was intended)"
+                "cannot safely replace or uninstall an existing Claude Code plugin because its installation generation marker {problem}; close all Claude Code clients, run `claude plugin uninstall nemo-relay-plugin` and `claude plugin marketplace remove nemo-relay-local`, remove the stale marketplace and state from the selected install directory, then run `nemo-relay install claude-code --force` to create a fenced install (and `nemo-relay uninstall claude-code` afterward if removal was intended)"
             ),
             Self::Hermes => unreachable!("Hermes does not use marketplace generations"),
         }
-    }
-
-    fn accepts_legacy_hook_only_plugin(self) -> bool {
-        matches!(self, Self::ClaudeCode)
-    }
-
-    fn accepts_mcp_environment_superset(self) -> bool {
-        matches!(self, Self::Codex)
     }
 
     fn local_install_exists(
@@ -364,50 +365,6 @@ pub(crate) fn plugin_manifest(agent: CodingAgent, plugin: &str) -> serde_json::V
     }
 }
 
-pub(crate) fn plugin_mcp_config(
-    agent: CodingAgent,
-    server: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    match agent {
-        CodingAgent::Codex => codex::assets::mcp_config(server),
-        CodingAgent::ClaudeCode => Ok(claude::assets::mcp_config(server)),
-        CodingAgent::Hermes => unreachable!("Hermes does not install a marketplace plugin"),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn codex_mcp_env_vars_from(
-    environment: impl IntoIterator<Item = String>,
-    config: Option<&serde_json::Value>,
-) -> Vec<String> {
-    codex::assets::mcp_env_vars_from(environment, config)
-}
-
-pub(crate) fn prepare_launch(
-    agent: CodingAgent,
-    launch: &mut crate::process::PreparedAgentLaunch,
-    gateway_url: &str,
-    resolved: &crate::configuration::ResolvedConfig,
-    proxy_credential: &crate::provider_auth::TransparentProxyCredential,
-    dry_run: bool,
-) -> Result<(), crate::error::CliError> {
-    launch.set_secret_env(
-        crate::provider_auth::TRANSPARENT_PROXY_CREDENTIAL_ENV,
-        proxy_credential.expose(),
-    );
-    match agent {
-        CodingAgent::Codex => codex::launch::prepare(launch, gateway_url),
-        CodingAgent::ClaudeCode => {
-            claude::launch::prepare(launch, gateway_url, proxy_credential, dry_run)
-        }
-        CodingAgent::Hermes => hermes::launch::prepare(
-            launch,
-            resolved.agents.hermes.hooks_path.as_deref(),
-            dry_run,
-        ),
-    }
-}
-
 pub(crate) fn configured(agent: CodingAgent, configs: &crate::configuration::AgentConfigs) -> bool {
     config(agent, configs).command.is_some()
         || matches!(agent, CodingAgent::Hermes) && configs.hermes.hooks_path.is_some()
@@ -435,9 +392,14 @@ pub(crate) fn hook_status(
     }
 }
 
+#[derive(Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "agent", content = "snapshot", rename_all = "kebab-case")]
 pub(crate) enum SetupSnapshot {
     Codex(CodexSetupSnapshot),
     Claude(ClaudeSetupSnapshot),
+    Hermes(hermes::HermesSetupSnapshot),
+    #[cfg(test)]
+    Test,
 }
 
 pub(crate) fn setup_action_description(agent: CodingAgent, action: &str) -> String {
@@ -447,13 +409,11 @@ pub(crate) fn setup_action_description(agent: CodingAgent, action: &str) -> Stri
         }
         (CodingAgent::Codex, "restore") => "remove Codex provider and plugin hook trust".into(),
         (CodingAgent::Codex, "doctor") => "check Codex provider and plugin-owned hooks".into(),
-        (CodingAgent::ClaudeCode, "configure") => {
-            "enable Claude Code provider routing through NeMo Relay".into()
-        }
+        (CodingAgent::ClaudeCode, "configure") => "verify Claude Code native proxy settings".into(),
         (CodingAgent::ClaudeCode, "restore") => {
-            "restore Claude Code provider routing from NeMo Relay backup".into()
+            "retain shared Claude proxy settings until enrollment removal".into()
         }
-        (CodingAgent::ClaudeCode, "doctor") => "check Claude Code provider routing".into(),
+        (CodingAgent::ClaudeCode, "doctor") => "check Claude Code native proxy settings".into(),
         _ => unreachable!("unsupported setup action"),
     }
 }
@@ -462,7 +422,21 @@ pub(crate) fn snapshot_setup(agent: CodingAgent) -> Result<SetupSnapshot, String
     match agent {
         CodingAgent::Codex => snapshot_codex_setup().map(SetupSnapshot::Codex),
         CodingAgent::ClaudeCode => snapshot_claude_setup().map(SetupSnapshot::Claude),
-        CodingAgent::Hermes => unreachable!("Hermes does not use marketplace setup"),
+        CodingAgent::Hermes => hermes::install::config_path()
+            .and_then(|path| hermes::snapshot_persistent(&path))
+            .map(SetupSnapshot::Hermes),
+    }
+}
+
+pub(crate) fn persistent_proxy_environment(
+    agent: CodingAgent,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    match agent {
+        CodingAgent::Hermes => {
+            let config = hermes::install::config_path()?;
+            hermes::proxy_environment(&config)
+        }
+        CodingAgent::ClaudeCode | CodingAgent::Codex => Ok(Default::default()),
     }
 }
 
@@ -470,7 +444,61 @@ pub(crate) fn restore_setup_snapshot(snapshot: &SetupSnapshot) -> Result<(), Str
     match snapshot {
         SetupSnapshot::Codex(snapshot) => restore_codex_setup(snapshot),
         SetupSnapshot::Claude(snapshot) => restore_claude_setup(snapshot),
+        SetupSnapshot::Hermes(snapshot) => hermes::restore_persistent_snapshot(snapshot),
+        #[cfg(test)]
+        SetupSnapshot::Test => Ok(()),
     }
+}
+
+pub(crate) fn capture_current_setup_snapshot(
+    snapshot: &SetupSnapshot,
+) -> Result<SetupSnapshot, String> {
+    match snapshot {
+        SetupSnapshot::Codex(_) => snapshot_codex_setup().map(SetupSnapshot::Codex),
+        SetupSnapshot::Claude(_) => snapshot_claude_setup().map(SetupSnapshot::Claude),
+        SetupSnapshot::Hermes(snapshot) => {
+            hermes::capture_current_persistent_snapshot(snapshot).map(SetupSnapshot::Hermes)
+        }
+        #[cfg(test)]
+        SetupSnapshot::Test => Ok(SetupSnapshot::Test),
+    }
+}
+
+pub(crate) fn restore_setup_snapshot_cas(
+    snapshot: &SetupSnapshot,
+    expected_current: Option<&SetupSnapshot>,
+) -> Result<(), String> {
+    let current = capture_current_setup_snapshot(snapshot)?;
+    if current == *snapshot {
+        return Ok(());
+    }
+    if expected_current != Some(&current) {
+        return Err(
+            "agent host configuration changed outside this Relay transaction; retained the current configuration"
+                .into(),
+        );
+    }
+    match (snapshot, &current) {
+        (SetupSnapshot::Codex(snapshot), SetupSnapshot::Codex(expected)) => {
+            restore_codex_setup_cas(snapshot, expected)
+        }
+        (SetupSnapshot::Claude(snapshot), SetupSnapshot::Claude(expected)) => {
+            restore_claude_setup_cas(snapshot, expected)
+        }
+        (SetupSnapshot::Hermes(snapshot), SetupSnapshot::Hermes(expected)) => {
+            hermes::restore_persistent_snapshot_cas(snapshot, expected)
+        }
+        #[cfg(test)]
+        (SetupSnapshot::Test, SetupSnapshot::Test) => Ok(()),
+        _ => Err("agent host rollback snapshot kind changed unexpectedly".into()),
+    }
+}
+
+pub(crate) fn refresh_hermes_proxy_environment(
+    enrollment: &crate::claude_desktop::AgentProxyEnrollment,
+) -> Result<(), String> {
+    let config = hermes::install::config_path()?;
+    hermes::refresh_proxy_environment(&config, enrollment).map_err(|error| error.to_string())
 }
 
 pub(crate) fn setup_marketplace_plugin(
@@ -483,7 +511,7 @@ pub(crate) fn setup_marketplace_plugin(
         CodingAgent::Codex => {
             install_codex_plugin_with_generation(gateway_url, plugin_root, generation_token)
         }
-        CodingAgent::ClaudeCode => enable_claude_provider(gateway_url),
+        CodingAgent::ClaudeCode => crate::claude_desktop::verify_claude_settings(),
         CodingAgent::Hermes => unreachable!("Hermes does not use marketplace setup"),
     }
 }
@@ -495,7 +523,7 @@ pub(crate) fn uninstall_marketplace_plugin(
 ) -> Result<(), String> {
     match agent {
         CodingAgent::Codex => uninstall_codex_plugin(gateway_url, plugin_root),
-        CodingAgent::ClaudeCode => restore_claude_provider(gateway_url),
+        CodingAgent::ClaudeCode => Ok(()),
         CodingAgent::Hermes => unreachable!("Hermes does not use marketplace setup"),
     }
 }
@@ -513,7 +541,7 @@ pub(crate) fn doctor_marketplace_plugin(
             plugin_root,
             generation_token,
         ),
-        CodingAgent::ClaudeCode => doctor_plugin(CodingAgent::ClaudeCode, gateway_url, plugin_root),
+        CodingAgent::ClaudeCode => crate::claude_desktop::verify_claude_settings(),
         CodingAgent::Hermes => unreachable!("Hermes does not use marketplace setup"),
     }
 }
@@ -526,32 +554,179 @@ pub(crate) fn doctor_marketplace_plugin_json(
     match agent {
         CodingAgent::Codex => doctor_plugin_json(CodingAgent::Codex, gateway_url, plugin_root),
         CodingAgent::ClaudeCode => {
-            doctor_plugin_json(CodingAgent::ClaudeCode, gateway_url, plugin_root)
+            let settings = crate::claude_desktop::verify_claude_settings();
+            Ok(json!({
+                "ok": settings.is_ok(),
+                "checks": {
+                    "claude_native_proxy_settings": settings.is_ok(),
+                },
+                "details": settings.err(),
+            }))
         }
         CodingAgent::Hermes => unreachable!("Hermes does not use marketplace setup"),
     }
 }
 
+pub(crate) fn verify_hook_host_configuration(
+    agent: CodingAgent,
+    gateway_url: &str,
+    generation_file: &Path,
+    generation_token: &str,
+) -> Result<(), String> {
+    match agent {
+        CodingAgent::ClaudeCode => crate::claude_desktop::verify_claude_settings(),
+        CodingAgent::Codex => {
+            if !codex_provider_installed(gateway_url) {
+                return Err(
+                    "Codex managed provider settings no longer match the enrolled proxy".into(),
+                );
+            }
+            let plugin_root = generation_file.parent().ok_or_else(|| {
+                format!(
+                    "Codex hook generation path {} has no plugin root",
+                    generation_file.display()
+                )
+            })?;
+            let hooks = plugin_root.join("hooks").join("hooks.json");
+            if !codex_hooks_installed_with_generation(&hooks, Some(generation_token))? {
+                return Err("Codex hook settings no longer match the installed generation".into());
+            }
+            Ok(())
+        }
+        CodingAgent::Hermes => {
+            let config = hermes::install::config_path()?;
+            hermes::diagnose_persistent(&config, None).map(|_| ())
+        }
+    }
+}
+
 pub(crate) fn install_integration(
     agent: CodingAgent,
-    command: crate::installation::InstallRequest,
+    mut command: crate::installation::InstallRequest,
 ) -> Result<std::process::ExitCode, crate::error::CliError> {
-    match agent {
-        CodingAgent::Hermes => hermes::install::install(command),
-        CodingAgent::Codex => codex::install::install(command),
-        CodingAgent::ClaudeCode => claude::install::install(command),
+    command.install_dir = Some(
+        resolved_agent_install_dir(command.install_dir.as_deref())
+            .map_err(crate::error::CliError::Install)?,
+    );
+    preflight_legacy_install_state(agent, command.install_dir.as_deref())
+        .map_err(crate::error::CliError::Install)?;
+    if command.dry_run {
+        println!(
+            "enroll {} in the authenticated per-user coding-agent proxy and {}",
+            agent.label(),
+            crate::claude_desktop::trust_configuration_notice()
+        );
+        if agent == CodingAgent::Codex && cfg!(target_os = "linux") {
+            println!(
+                "require CODEX_CA_CERTIFICATE in every Codex launch environment and print the generated stable bundle path"
+            );
+        }
+        return match agent {
+            CodingAgent::Hermes => hermes::install::install(command),
+            CodingAgent::Codex => codex::install::install(command),
+            CodingAgent::ClaudeCode => claude::install::install(command),
+        };
     }
+    let setup_snapshot = snapshot_setup(agent).map_err(crate::error::CliError::Install)?;
+    let shared_claude_plugin = agent == CodingAgent::ClaudeCode
+        && crate::claude_desktop::is_enrolled(command.install_dir.as_deref())
+            .map_err(crate::error::CliError::Install)?;
+    let proxy_request = command.clone();
+    crate::claude_desktop::enroll_agent_transactionally(
+        agent,
+        &proxy_request,
+        &setup_snapshot,
+        || match (agent, shared_claude_plugin) {
+            (CodingAgent::ClaudeCode, true) => {
+                println!("shared the existing Claude Desktop Relay plugin with Claude Code");
+                Ok(std::process::ExitCode::SUCCESS)
+            }
+            (CodingAgent::Hermes, _) => hermes::install::install(command),
+            (CodingAgent::Codex, _) => codex::install::install(command),
+            (CodingAgent::ClaudeCode, false) => claude::install::install(command),
+        },
+    )
+}
+
+fn preflight_legacy_install_state(
+    agent: CodingAgent,
+    install_dir: Option<&std::path::Path>,
+) -> Result<(), String> {
+    match agent {
+        CodingAgent::Codex => codex::host::ensure_no_legacy_mcp_state()?,
+        CodingAgent::Hermes => {
+            let config = hermes::install::config_path()?;
+            hermes::ensure_no_legacy_mcp_state(&config)?;
+        }
+        CodingAgent::ClaudeCode => {}
+    }
+    if matches!(agent, CodingAgent::Codex | CodingAgent::ClaudeCode) {
+        let selected = install_dir.map_or_else(
+            crate::installation::marketplace::default_marketplace_install_dir,
+            std::path::Path::to_path_buf,
+        );
+        let absolute = if selected.is_absolute() {
+            selected
+        } else {
+            std::env::current_dir()
+                .map_err(|error| format!("failed to resolve marketplace directory: {error}"))?
+                .join(selected)
+        };
+        let (_, plugin_root) =
+            crate::installation::marketplace::marketplace_install_roots(agent, &absolute);
+        let legacy_mcp = plugin_root.join(".mcp.json");
+        if legacy_mcp.exists() {
+            return Err(format!(
+                "legacy {} MCP-gateway state exists at {}; close the agent, uninstall this integration with the previous Relay binary, then run `nemo-relay install {}`",
+                agent.label(),
+                legacy_mcp.display(),
+                agent.install_arg()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn uninstall_integration(
     agent: CodingAgent,
-    command: crate::installation::UninstallRequest,
+    mut command: crate::installation::UninstallRequest,
 ) -> Result<std::process::ExitCode, crate::error::CliError> {
-    match agent {
-        CodingAgent::Hermes => hermes::install::uninstall(command),
-        CodingAgent::Codex => codex::install::uninstall(command),
-        CodingAgent::ClaudeCode => claude::install::uninstall(command),
+    command.install_dir = Some(
+        resolved_agent_install_dir(command.install_dir.as_deref())
+            .map_err(crate::error::CliError::Install)?,
+    );
+    if command.dry_run {
+        println!(
+            "remove {} from the shared per-user coding-agent proxy",
+            agent.label()
+        );
     }
+    let shared_claude_plugin = agent == CodingAgent::ClaudeCode
+        && crate::claude_desktop::is_enrolled(command.install_dir.as_deref())
+            .map_err(crate::error::CliError::Install)?;
+    let setup_snapshot = (!command.dry_run)
+        .then(|| snapshot_setup(agent))
+        .transpose()
+        .map_err(crate::error::CliError::Install)?;
+    let request = command.clone();
+    crate::claude_desktop::unenroll_agent_transactionally(
+        agent,
+        &request,
+        setup_snapshot.as_ref(),
+        || match (agent, shared_claude_plugin) {
+            (CodingAgent::ClaudeCode, true) => {
+                println!("retained the shared Relay plugin for Claude Desktop");
+                Ok(std::process::ExitCode::SUCCESS)
+            }
+            (CodingAgent::Hermes, _) => hermes::install::uninstall(command.clone()),
+            (CodingAgent::Codex, _) => codex::install::uninstall(command.clone()),
+            (CodingAgent::ClaudeCode, false) => claude::install::uninstall(command.clone()),
+        },
+    )
+}
+
+fn resolved_agent_install_dir(install_dir: Option<&Path>) -> Result<PathBuf, String> {
+    crate::claude_desktop::resolved_marketplace_install_dir(install_dir)
 }
 
 pub(crate) fn detected_install_integrations(candidates: &[CodingAgent]) -> Vec<CodingAgent> {
@@ -566,18 +741,30 @@ pub(crate) fn installed_integrations(
     candidates: &[CodingAgent],
     install_dir: Option<&Path>,
 ) -> Vec<CodingAgent> {
-    let install_dir = install_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(crate::installation::marketplace::default_marketplace_install_dir);
+    let selected_install_dir = resolved_agent_install_dir(install_dir).unwrap_or_else(|_| {
+        install_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(crate::installation::marketplace::default_marketplace_install_dir)
+    });
     candidates
         .iter()
         .copied()
-        .filter(|agent| match agent {
-            CodingAgent::Codex | CodingAgent::ClaudeCode => {
-                crate::installation::marketplace::persisted_state_exists(*agent, &install_dir)
-            }
-            CodingAgent::Hermes => hermes::install::config_path()
-                .is_ok_and(|path| hermes::persistent_state_exists(&path)),
+        .filter(|agent| {
+            let enrolled = crate::claude_desktop::enrollment_at(*agent, install_dir)
+                .ok()
+                .flatten()
+                .is_some();
+            let host_state = match agent {
+                CodingAgent::Codex | CodingAgent::ClaudeCode => {
+                    crate::installation::marketplace::persisted_state_exists(
+                        *agent,
+                        &selected_install_dir,
+                    )
+                }
+                CodingAgent::Hermes => hermes::install::config_path()
+                    .is_ok_and(|path| hermes::persistent_state_exists(&path)),
+            };
+            enrolled || host_state
         })
         .collect()
 }
@@ -586,6 +773,10 @@ pub(crate) fn doctor_integration(
     agent: CodingAgent,
     options: &crate::installation::marketplace::state::PluginInstallOptions,
 ) -> Result<(), crate::error::CliError> {
+    let enrollment =
+        crate::claude_desktop::diagnose_enrollment_at(agent, Some(&options.install_dir))
+            .map_err(crate::error::CliError::Install)?;
+    println!("Agent proxy: ok ({enrollment})");
     match agent {
         CodingAgent::Codex | CodingAgent::ClaudeCode => {
             crate::installation::marketplace::doctor_marketplace_integration(agent, options)
@@ -601,7 +792,8 @@ pub(crate) fn doctor_integration_report(
     agent: CodingAgent,
     options: &crate::installation::marketplace::state::PluginInstallOptions,
 ) -> Result<serde_json::Value, crate::error::CliError> {
-    match agent {
+    let proxy = crate::claude_desktop::diagnose_enrollment_at(agent, Some(&options.install_dir));
+    let mut report = match agent {
         CodingAgent::Codex | CodingAgent::ClaudeCode => {
             crate::installation::marketplace::doctor_marketplace_report(agent, options)
         }
@@ -610,7 +802,23 @@ pub(crate) fn doctor_integration_report(
             hermes::install::doctor_json_value(options, &runner)
                 .map_err(crate::error::CliError::Install)
         }
+    }?;
+    let proxy_ok = proxy.is_ok();
+    if let Some(object) = report.as_object_mut() {
+        let integration_ok = object
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        object.insert("ok".into(), serde_json::json!(integration_ok && proxy_ok));
+        object.insert(
+            "agent_proxy".into(),
+            match proxy {
+                Ok(details) => serde_json::json!({ "ok": true, "details": details }),
+                Err(details) => serde_json::json!({ "ok": false, "details": details }),
+            },
+        );
     }
+    Ok(report)
 }
 
 struct PendingIntegrationReadiness {
@@ -623,7 +831,8 @@ pub(crate) fn collect_default_integration_readiness()
 -> Vec<crate::installation::marketplace::HostPluginReadiness> {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let install_dir = crate::installation::marketplace::default_marketplace_install_dir();
+    let install_dir = resolved_agent_install_dir(None)
+        .unwrap_or_else(|_| crate::installation::marketplace::default_marketplace_install_dir());
     let agents = installed_integrations(&CodingAgent::ALL, Some(&install_dir));
     let pending = agents
         .into_iter()
@@ -760,8 +969,12 @@ pub(crate) use crate::process::portable_executable_path;
 pub(crate) use crate::process::shell_quote_arg_for_platform;
 #[cfg(test)]
 pub(crate) use crate::process::strip_windows_verbatim_prefix;
-pub(crate) use claude::host::{ClaudeSetupSnapshot, restore_claude_setup, snapshot_claude_setup};
-pub(crate) use codex::host::{CodexSetupSnapshot, restore_codex_setup, snapshot_codex_setup};
+pub(crate) use claude::host::{
+    ClaudeSetupSnapshot, restore_claude_setup, restore_claude_setup_cas, snapshot_claude_setup,
+};
+pub(crate) use codex::host::{
+    CodexSetupSnapshot, restore_codex_setup, restore_codex_setup_cas, snapshot_codex_setup,
+};
 
 use std::path::{Path, PathBuf};
 
@@ -776,7 +989,7 @@ use codex::host::{
 use shared::host::{current_exe, healthz, print_check, print_info};
 
 #[cfg(test)]
-pub(super) use crate::bootstrap::DEFAULT_URL;
+pub(super) use crate::bootstrap::LEGACY_FIXED_URL;
 
 pub(crate) fn install_codex_plugin_with_generation(
     gateway_url: &str,
@@ -791,22 +1004,21 @@ pub(crate) fn install_codex_plugin_with_generation(
     .map(|_| ())
 }
 
-pub(crate) fn stop_plugin_gateway() -> Result<(), String> {
-    crate::bootstrap::state::stop_owned_and_reset(crate::bootstrap::DEFAULT_URL)
-}
-
 pub(crate) fn uninstall_codex_plugin(gateway_url: &str, plugin_root: &Path) -> Result<(), String> {
     uninstall_codex(gateway_url, &plugin_root.join("hooks").join("hooks.json")).map(|_| ())
 }
 
+#[cfg(test)]
 pub(crate) fn enable_claude_provider(gateway_url: &str) -> Result<(), String> {
     claude::host::enable_claude_provider(gateway_url)
 }
 
+#[cfg(test)]
 pub(crate) fn restore_claude_provider(gateway_url: &str) -> Result<(), String> {
     claude::host::restore_claude_provider(gateway_url)
 }
 
+#[cfg(test)]
 pub(crate) fn doctor_plugin(
     agent: CodingAgent,
     gateway_url: &str,
@@ -839,14 +1051,14 @@ pub(crate) fn doctor_plugin_json(
     plugin_root: &Path,
 ) -> Result<Value, String> {
     let plugin_binary = current_exe().ok().is_some_and(|path| path.exists());
-    let sidecar_running = healthz(gateway_url);
+    let proxy_running = healthz(gateway_url);
     let (checks, ok, codex_trust) = match agent {
         CodingAgent::ClaudeCode => {
             let provider = claude_settings_base_url().as_deref() == Some(gateway_url);
             (
                 json!({
                     "plugin_binary": plugin_binary,
-                    "sidecar_running": sidecar_running,
+                    "proxy_service_running": proxy_running,
                     "claude_provider_routing": provider
                 }),
                 plugin_binary && provider,
@@ -866,7 +1078,7 @@ pub(crate) fn doctor_plugin_json(
             (
                 json!({
                     "plugin_binary": plugin_binary,
-                    "sidecar_running": sidecar_running,
+                    "proxy_service_running": proxy_running,
                     "codex_provider_alias": provider,
                     "codex_hooks": hooks,
                     "codex_hooks_trusted": hooks_trusted
@@ -884,10 +1096,10 @@ pub(crate) fn doctor_plugin_json(
     };
     let mut report = json!({
         "ok": ok,
-        "sidecar_health": if sidecar_running {
+        "proxy_service_health": if proxy_running {
             "running"
         } else {
-            "not_running_mcp_start"
+            "not_running"
         },
         "checks": checks
     });
@@ -909,11 +1121,11 @@ fn doctor_ok(
         current_exe().ok().is_some_and(|path| path.exists()),
     );
     if healthz(gateway_url) {
-        print_info("sidecar health", "running");
+        print_info("proxy service health", "running");
     } else {
         print_info(
-            "sidecar health",
-            "not running; the plugin MCP starts it when the host launches",
+            "proxy service health",
+            "not running; reinstall the enrolled agent or inspect the user service",
         );
     }
     match agent {
@@ -950,8 +1162,6 @@ fn doctor_ok(
     Ok(ok)
 }
 
-#[cfg(test)]
-use crate::bootstrap::*;
 #[cfg(test)]
 use crate::hooks::generated_hooks;
 #[cfg(test)]

@@ -9,12 +9,13 @@ SPDX-License-Identifier: Apache-2.0 */}
 
 Use `plugins.toml` when Relay should activate plugins from file configuration.
 The runtime discovers and layers this generic plugin document for direct Rust,
-Python, and Node.js integrations as well as for the `nemo-relay` CLI gateway.
+Python, and Node.js integrations as well as for the persistent coding-agent
+proxy.
 The file encodes the same document that binding APIs accept, but uses TOML at
 the file root.
 
 This guide documents runtime file discovery, precedence, merge behavior, and
-conflict rules. It also identifies gateway-only editor, explicit-config, and
+conflict rules. It also identifies proxy-only editor, explicit-config, and
 discoverable-plugin workflows. Each component guide documents its
 component-specific fields.
 
@@ -46,35 +47,26 @@ enabled = true
 
 [[components.config.atof.sinks]]
 type = "file"
-output_directory = "logs"
+output_directory = "/absolute/path/to/relay-output/atof"
 filename = "events.jsonl"
 mode = "append"
 ```
 
-For the most deterministic CLI-gateway verification path, keep `plugins.toml`
-in the same directory as the gateway `config.toml` file for this run, then
-launch the wrapper with that explicit config path. For example:
-
-```text
-path/to/
-  config.toml
-  plugins.toml
-```
-
-Run the gateway with the following command:
+For the most deterministic coding-agent verification path, write this document
+to the user plugin configuration and enroll one supported local client:
 
 ```bash
-nemo-relay --config path/to/config.toml run -- codex
+nemo-relay plugins edit --user
+nemo-relay install codex
+# Linux only: export CODEX_CA_CERTIFICATE="<path printed by install>"
+nemo-relay doctor codex
 ```
 
-This keeps plugin discovery scoped to the colocated `plugins.toml` instead of
-relying on implicit project, user, or system plugin files. The plugin file is
-the configuration being demonstrated here; `--config` only tells the gateway
-which config root to use for this run. If you prefer implicit discovery, place
-the file at `./.nemo-relay/plugins.toml` or another discovered location and
-ensure no higher-precedence plugin file overrides the exporter you want to
-verify. Refer to [CLI Basic Usage](/nemo-relay-cli/basic-usage) for the wrapper
-command shapes.
+The persistent proxy reads system and user configuration. It intentionally
+does not read project `.nemo-relay` configuration for coding-agent traffic.
+Direct Rust, Python, and Node.js integrations still use the complete discovery
+and explicit-config behavior described later in this guide. Refer to [CLI
+Basic Usage](/nemo-relay-cli/basic-usage) for enrollment and diagnostics.
 
 ## What Success Looks Like
 
@@ -83,7 +75,8 @@ The shortest-path setup is working when:
 - `nemo-relay` starts without plugin validation or activation errors.
 - The observability component activates the ATOF exporter configured in this
   file.
-- An instrumented gateway run writes ATOF JSONL output to `logs/events.jsonl`.
+- An enrolled client's managed provider call or lifecycle hook writes ATOF
+  JSONL output to the absolute `output_directory` configured above.
 
 After that path works, expand the config with additional components, policies,
 or higher-precedence files as needed.
@@ -133,11 +126,11 @@ Each built-in component has:
 | `enabled` | `true` | Relay validates disabled components but does not initialize them. |
 | `config` | `{}` | Component-local configuration object. The shape depends on `kind`. |
 
-## Gateway Discoverable Plugin Records
+## Manifest-backed Plugin Records
 
-Use `[[plugins.dynamic]]` only for a gateway-managed manifest-backed native or
+Use `[[plugins.dynamic]]` only for a Relay-managed manifest-backed native or
 worker plugin. These records remain separate from `[[components]]`. During
-gateway activation, Relay loads each enabled dynamic adapter, synthesizes its
+runtime activation, Relay loads each enabled dynamic adapter, synthesizes its
 internal component, and validates the component configuration.
 
 The following record configures a dynamic plugin:
@@ -179,15 +172,16 @@ File configuration comes from `plugins.toml`:
 
 The runtime does not read plugin configuration from `config.toml`.
 
-### Gateway Explicit Config
+### Explicit Plugin Lifecycle Configuration
 
-When the CLI gateway receives `--config path/to/config.toml`, it scopes plugin
-file discovery to `path/to/plugins.toml`. It does not load implicit system,
-project, or user plugin files for that run.
+Plugin lifecycle commands can receive `--config path/to/config.toml`; this
+scopes that command's plugin discovery to `path/to/plugins.toml`. The option
+does not launch a standalone service and does not override the persistent
+coding-agent proxy, which always resolves system and user policy.
 
 ### Default Discovery Locations
 
-When no gateway `--config` path overrides discovery, the runtime checks these
+Direct Rust, Python, and Node.js runtime initialization checks these
 `plugins.toml` locations from lowest to highest precedence:
 
 1. System: `/etc/nemo-relay/plugins.toml`
@@ -199,7 +193,10 @@ When no gateway `--config` path overrides discovery, the runtime checks these
 The runtime skips missing files. If no plugin config source exists,
 initialization continues without process-level plugin activation.
 
-## Gateway Editing Files
+The persistent coding-agent proxy deliberately loads only system and user
+plugin files; it excludes the project layer.
+
+## Editing Files
 
 Use the interactive editor for Observability, Adaptive, NeMo Guardrails, and
 PII Redaction configuration. The editor also updates the configuration of
@@ -380,8 +377,9 @@ field such as `enabled = false`.
 
 ## Validation
 
-Plugin validation runs before activation. Invalid plugin config blocks gateway
-startup instead of starting with a partially installed plugin set.
+Plugin validation runs before activation. Invalid plugin config blocks runtime
+or persistent-proxy startup instead of starting with a partially installed
+plugin set.
 
 Common validation failures include:
 
@@ -397,8 +395,12 @@ Common validation failures include:
   `nemo-relay plugins validate <plugin-id>` to check optional static schema
   validation for dynamic component config.
 
-Use `nemo-relay doctor` to inspect the resolved gateway configuration and
-plugin diagnostics. For Observability, doctor also reports enabled exporter
+Use `nemo-relay doctor` to inspect the configuration resolved for the current
+CLI invocation and its plugin diagnostics. This ordinary resolution can include
+the nearest project file; the persistent coding-agent proxy instead loads only
+system and user files. Use `nemo-relay doctor <agent>` to verify that an
+enrolled service still matches its persistent configuration fingerprint. For
+Observability, unscoped doctor also reports enabled exporter
 sections, checks writable file exporter directories, probes configured ATOF
 stream sinks, and checks reachable OTLP endpoints when those settings
 are present. For model pricing, doctor validates enabled file and inline
@@ -409,12 +411,12 @@ resolved manifest references and host configuration status.
 
 ## Relationship to `config.toml`
 
-`config.toml` owns gateway and agent setup, such as upstream provider base URLs
-and agent command configuration. `plugins.toml` owns reusable runtime behavior
-installed by the plugin system.
+`config.toml` owns host/runtime settings such as operational limits and direct
+runtime upstream configuration. `plugins.toml` owns reusable runtime behavior
+installed by the plugin system. The persistent coding-agent proxy accepts only
+native provider bases and ignores wrapper-era agent command configuration.
 
-Keep all long-lived plugin setup in `plugins.toml`. `config.toml` owns gateway
-and agent setup only.
+Keep all long-lived plugin setup in `plugins.toml`.
 
 Legacy observability config sections in `config.toml`, such as `[exporters]`,
 `[observability]`, and `[export.openinference]`, are not supported. Configure

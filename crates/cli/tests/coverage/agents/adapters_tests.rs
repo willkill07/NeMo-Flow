@@ -837,6 +837,11 @@ fn maps_hermes_api_hooks_to_llm_lifecycle() {
                 json!(false)
             );
             assert_eq!(event.metadata["provider_payload_exact"], json!(false));
+            assert_eq!(
+                event.metadata["observability_mode"],
+                json!("hook_only_degraded")
+            );
+            assert_eq!(event.metadata["managed_inference"], json!(false));
         }
         event => panic!("unexpected event: {event:?}"),
     }
@@ -867,6 +872,111 @@ fn maps_hermes_api_hooks_to_llm_lifecycle() {
             assert_eq!(event.api_call_id, "hermes-session:task-1:2");
             assert_eq!(event.response["usage"]["prompt_tokens"], json!(10));
             assert_eq!(event.response["usage"]["completion_tokens"], json!(5));
+        }
+        event => panic!("unexpected event: {event:?}"),
+    }
+}
+
+#[test]
+fn labels_known_native_hermes_providers_as_managed_proxy_traffic() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        crate::claude_desktop::ENROLLED_AGENT_HEADER,
+        "hermes".parse().unwrap(),
+    );
+    for (provider, base_url) in [
+        ("openai", Some("https://api.openai.com/v1")),
+        ("custom", Some("https://chatgpt.com/backend-api/codex")),
+        ("anthropic", Some("https://api.anthropic.com/v1/messages")),
+    ] {
+        let outcome = hermes::adapt(
+            json!({
+                "hook_event_name": "pre_api_request",
+                "session_id": "hermes-session",
+                "extra": {
+                    "task_id": "task-1",
+                    "api_call_count": 1,
+                    "model": "native-model",
+                    "provider": provider,
+                    "base_url": base_url
+                }
+            }),
+            &headers,
+        );
+        match &outcome.events[0] {
+            NormalizedEvent::LlmStarted(event) => {
+                assert_eq!(event.metadata["observability_mode"], json!("managed_proxy"));
+                assert_eq!(event.metadata["managed_inference"], json!(true));
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+    }
+}
+
+#[test]
+fn hermes_provider_labels_without_native_host_evidence_are_degraded() {
+    let mut enrolled_headers = HeaderMap::new();
+    enrolled_headers.insert(
+        crate::claude_desktop::ENROLLED_AGENT_HEADER,
+        "hermes".parse().unwrap(),
+    );
+    for extra in [
+        json!({"provider": "openai"}),
+        json!({"provider": "anthropic"}),
+        json!({"provider": "openai", "base_url": "https://compatible.example/v1"}),
+        json!({"provider": "openai", "base_url": "http://api.openai.com/v1"}),
+        json!({"provider": "openai", "base_url": "https://api.openai.com:8443/v1"}),
+        json!({"provider": "openai", "base_url": "https://user:secret@api.openai.com/v1"}),
+        json!({"provider": "openai", "base_url": "https://api.openai.com/v1?route=other"}),
+        json!({"provider": "openai", "base_url": "https://api.openai.com/v1#other"}),
+        json!({"provider": "openai", "base_url": "https://api.openai.com/arbitrary"}),
+    ] {
+        let mut payload = json!({
+            "hook_event_name": "pre_api_request",
+            "session_id": "hermes-session",
+            "extra": {
+                "task_id": "task-1",
+                "api_call_count": 1,
+                "model": "compatible-model"
+            }
+        });
+        payload["extra"]
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let outcome = hermes::adapt(payload, &enrolled_headers);
+        match &outcome.events[0] {
+            NormalizedEvent::LlmStarted(event) => {
+                assert_eq!(
+                    event.metadata["observability_mode"],
+                    json!("hook_only_degraded")
+                );
+                assert_eq!(event.metadata["managed_inference"], json!(false));
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+    }
+
+    let outcome = hermes::adapt(
+        json!({
+            "hook_event_name": "pre_api_request",
+            "session_id": "hermes-session",
+            "extra": {
+                "task_id": "task-1",
+                "api_call_count": 1,
+                "provider": "openai",
+                "base_url": "https://api.openai.com/v1"
+            }
+        }),
+        &HeaderMap::new(),
+    );
+    match &outcome.events[0] {
+        NormalizedEvent::LlmStarted(event) => {
+            assert_eq!(
+                event.metadata["observability_mode"],
+                json!("hook_only_degraded")
+            );
+            assert_eq!(event.metadata["managed_inference"], json!(false));
         }
         event => panic!("unexpected event: {event:?}"),
     }
@@ -1037,6 +1147,31 @@ fn maps_hermes_null_request_as_lossy_summary() {
     }
 }
 
+fn normalized_mark_fields<'a>(
+    event: &'a NormalizedEvent,
+    expected: &str,
+    event_name: &str,
+) -> (&'a str, &'a Value, &'a Value) {
+    match event {
+        NormalizedEvent::PromptSubmitted(event) if expected == "prompt" => {
+            (event.session_id.as_str(), &event.metadata, &event.payload)
+        }
+        NormalizedEvent::LlmHint(event) if expected == "response" => {
+            (event.session_id.as_str(), &event.metadata, &event.payload)
+        }
+        NormalizedEvent::Compaction(event) if expected == "compact" => {
+            (event.session_id.as_str(), &event.metadata, &event.payload)
+        }
+        NormalizedEvent::Notification(event) if expected == "notification" => {
+            (event.session_id.as_str(), &event.metadata, &event.payload)
+        }
+        NormalizedEvent::HookMark(event) if expected == "hook" => {
+            (event.session_id.as_str(), &event.metadata, &event.payload)
+        }
+        event => panic!("unexpected event for {event_name}: {event:?}"),
+    }
+}
+
 #[test]
 fn normalizes_mark_style_events_and_header_session_ids() {
     let mut headers = HeaderMap::new();
@@ -1060,24 +1195,8 @@ fn normalizes_mark_style_events_and_header_session_ids() {
             }),
             &headers,
         );
-        let (session_id, metadata, payload) = match &outcome.events[0] {
-            NormalizedEvent::PromptSubmitted(event) if expected == "prompt" => {
-                (event.session_id.as_str(), &event.metadata, &event.payload)
-            }
-            NormalizedEvent::LlmHint(event) if expected == "response" => {
-                (event.session_id.as_str(), &event.metadata, &event.payload)
-            }
-            NormalizedEvent::Compaction(event) if expected == "compact" => {
-                (event.session_id.as_str(), &event.metadata, &event.payload)
-            }
-            NormalizedEvent::Notification(event) if expected == "notification" => {
-                (event.session_id.as_str(), &event.metadata, &event.payload)
-            }
-            NormalizedEvent::HookMark(event) if expected == "hook" => {
-                (event.session_id.as_str(), &event.metadata, &event.payload)
-            }
-            event => panic!("unexpected event for {event_name}: {event:?}"),
-        };
+        let (session_id, metadata, payload) =
+            normalized_mark_fields(&outcome.events[0], expected, event_name);
         if expected == "prompt" {
             assert!(
                 matches!(outcome.events.get(1), Some(NormalizedEvent::LlmHint(_))),

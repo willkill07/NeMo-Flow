@@ -4,12 +4,13 @@
 //! Gateway request validation, buffering, and normalized LLM start construction.
 
 use std::borrow::Cow;
-use std::error::Error;
 use std::io::Read;
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Request, header};
-use http_body_util::LengthLimitError;
+use bytes::BytesMut;
+use futures_util::StreamExt;
 use nemo_relay::api::llm::LlmRequest;
 use serde_json::{Value, json};
 
@@ -23,6 +24,25 @@ use super::routes::{
     gateway_upstream_url_override,
 };
 
+const REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum ManagedRequestTransport {
+    #[default]
+    Http,
+    WebSocket,
+}
+
+impl ManagedRequestTransport {
+    const fn label(self, streaming: bool) -> &'static str {
+        match (self, streaming) {
+            (Self::Http, true) => "http_sse",
+            (Self::Http, false) => "http",
+            (Self::WebSocket, _) => "websocket",
+        }
+    }
+}
+
 pub(super) struct PreparedGatewayRequest {
     pub(super) method: Method,
     pub(super) headers: HeaderMap,
@@ -32,7 +52,9 @@ pub(super) struct PreparedGatewayRequest {
     pub(super) body_bytes: Bytes,
     pub(super) request_json: Value,
     pub(super) streaming: bool,
+    pub(super) transport: &'static str,
     pub(super) authorization: crate::provider_auth::ProviderRequestAuthorization,
+    pub(super) agent_route: Option<crate::claude_desktop::AgentRouteContext>,
 }
 
 pub(super) async fn prepare_gateway_request(
@@ -41,20 +63,41 @@ pub(super) async fn prepare_gateway_request(
     mut authorization: crate::provider_auth::ProviderRequestAuthorization,
 ) -> Result<PreparedGatewayRequest, CliError> {
     let (mut parts, body) = request.into_parts();
+    let agent_route = parts
+        .extensions
+        .remove::<crate::claude_desktop::AgentRouteContext>();
+    let transport = parts
+        .extensions
+        .remove::<ManagedRequestTransport>()
+        .unwrap_or_default();
     parts.headers.remove(BOOTSTRAP_CLIENT_TOKEN_HEADER);
     let provider = ProviderRoute::from_path(parts.uri.path()).ok_or_else(|| {
         CliError::InvalidPayload(format!("unsupported gateway path {}", parts.uri.path()))
     })?;
-    let body_bytes = axum::body::to_bytes(body, config.max_passthrough_body_bytes)
-        .await
-        .map_err(passthrough_body_error)?;
-    let request_json = request_body_for_observability(
+    if agent_route
+        .as_ref()
+        .is_some_and(|route| !provider.allowed_for_agent(&route.agent))
+    {
+        return Err(CliError::InvalidPayload(
+            "agent credential is not authorized for this provider route".into(),
+        ));
+    }
+    let body_bytes = collect_request_body(
+        body,
+        config.max_passthrough_body_bytes,
+        REQUEST_BODY_IDLE_TIMEOUT,
+    )
+    .await?;
+    let managed_body = request_body_for_observability(
         &body_bytes,
         &parts.headers,
         config.max_passthrough_body_bytes,
-    )
-    .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
-    .unwrap_or(Value::Null);
+    )?;
+    let request_json = serde_json::from_slice::<Value>(&managed_body).map_err(|error| {
+        CliError::InvalidPayload(format!(
+            "managed provider request body must be valid JSON: {error}"
+        ))
+    })?;
     let path_and_query = parts
         .uri
         .path_and_query()
@@ -64,6 +107,7 @@ pub(super) async fn prepare_gateway_request(
         provider,
         &parts.headers,
         path_and_query,
+        authorization.allow_configured_provider_auth,
         authorization.allow_environment_provider_auth,
         config,
     )
@@ -71,16 +115,18 @@ pub(super) async fn prepare_gateway_request(
     parts.headers = super::routes::strip_replaceable_agent_auth_headers(
         &parts.headers,
         provider,
+        authorization.allow_configured_provider_auth,
         authorization.allow_environment_provider_auth,
         provider.configured_auth_header(config),
     );
     authorization.source_credential = authorization
         .source_credential
         .after_source_normalization(&parts.headers);
-    let streaming = request_json
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let streaming = transport == ManagedRequestTransport::WebSocket
+        || request_json
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     Ok(PreparedGatewayRequest {
         method: parts.method,
         headers: parts.headers,
@@ -90,31 +136,39 @@ pub(super) async fn prepare_gateway_request(
         body_bytes,
         request_json,
         streaming,
+        transport: transport.label(streaming),
         authorization,
+        agent_route,
     })
 }
 
-// Decodes the transport body only for Relay's managed request representation. The original bytes
-// and Content-Encoding header remain on PreparedGatewayRequest so unsupported or malformed
-// encodings still pass through unchanged. When the managed pipeline reserializes decoded JSON,
-// effective_dispatch_request removes Content-Encoding from the identity-encoded upstream body.
+// Decodes the transport body for Relay's managed request representation. Managed routes fail
+// closed when an encoding is unsupported, malformed, or expands past the configured limit; no
+// opaque provider body may bypass request guardrails. When the managed pipeline reserializes
+// decoded JSON, effective_dispatch_request removes Content-Encoding from the identity-encoded
+// upstream body.
 fn request_body_for_observability<'a>(
     body: &'a [u8],
     headers: &HeaderMap,
     max_decoded_bytes: usize,
-) -> Option<Cow<'a, [u8]>> {
+) -> Result<Cow<'a, [u8]>, CliError> {
     let mut encodings = Vec::new();
     for value in headers.get_all(header::CONTENT_ENCODING) {
-        for encoding in value.to_str().ok()?.split(',') {
+        let value = value.to_str().map_err(|_| {
+            CliError::InvalidPayload("Content-Encoding must contain visible ASCII".into())
+        })?;
+        for encoding in value.split(',') {
             let encoding = encoding.trim();
             if encoding.is_empty() {
-                return None;
+                return Err(CliError::InvalidPayload(
+                    "Content-Encoding contains an empty coding".into(),
+                ));
             }
             encodings.push(encoding.to_ascii_lowercase());
         }
     }
     if encodings.is_empty() {
-        return Some(Cow::Borrowed(body));
+        return Ok(Cow::Borrowed(body));
     }
 
     let mut decoded = Cow::Borrowed(body);
@@ -122,23 +176,43 @@ fn request_body_for_observability<'a>(
         match encoding.as_str() {
             "identity" => {}
             "zstd" => decoded = Cow::Owned(decode_zstd(&decoded, max_decoded_bytes)?),
-            _ => return None,
+            _ => {
+                return Err(CliError::InvalidPayload(format!(
+                    "unsupported Content-Encoding {encoding:?} on a managed provider route"
+                )));
+            }
         }
     }
-    (decoded.len() <= max_decoded_bytes).then_some(decoded)
+    if decoded.len() > max_decoded_bytes {
+        return Err(CliError::PayloadTooLarge(format!(
+            "decoded request body exceeds the {max_decoded_bytes}-byte Relay limit"
+        )));
+    }
+    Ok(decoded)
 }
 
-fn decode_zstd(body: &[u8], max_decoded_bytes: usize) -> Option<Vec<u8>> {
-    let mut decoder = zstd::stream::read::Decoder::new(body).ok()?;
+fn decode_zstd(body: &[u8], max_decoded_bytes: usize) -> Result<Vec<u8>, CliError> {
+    let mut decoder = zstd::stream::read::Decoder::new(body)
+        .map_err(|error| CliError::InvalidPayload(format!("invalid zstd request body: {error}")))?;
     decoder
         .window_log_max(zstd_window_log_max(max_decoded_bytes))
-        .ok()?;
+        .map_err(|error| {
+            CliError::InvalidPayload(format!("invalid zstd request window: {error}"))
+        })?;
     let limit = u64::try_from(max_decoded_bytes)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
     let mut decoded = Vec::new();
-    decoder.take(limit).read_to_end(&mut decoded).ok()?;
-    (decoded.len() <= max_decoded_bytes).then_some(decoded)
+    decoder
+        .take(limit)
+        .read_to_end(&mut decoded)
+        .map_err(|error| CliError::InvalidPayload(format!("invalid zstd request body: {error}")))?;
+    if decoded.len() > max_decoded_bytes {
+        return Err(CliError::PayloadTooLarge(format!(
+            "decoded request body exceeds the {max_decoded_bytes}-byte Relay limit"
+        )));
+    }
+    Ok(decoded)
 }
 
 pub(super) fn zstd_window_log_max(max_decoded_bytes: usize) -> u32 {
@@ -149,16 +223,32 @@ pub(super) fn zstd_window_log_max(max_decoded_bytes: usize) -> u32 {
     required_log.clamp(ZSTD_WINDOW_LOG_MIN, ZSTD_WINDOW_LOG_MAX)
 }
 
-fn passthrough_body_error(error: axum::Error) -> CliError {
-    if error.source().is_some_and(|source| {
-        source.is::<LengthLimitError>()
-            || source
-                .source()
-                .is_some_and(|source| source.is::<LengthLimitError>())
-    }) {
-        CliError::PayloadTooLarge(error.to_string())
-    } else {
-        CliError::InvalidPayload(error.to_string())
+async fn collect_request_body(
+    body: Body,
+    limit: usize,
+    idle_timeout: Duration,
+) -> Result<Bytes, CliError> {
+    let mut stream = body.into_data_stream();
+    let mut output = BytesMut::new();
+    loop {
+        let chunk = tokio::time::timeout(idle_timeout, stream.next())
+            .await
+            .map_err(|_| {
+                CliError::InvalidPayload(format!(
+                    "request body made no progress for {} seconds",
+                    idle_timeout.as_secs()
+                ))
+            })?;
+        let Some(chunk) = chunk else {
+            return Ok(output.freeze());
+        };
+        let chunk = chunk.map_err(|error| CliError::InvalidPayload(error.to_string()))?;
+        if output.len().saturating_add(chunk.len()) > limit {
+            return Err(CliError::PayloadTooLarge(format!(
+                "request body exceeds the {limit}-byte Relay limit"
+            )));
+        }
+        output.extend_from_slice(&chunk);
     }
 }
 
@@ -205,6 +295,9 @@ pub(super) fn build_llm_gateway_start(request: &PreparedGatewayRequest) -> LlmGa
             content: request.request_json.clone(),
         },
         streaming: request.streaming,
-        metadata: json!({ "gateway_path": request.path }),
+        metadata: json!({
+            "gateway_path": request.path,
+            "transport": request.transport,
+        }),
     }
 }

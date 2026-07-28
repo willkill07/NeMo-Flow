@@ -10,129 +10,120 @@ use serde_json::Value;
 use crate::error::CliError;
 use crate::installation::generation::{ActiveGenerationGuard, InstallGeneration};
 
-use super::destination::{
-    HookGatewayLifecycle, hook_destination, recovery_plan, transparent_gateway_spec,
-    transparent_run_active, wait_for_existing_gateway,
-};
-use super::response::MAX_HOOK_RESPONSE_BYTES;
-use super::response::{handle_hook_forward_response, handle_verified_hook_forward_response};
+use super::response::handle_hook_forward_response;
 use super::{GatewayMode, HookForwardRequest};
 
 const HOOK_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+const HOOK_INPUT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) async fn hook_forward(command: HookForwardRequest) -> Result<(), CliError> {
-    // A transparent wrapper can coexist with any installed Relay plugin. Its process marker makes
-    // persistent plugin hooks inert, while only the wrapper-owned command carries
-    // `--transparent-run` and forwards to the process-private gateway. This avoids rewriting host
-    // plugin settings and works for both installer and source-marketplace plugin identities.
-    if transparent_run_active() && !command.transparent_run {
-        return Ok(());
+    if !command.fail_closed {
+        return handle_hook_error(
+            CliError::Launch(
+                "unfenced hook forwarding was removed; reinstall this coding-agent integration"
+                    .into(),
+            ),
+            true,
+        );
     }
     validate_optional_json("session metadata", command.session_metadata.as_deref())?;
-    let fail_closed =
-        command.fail_closed || std::env::var("NEMO_RELAY_FAIL_CLOSED").ok().as_deref() == Some("1");
-    let desktop_gateway = if should_validate_claude_desktop(&command) {
-        match crate::claude_desktop::hook_gateway() {
-            Ok(gateway) => gateway,
-            Err(error) => {
-                // A missing or modified fail-closed marker is itself a Desktop protection failure.
-                // Do not let that same missing marker downgrade the hook to the direct
-                // integration's fail-open behavior.
-                return handle_hook_error(CliError::Launch(error), true);
-            }
+    let fail_closed = true;
+    let enrollment = match crate::claude_desktop::hook_enrollment(command.agent) {
+        Ok(Some(enrollment)) => enrollment,
+        Ok(None) => {
+            return handle_hook_error(
+                CliError::Launch(format!(
+                    "{} is not enrolled in the per-user coding-agent proxy",
+                    command.agent.label()
+                )),
+                fail_closed,
+            );
         }
-    } else {
-        None
+        Err(error) => return handle_hook_error(CliError::Launch(error), fail_closed),
     };
-    let destination = hook_destination(&command);
-    let persistent = match desktop_gateway {
-        Some(gateway) => Some(gateway),
-        None => match persistent_gateway(&destination) {
-            Ok(persistent) => persistent,
-            Err(error) => return handle_hook_error(error, fail_closed),
-        },
+    let destination = command
+        .gateway_url
+        .as_deref()
+        .unwrap_or(&enrollment.gateway_url);
+    if enrollment.gateway_url.trim_end_matches('/') != destination.trim_end_matches('/') {
+        return handle_hook_error(
+            CliError::Launch(format!(
+                "{} hook targets {destination}, but its enrolled proxy endpoint is {}; reinstall the integration",
+                command.agent.label(),
+                enrollment.gateway_url
+            )),
+            fail_closed,
+        );
     };
-    let transparent_gateway = match command
-        .transparent_run
-        .then(|| transparent_gateway_spec(&destination.gateway_url))
-        .transpose()
+    if let Err(error) =
+        crate::claude_desktop::verify_hook_enrollment_health(command.agent, &enrollment)
     {
-        Ok(gateway) => gateway,
-        Err(error) => return handle_hook_error(error, fail_closed),
-    };
-    let _generation_guard = match capture_generation_guard(&command, destination.lifecycle) {
-        Ok(guard) => guard,
-        Err(error) => return handle_hook_error(error, fail_closed),
-    };
-    let input = match read_hook_payload(persistent.as_ref().map_or(
-        crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
-        |launch| launch.max_hook_payload_bytes,
-    )) {
+        return handle_hook_error(CliError::Launch(error), fail_closed);
+    }
+    let input = match read_hook_payload(enrollment.max_hook_payload_bytes) {
         Ok(input) => input,
         Err(error) => return handle_hook_error(error, fail_closed),
     };
-    if destination.lifecycle == HookGatewayLifecycle::Existing {
-        let gateway = persistent
-            .as_ref()
-            .expect("existing persistent destinations resolve a gateway")
-            .gateway
-            .clone();
-        if let Err(error) =
-            wait_for_existing_gateway(gateway, destination.gateway_url.clone()).await
-        {
-            return handle_hook_error(error, fail_closed);
-        }
+    let _generation_guard = match capture_generation_guard(&command) {
+        Ok(guard) => guard,
+        Err(error) => return handle_hook_error(error, fail_closed),
+    };
+    if let Err(error) =
+        crate::claude_desktop::verify_hook_enrollment_health(command.agent, &enrollment)
+    {
+        return handle_hook_error(CliError::Launch(error), fail_closed);
     }
-    let verified_gateway = persistent
-        .as_ref()
-        .map(|launch| &launch.gateway)
-        .or(transparent_gateway.as_ref());
-    if let Some(gateway) = verified_gateway {
-        let response = match send_verified_hook_forward_request(
-            &command,
-            gateway,
-            &destination.gateway_url,
-            input,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => return handle_hook_error(error, fail_closed),
-        };
-        return handle_verified_hook_forward_response(response, fail_closed);
+    if let Err(error) = verify_hook_host_configuration(&command, destination) {
+        return handle_hook_error(CliError::Launch(error), fail_closed);
     }
 
     let url = format!(
         "{}{}",
-        destination.gateway_url.trim_end_matches('/'),
+        destination.trim_end_matches('/'),
         command.agent.hook_path()
     );
-    let response = match send_hook_forward_request(&command, &url, input).await {
+    let response = match send_hook_forward_request(
+        &command,
+        &url,
+        input,
+        Some(enrollment.authorization.as_str()),
+        Some(enrollment.root_ca_pem.as_path()),
+    )
+    .await
+    {
         Ok(response) => response,
         Err(error) => return handle_hook_error(error, fail_closed),
     };
     handle_hook_forward_response(response, fail_closed).await
 }
 
-pub(crate) fn should_validate_claude_desktop(command: &HookForwardRequest) -> bool {
-    command.agent.uses_claude_desktop_protection() && !command.transparent_run
-}
-
-fn persistent_gateway(
-    destination: &super::destination::HookDestination,
-) -> Result<Option<crate::bootstrap::PluginGatewaySpec>, CliError> {
-    (destination.lifecycle != HookGatewayLifecycle::Transparent)
-        .then(|| recovery_plan(&destination.gateway_url))
-        .transpose()
+fn verify_hook_host_configuration(
+    command: &HookForwardRequest,
+    gateway_url: &str,
+) -> Result<(), String> {
+    let generation_file = command.generation_file.as_deref().ok_or_else(|| {
+        format!(
+            "{} hook is missing its generation path",
+            command.agent.label()
+        )
+    })?;
+    let generation_token = command.generation_token.as_deref().ok_or_else(|| {
+        format!(
+            "{} hook is missing its generation identity",
+            command.agent.label()
+        )
+    })?;
+    crate::agents::verify_hook_host_configuration(
+        command.agent,
+        gateway_url,
+        generation_file,
+        generation_token,
+    )
 }
 
 fn capture_generation_guard(
     command: &HookForwardRequest,
-    lifecycle: HookGatewayLifecycle,
 ) -> Result<Option<ActiveGenerationGuard>, CliError> {
-    if lifecycle != HookGatewayLifecycle::Existing || command.forward_only {
-        return Ok(None);
-    }
     let install_host = command.agent.install_arg();
     let generation_file = command.generation_file.clone().ok_or_else(|| {
         CliError::Launch(format!(
@@ -179,7 +170,35 @@ fn handle_hook_error(error: CliError, fail_closed: bool) -> Result<(), CliError>
 // Reads the native hook payload from stdin and normalizes empty payloads to JSON object syntax.
 // This keeps hook commands observable even for agents or events that invoke hooks without input.
 fn read_hook_payload(limit: usize) -> Result<String, CliError> {
-    read_hook_payload_from(std::io::stdin(), limit)
+    read_hook_payload_with_timeout(std::io::stdin(), limit, HOOK_INPUT_TIMEOUT)
+}
+
+pub(crate) fn read_hook_payload_with_timeout(
+    reader: impl Read + Send + 'static,
+    limit: usize,
+    timeout: Duration,
+) -> Result<String, CliError> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("nemo-relay-hook-input".into())
+        .spawn(move || {
+            let _ = sender.send(read_hook_payload_from(reader, limit));
+        })
+        .map_err(|error| {
+            CliError::Install(format!(
+                "failed to start bounded hook input reader: {error}"
+            ))
+        })?;
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(CliError::Install(format!(
+            "hook payload was not closed within {} seconds",
+            timeout.as_secs_f64()
+        ))),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(CliError::Install(
+            "hook payload reader stopped before returning input".into(),
+        )),
+    }
 }
 
 pub(crate) fn read_hook_payload_from(reader: impl Read, limit: usize) -> Result<String, CliError> {
@@ -201,67 +220,53 @@ pub(crate) fn read_hook_payload_from(reader: impl Read, limit: usize) -> Result<
     }
 }
 
-pub(crate) async fn send_verified_hook_forward_request(
-    command: &HookForwardRequest,
-    gateway: &crate::bootstrap::GatewaySpec,
-    gateway_url: &str,
-    input: String,
-) -> Result<
-    Result<crate::gateway::client::VerifiedHttpResponse, crate::gateway::client::VerifiedHttpError>,
-    CliError,
-> {
-    let headers = gateway_headers(
-        command.profile.as_deref(),
-        command.session_metadata.as_deref(),
-        command.gateway_mode,
-    )?
-    .iter()
-    .map(|(name, value)| {
-        value
-            .to_str()
-            .map(|value| (name.as_str().to_string(), value.to_string()))
-            .map_err(|error| {
-                CliError::Install(format!(
-                    "hook header {name} is not valid HTTP text: {error}"
-                ))
-            })
-    })
-    .collect::<Result<Vec<_>, _>>()?;
-    let gateway = gateway.clone();
-    let gateway_url = gateway_url.to_string();
-    let path = command.agent.hook_path().to_string();
-    tokio::task::spawn_blocking(move || {
-        gateway.post_verified(
-            &gateway_url,
-            &path,
-            &headers,
-            input.as_bytes(),
-            HOOK_FORWARD_TIMEOUT,
-            MAX_HOOK_RESPONSE_BYTES,
-        )
-    })
-    .await
-    .map_err(|error| CliError::Launch(format!("verified hook request task failed: {error}")))
-}
-
 // Sends the hook payload with gateway-specific headers translated from CLI flags. The reqwest
-// transport result is returned separately so response handling can preserve fail-open semantics.
+// transport result is returned separately so response handling can preserve the provider reply.
 async fn send_hook_forward_request(
     command: &HookForwardRequest,
     url: &str,
     input: String,
+    authorization: Option<&str>,
+    root_ca_pem: Option<&std::path::Path>,
 ) -> Result<Result<reqwest::Response, reqwest::Error>, CliError> {
-    Ok(reqwest::Client::builder()
+    let mut client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(HOOK_FORWARD_TIMEOUT)
-        .build()?
-        .post(url)
-        .headers(gateway_headers(
-            command.profile.as_deref(),
-            command.session_metadata.as_deref(),
-            command.gateway_mode,
-        )?)
+        .timeout(HOOK_FORWARD_TIMEOUT);
+    if let Some(path) = root_ca_pem {
+        let bytes = crate::filesystem::bounded::read_bounded_regular_file(
+            path,
+            "coding-agent proxy hook trust anchor",
+        )
+        .map_err(CliError::Install)?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&bytes).map_err(|error| {
+            CliError::Install(format!(
+                "failed to parse coding-agent proxy hook trust anchor {}: {error}",
+                path.display()
+            ))
+        })?;
+        if certificates.is_empty() {
+            return Err(CliError::Install(format!(
+                "coding-agent proxy hook trust anchor {} contains no certificates",
+                path.display()
+            )));
+        }
+        for certificate in certificates {
+            client = client.add_root_certificate(certificate);
+        }
+    }
+    let mut request = client.build()?.post(url).headers(gateway_headers(
+        command.profile.as_deref(),
+        command.session_metadata.as_deref(),
+        command.gateway_mode,
+    )?);
+    if let Some(authorization) = authorization {
+        request = request.header(
+            crate::claude_desktop::AGENT_AUTHORIZATION_HEADER,
+            authorization,
+        );
+    }
+    Ok(request
         .header(CONTENT_TYPE, "application/json")
         .body(input)
         .send()

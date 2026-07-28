@@ -33,6 +33,7 @@ impl PluginSetupSnapshot {
 pub(crate) trait MarketplaceHost: Copy {
     fn install_arg(self) -> &'static str;
     fn label(self) -> &'static str;
+    fn enrolled_proxy_url(self) -> Result<String, String>;
     fn executable(self) -> &'static str;
     fn validate_version_output(self, output: &str) -> Result<(), String>;
     fn version_requirement(self) -> String;
@@ -40,7 +41,6 @@ pub(crate) trait MarketplaceHost: Copy {
     fn plugin_manifest_relative(self) -> &'static [&'static str];
     fn marketplace_manifest(self, marketplace: &str, plugin: &str) -> Value;
     fn plugin_manifest(self, plugin: &str) -> Value;
-    fn plugin_mcp_config(self, server: Value) -> Result<Value, String>;
     fn plugin_hooks(
         self,
         relay: &Path,
@@ -56,8 +56,6 @@ pub(crate) trait MarketplaceHost: Copy {
     ) -> Result<HostRegistrationReport, String>;
     fn setup_may_mutate_before_success(self) -> bool;
     fn unsafe_generation_fence_error(self, problem: &str) -> String;
-    fn accepts_legacy_hook_only_plugin(self) -> bool;
-    fn accepts_mcp_environment_superset(self) -> bool;
     fn local_install_exists(
         self,
         marketplace_root: &Path,

@@ -81,6 +81,80 @@ fn backups_and_snapshots_restore_original_or_missing_files() {
     assert!(!missing.exists());
 }
 
+#[test]
+fn snapshot_compare_and_swap_preserves_concurrent_edits() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("settings.json");
+    std::fs::write(&path, b"before").unwrap();
+    let before = snapshot_optional_file(&path).unwrap();
+    std::fs::write(&path, b"relay-value").unwrap();
+    let relay_value = snapshot_optional_file(&path).unwrap();
+    std::fs::write(&path, b"concurrent-user-value").unwrap();
+
+    let error = restore_file_snapshot_cas(&before, Some(&relay_value)).unwrap_err();
+    assert!(error.contains("changed outside"), "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"concurrent-user-value");
+
+    std::fs::write(&path, b"relay-value").unwrap();
+    restore_file_snapshot_cas(&before, Some(&relay_value)).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"before");
+}
+
+#[test]
+fn directory_snapshots_restore_exact_trees_and_original_absence() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("marketplace");
+    std::fs::create_dir_all(root.join("plugins/nemo-relay")).unwrap();
+    std::fs::write(root.join("marketplace.json"), b"original manifest").unwrap();
+    std::fs::write(
+        root.join("plugins/nemo-relay/hooks.json"),
+        b"original hooks",
+    )
+    .unwrap();
+    let existing = DirectorySnapshot::capture(&root).unwrap();
+
+    std::fs::remove_file(root.join("marketplace.json")).unwrap();
+    std::fs::write(root.join("plugins/nemo-relay/hooks.json"), b"changed hooks").unwrap();
+    std::fs::write(root.join("unowned.txt"), b"must disappear").unwrap();
+    existing.restore().unwrap();
+
+    assert_eq!(
+        std::fs::read(root.join("marketplace.json")).unwrap(),
+        b"original manifest"
+    );
+    assert_eq!(
+        std::fs::read(root.join("plugins/nemo-relay/hooks.json")).unwrap(),
+        b"original hooks"
+    );
+    assert!(!root.join("unowned.txt").exists());
+
+    let missing_root = directory.path().join("missing-marketplace");
+    let missing = DirectorySnapshot::capture(&missing_root).unwrap();
+    std::fs::create_dir_all(&missing_root).unwrap();
+    std::fs::write(missing_root.join("temporary"), b"temporary").unwrap();
+    missing.restore().unwrap();
+    assert!(!missing_root.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_snapshots_reject_symbolic_links() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("marketplace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(directory.path().join("outside"), b"outside").unwrap();
+    symlink(directory.path().join("outside"), root.join("link")).unwrap();
+
+    let error = DirectorySnapshot::capture(&root).unwrap_err();
+
+    assert!(error.contains("symbolic link"), "{error}");
+
+    let file_error = snapshot_optional_file(&root.join("link")).unwrap_err();
+    assert!(file_error.contains("symbolic-link"), "{file_error}");
+}
+
 #[cfg(unix)]
 #[test]
 fn private_atomic_write_ignores_a_permissive_umask() {

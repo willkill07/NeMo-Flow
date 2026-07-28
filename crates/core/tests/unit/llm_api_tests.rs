@@ -13,11 +13,15 @@ use tokio_stream::StreamExt;
 
 use super::{
     LlmCallExecuteParams, LlmCallParams, LlmHandle, LlmRequest, LlmStreamCallExecuteParams,
-    emit_optimization_marks_with, llm_call, llm_call_execute, llm_stream_call_execute,
-    project_llm_request_to_current_user_turn,
+    PROVIDER_CREDENTIAL_HEADER_NAMES_HEADER, emit_optimization_marks_with, llm_call,
+    llm_call_execute, llm_stream_call_execute, project_llm_request_to_current_user_turn,
+    redact_provider_credentials,
 };
 use crate::api::event::{Event, ScopeCategory};
 use crate::api::optimization::finalize_optimization_summary;
+use crate::api::registry::{
+    deregister_scope_sanitize_start_guardrail, register_scope_sanitize_start_guardrail,
+};
 use crate::api::runtime::LlmJsonStream;
 use crate::api::runtime::{
     NemoRelayContextState, create_scope_stack, global_context, set_thread_scope_stack,
@@ -51,6 +55,134 @@ fn request() -> LlmRequest {
         headers: serde_json::Map::new(),
         content: json!({"messages": [], "model": "demo"}),
     }
+}
+
+#[test]
+fn provider_credentials_are_unconditionally_redacted_from_llm_events() {
+    let mut request = LlmRequest {
+        headers: serde_json::Map::from_iter([
+            ("Authorization".into(), json!("Bearer interceptor-secret")),
+            ("Cookie".into(), json!("session=interceptor-cookie")),
+            ("X-API-Key".into(), json!("interceptor-api-key")),
+            ("api-key".into(), json!("azure-secret")),
+            ("anthropic-api-key".into(), json!("anthropic-secret")),
+            ("X-Provider-Key".into(), json!("provider-secret")),
+            ("X-Custom-Signature".into(), json!("custom-secret")),
+            (
+                PROVIDER_CREDENTIAL_HEADER_NAMES_HEADER.into(),
+                json!(["X-Custom-Signature"]),
+            ),
+            ("x-trace-id".into(), json!("trace-1")),
+        ]),
+        content: json!({"model": "demo"}),
+    };
+
+    redact_provider_credentials(&mut request);
+
+    assert_eq!(request.headers.get("x-trace-id"), Some(&json!("trace-1")));
+    for name in [
+        "Authorization",
+        "Cookie",
+        "X-API-Key",
+        "api-key",
+        "anthropic-api-key",
+        "X-Provider-Key",
+        "X-Custom-Signature",
+        PROVIDER_CREDENTIAL_HEADER_NAMES_HEADER,
+    ] {
+        assert!(!request.headers.contains_key(name));
+    }
+}
+
+#[test]
+fn provider_credentials_are_redacted_after_event_sanitizers() {
+    let _guard = lock_global_runtime();
+    reset_global();
+    set_thread_scope_stack(create_scope_stack());
+
+    register_scope_sanitize_start_guardrail(
+        "restore-provider-credentials",
+        1,
+        Arc::new(|_, mut fields| {
+            fields.data = Some(json!({
+                "headers": {
+                    "Authorization": "Bearer restored-secret",
+                    "X-Custom-Signature": "restored-custom-secret",
+                    "X-Provider-Key": "restored-provider-secret",
+                    "idempotency-key": "retry-safe",
+                    "x-trace-id": "trace-1"
+                },
+                "content": {"model": "demo"}
+            }));
+            fields.metadata = Some(json!({
+                "nested": {
+                    "X-Custom-Signature": "metadata-secret",
+                    "visible": true
+                }
+            }));
+            fields
+                .category_profile
+                .get_or_insert_default()
+                .extra
+                .insert("X-Provider-Key".into(), json!("profile-secret"));
+            fields
+        }),
+    )
+    .unwrap();
+
+    let events = Arc::new(Mutex::new(Vec::<Event>::new()));
+    let captured = events.clone();
+    register_subscriber(
+        "final-provider-credential-redaction",
+        Arc::new(move |event| captured.lock().unwrap().push(event.clone())),
+    )
+    .unwrap();
+    let request = LlmRequest {
+        headers: serde_json::Map::from_iter([
+            (
+                PROVIDER_CREDENTIAL_HEADER_NAMES_HEADER.into(),
+                json!(["X-Custom-Signature"]),
+            ),
+            ("x-trace-id".into(), json!("trace-1")),
+        ]),
+        content: json!({"model": "demo"}),
+    };
+
+    llm_call(
+        LlmCallParams::builder()
+            .name("final-redaction")
+            .request(&request)
+            .build(),
+    )
+    .unwrap();
+    flush_subscribers().unwrap();
+    assert!(deregister_subscriber("final-provider-credential-redaction").unwrap());
+    assert!(deregister_scope_sanitize_start_guardrail("restore-provider-credentials").unwrap());
+
+    let captured = events.lock().unwrap();
+    let event = captured
+        .iter()
+        .find(|event| event.name() == "final-redaction")
+        .unwrap();
+    let headers = event.input().unwrap()["headers"].as_object().unwrap();
+    assert_eq!(headers.get("idempotency-key"), Some(&json!("retry-safe")));
+    assert_eq!(headers.get("x-trace-id"), Some(&json!("trace-1")));
+    for name in ["Authorization", "X-Custom-Signature", "X-Provider-Key"] {
+        assert!(!headers.contains_key(name));
+    }
+    assert_eq!(event.metadata().unwrap()["nested"]["visible"], json!(true));
+    assert!(
+        event.metadata().unwrap()["nested"]
+            .get("X-Custom-Signature")
+            .is_none()
+    );
+    assert!(
+        !event
+            .category_profile()
+            .unwrap()
+            .extra
+            .contains_key("X-Provider-Key")
+    );
 }
 
 fn multi_turn_request() -> LlmRequest {

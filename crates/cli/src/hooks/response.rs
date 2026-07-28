@@ -31,42 +31,6 @@ pub(super) async fn handle_hook_forward_response(
     }
 }
 
-pub(crate) fn handle_verified_hook_forward_response(
-    response: Result<
-        crate::gateway::client::VerifiedHttpResponse,
-        crate::gateway::client::VerifiedHttpError,
-    >,
-    fail_closed: bool,
-) -> Result<(), CliError> {
-    match response {
-        Ok(response) => {
-            let status = match reqwest::StatusCode::from_u16(response.status) {
-                Ok(status) => status,
-                Err(error) => {
-                    let message = format!("verified hook response had an invalid status: {error}");
-                    return handle_hook_failure(
-                        CliError::Install(message),
-                        fail_closed,
-                        "invalid_status",
-                        None,
-                    );
-                }
-            };
-            handle_hook_forward_status(
-                status,
-                String::from_utf8_lossy(&response.body).into_owned(),
-                fail_closed,
-            )
-        }
-        Err(error) => handle_hook_failure(
-            CliError::Install(format!("verified hook forward failed: {error}")),
-            fail_closed,
-            "verified_transport",
-            None,
-        ),
-    }
-}
-
 pub(crate) fn handle_hook_forward_status(
     status: reqwest::StatusCode,
     body: String,

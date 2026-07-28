@@ -1,209 +1,60 @@
 ---
 title: "Claude Desktop"
-description: "Install and operate fail-closed NeMo Relay protection for the Claude Desktop Code tab and terminal Claude Code."
+description: "Protect local Claude Desktop Code sessions with the per-user Relay proxy."
 position: 5
 ---
 {/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0 */}
 
-
-Use the Claude Desktop integration when the Code tab and bare `claude`
-processes must use the same persistent NeMo Relay policy without replacing
-Claude's subscription authentication.
-
-The integration has one public contract on macOS, Windows, and supported Linux
-distributions:
+Enroll Claude Desktop:
 
 ```bash
 nemo-relay install claude-desktop
-nemo-relay claude-desktop --folder /path/to/project
 ```
-
-Installation is explicit because it adds current-user TLS trust and a login
-service. `nemo-relay install all` does not select Claude Desktop.
 
 <Warning>
-Claude Desktop support is release-gated separately on each platform. The
-implementation and platform adapters can be present before a platform passes
-the integrated live-application proof of concept. Check the [Support
-Matrix](/reference/support-matrix#claude-desktop-code-tab) before treating a
-platform as supported for production use.
+Claude Desktop adapters are implemented on macOS, Windows, Ubuntu, and Debian,
+but each platform still requires its integrated live-application release gate.
+Treat explicit Desktop enrollment as preview until the support matrix marks
+that platform supported.
 </Warning>
 
-## Requirements
+On macOS and Windows, the installer changes current-user TLS trust; Linux uses
+an agent-scoped CA bundle instead. It patches the authenticated HTTPS proxy and
+CA settings used by the Desktop Code tab, retains native OAuth, and installs
+fail-closed lifecycle hooks. Claude Code and Claude Desktop have separate
+ownership records over their shared Claude configuration, but provider traffic
+uses one active shared Claude credential and upstream route.
+The shared plugin keeps the canonical Claude Code hook schema and uses the
+Desktop enrollment credential whenever Desktop is the only Claude owner.
 
-Close Claude Desktop and every terminal Claude Code process before install,
-forced upgrade, or uninstall. Relay refuses to modify trust, settings, or
-service state while those processes are running.
-
-The target platform must meet these requirements:
-
-| Platform | Requirement | Per-user service and trust |
-| --- | --- | --- |
-| macOS | macOS 11 or newer and `Claude.app` with bundle ID `com.anthropic.claudefordesktop` | LaunchAgent `com.nvidia.nemo-relay.claude-desktop` and the login Keychain |
-| Windows | Windows 10 or newer and the per-user Claude Desktop installation | Hidden, least-privilege logon Scheduled Task and CurrentUser Root |
-| Linux | Anthropic's Ubuntu 22.04+ or Debian 12+ package with a systemd user session | `nemo-relay-claude-desktop.service` and a Claude-scoped combined `NODE_EXTRA_CA_CERTS` bundle |
-
-Generic Linux distributions and non-systemd autostart are not supported. See
-Anthropic's [Desktop installation
-requirements](https://support.claude.com/en/articles/10065433-install-claude-desktop),
-[network configuration](https://code.claude.com/docs/en/corporate-proxy), and
-[Desktop deep-link](https://support.claude.com/en/articles/14729294-open-claude-desktop-with-a-link)
-documentation for host-side requirements.
-
-Persistent Desktop mode resolves NeMo Relay system and user configuration only.
-Use `nemo-relay claude` for project-specific Relay configuration.
-
-## Install
-
-Run:
-
-```bash
-nemo-relay install claude-desktop
-```
-
-The command performs a journaled transaction that:
-
-1. Reuses or installs the existing `nemo-relay-plugin` Claude Code marketplace
-   dependency with all 14 lifecycle hooks and `alwaysLoad: true`.
-2. Generates a constrained root and one exact `api.anthropic.com` leaf
-   certificate. Relay persists only the leaf private key and discards the CA
-   signing key after issuance.
-3. Registers a generation-fenced per-user sidecar. The sidecar owns the Relay
-   gateway at `127.0.0.1:47632` and an authenticated CONNECT proxy at
-   `127.0.0.1:47633`.
-4. Updates only Relay-managed fields in `~/.claude/settings.json`, including
-   authenticated `HTTPS_PROXY`, `NEMO_RELAY_FAIL_CLOSED=1`, TLS CA selection,
-   and the state identity checked by installed hooks.
-5. Removes Relay's direct `ANTHROPIC_BASE_URL` route so Claude continues to use
-   its first-party endpoint and existing OAuth credential through TLS
-   interception.
-6. Starts the service and verifies its authenticated generation and persistent
-   configuration fingerprint before committing the transaction.
-
-Use `--dry-run` to preview paths and platform actions. Use `--force` to rotate
-the certificate and service generation or refresh the shared Claude Code
-plugin. The leaf certificate is valid for two years; doctor warns during its
-last 30 days.
-
-If `nemo-relay install claude-code` already exists, Desktop installation
-records that ownership and migrates the same plugin in place. Desktop uninstall
-then restores direct-gateway mode instead of removing the pre-existing plugin.
-
-## Open a Protected Code Tab
-
-Run from a project directory:
-
-```bash
-nemo-relay claude-desktop
-```
-
-Or choose a folder explicitly:
+After enrollment, open a protected Code session through the retained deep-link
+command:
 
 ```bash
 nemo-relay claude-desktop --folder /path/to/project
 ```
 
-The command starts the registered sidecar if necessary, runs the complete
-protection check, and opens an encoded `claude://code/new?folder=...` link. It
-does not open Claude when the certificate, trust, service definition, proxy,
-settings, plugin generation, hook policy, gateway configuration, or sidecar
-identity is unhealthy.
+Before opening Claude, the command verifies the service executable, health,
+generation, configuration fingerprint, trust fingerprint, effective settings,
+and hooks. It refuses to open a session if protection is incomplete.
 
-The original Claude application icon and bare terminal `claude` also read the
-same user settings, so their Code sessions use the installed sidecar without a
-wrapper command.
+The integration covers local Claude Desktop Code activity that uses the
+enrolled user configuration. Claude Chat, Cowork, web traffic, and cloud
+execution remain outside scope.
 
-## Traffic Policy
-
-The local proxy requires a random persistent Basic credential. It verifies the
-credential in constant time, removes it before forwarding, and does not log
-authorization headers or request bodies at the transport layer.
-
-Relay terminates TLS only for `api.anthropic.com` and validates CONNECT
-authority, port, TLS SNI, and the inner Host header. It routes these endpoints
-through the managed Relay LLM pipeline, preserving Claude OAuth and streaming
-responses:
-
-- `/v1/messages`
-- `/v1/messages/count_tokens`
-
-An audited allowlist passes bootstrap, settings, OAuth, organization, plugin,
-MCP, and model-discovery control traffic to Anthropic. Message batches, legacy
-completions, unknown `/v1/*` routes, and endpoints outside the allowlist fail
-closed. Other public HTTPS hosts are tunneled without inspection. Private,
-loopback, link-local, multicast, unspecified, and reserved destinations are
-rejected.
-
-An explicit pre-existing HTTP or HTTPS corporate proxy becomes the sidecar's
-upstream proxy. Relay preserves optional Basic authentication and `NO_PROXY`
-rules. The Claude-facing `NO_PROXY` value removes entries that would bypass
-interception for `api.anthropic.com`; the sidecar retains the original rules
-when selecting its corporate-proxy route. On macOS and Windows, an explicit
-pre-existing `NODE_EXTRA_CA_CERTS` bundle is also loaded by the sidecar. Linux
-composes that bundle with Relay's constrained root. SOCKS, PAC, automatic
-discovery, NTLM, Kerberos, and ambiguous case-variant definitions are rejected
-with a diagnostic.
-
-Custom Anthropic gateways, Bedrock, Vertex AI, and Foundry are not supported by
-Desktop persistent mode.
-
-## Fail-Closed Hooks
-
-Every installed Claude lifecycle hook verifies the Desktop state when the
-Desktop marker is present. A missing sidecar, stale configuration fingerprint,
-changed effective proxy, restored `ANTHROPIC_BASE_URL`, or failed hook delivery
-returns an error under `NEMO_RELAY_FAIL_CLOSED=1`. This prevents prompt and
-`PreToolUse` enforcement from silently falling back to direct execution.
-
-This is user-scoped enforcement. Higher-priority enterprise policy or a user
-who deliberately disables hooks is diagnosed but not overwritten.
-
-## Diagnose and Uninstall
-
-Run:
+Diagnose the installation with:
 
 ```bash
-nemo-relay doctor --plugin claude-desktop
-nemo-relay doctor --plugin claude-desktop --json
+nemo-relay doctor claude-desktop
 ```
 
-Doctor reports application identity, platform support, service registration,
-certificate files and expiry, trust, owner-only permissions, effective Claude
-settings, redacted upstream proxy, marketplace and hook generation, sidecar
-identity, gateway configuration, and effective protection.
-
-Remove the integration with:
+Uninstall with:
 
 ```bash
 nemo-relay uninstall claude-desktop
 ```
 
-Uninstall stops and unregisters the service, restores only settings fields that
-still equal Relay's installed values, removes the exact generated root, and
-removes generated state. Concurrent edits and unrelated Claude settings remain
-unchanged. If the Claude Code plugin existed before Desktop installation,
-uninstall restores its direct `ANTHROPIC_BASE_URL` route. Otherwise, it removes
-the plugin and restores the settings state that predated both installations.
-
-## Run the Release-Gate POC
-
-The integrated live-application proof of concept is intentionally opt-in. It
-installs current-user trust and a login service, consumes real Claude
-subscription requests, and pauses for visual confirmation in the Desktop Code
-tab. Run it only on a release-gate account after closing every Claude process:
-
-```bash
-NEMO_RELAY_CLAUDE_DESKTOP_LIVE_POC=1 just test-claude-desktop-live-poc
-```
-
-The same Python runner selects the macOS, Windows, or Linux service adapter. It
-builds temporary test middleware, verifies OAuth without an API key, exposes a
-model-request rewrite, and enables isolated ATOF `0.1` JSONL and ATIF v1.7
-file exporters. Both artifacts must contain the rewritten POC request. The
-runner also rejects a sentinel `PreToolUse`, stops the sidecar to check
-inference and hook failure, exercises both the protected deep link and the
-original application icon, uninstalls, and compares the prior settings and
-trust inventory, login-service state, and integration install root. It does not
-promote platform support automatically; attach the runner output to the
-platform's release evidence before updating the support matrix.
+If Claude Code remains enrolled, uninstall preserves shared Claude fields that
+it still owns. The current-user CA and service remain until the final agent
+enrollment is removed.

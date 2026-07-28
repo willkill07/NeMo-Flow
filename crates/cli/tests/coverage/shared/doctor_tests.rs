@@ -785,7 +785,7 @@ fn hermes_hook_status_reports_actionable_persistent_diagnosis_failures() {
     let (status, details) = hook_status(CodingAgent::Hermes, &agents);
 
     assert_eq!(status, Status::Fail);
-    assert!(details.contains("persistent MCP/hooks"), "{details}");
+    assert!(details.contains("persistent proxy/hooks"), "{details}");
     assert!(details.contains("install hermes --force"), "{details}");
 }
 

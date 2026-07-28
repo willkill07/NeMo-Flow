@@ -23,9 +23,17 @@ fn agent_descriptors_are_complete_and_unique() {
     assert_eq!(CodingAgent::ClaudeCode.hook_events().len(), 14);
     assert_eq!(CodingAgent::Codex.hook_events().len(), 10);
     assert_eq!(CodingAgent::Hermes.hook_events().len(), 13);
+    assert_direct_hook_ownership();
+    assert_unique_hook_events();
+}
+
+fn assert_direct_hook_ownership() {
     assert!(!CodingAgent::ClaudeCode.uses_direct_hook_entries());
     assert!(!CodingAgent::Codex.uses_direct_hook_entries());
     assert!(CodingAgent::Hermes.uses_direct_hook_entries());
+}
+
+fn assert_unique_hook_events() {
     for agent in CodingAgent::ALL {
         let events = agent.hook_events();
         assert!(events.iter().all(|event| !event.is_empty()));
@@ -102,4 +110,22 @@ fn agent_inference_accepts_supported_binary_aliases() {
         Some(CodingAgent::Hermes)
     );
     assert_eq!(CodingAgent::infer("unknown"), None);
+}
+
+#[test]
+fn claude_preflight_reports_the_exact_legacy_mcp_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, plugin_root) = crate::installation::marketplace::marketplace_install_roots(
+        CodingAgent::ClaudeCode,
+        temp.path(),
+    );
+    std::fs::create_dir_all(&plugin_root).unwrap();
+    let legacy = plugin_root.join(".mcp.json");
+    std::fs::write(&legacy, b"{}").unwrap();
+
+    let error =
+        preflight_legacy_install_state(CodingAgent::ClaudeCode, Some(temp.path())).unwrap_err();
+
+    assert!(error.contains(&legacy.display().to_string()));
+    assert!(error.contains("previous Relay binary"));
 }

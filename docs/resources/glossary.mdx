@@ -242,8 +242,8 @@ the rest of the documentation can use them consistently.
 
 **Lifecycle Hook**
 : A lifecycle hook is a coding-agent callback that reports a session or tool
-  milestone. Relay-generated hooks forward the canonical payload to the local
-  Relay gateway.
+milestone. Relay-generated hooks forward the canonical payload to the local
+authenticated per-user Relay proxy.
 
 **Lifecycle Pair**
 : A lifecycle pair is the matching start and end event for one scope, tool
@@ -302,9 +302,9 @@ the rest of the documentation can use them consistently.
   before managed execution.
 
 **Model Context Protocol (MCP)**
-: Model Context Protocol (MCP) is the protocol that NeMo Relay uses for the
-  host-neutral lifecycle client in persistent coding-agent integrations. The
-  `nemo-relay mcp` server manages gateway lifetime and exposes no tools.
+: Model Context Protocol (MCP) is an open protocol for model clients to discover
+  and invoke external tools or context servers. NeMo Relay coding-agent
+  enrollment does not use MCP to manage proxy lifecycle.
 
 **Model Pricing**
 : Model pricing is the built-in `pricing` plugin component that loads catalog
@@ -358,10 +358,10 @@ the rest of the documentation can use them consistently.
 
 **Persistent Installation**
 : A persistent installation is a Relay-owned coding-agent integration created
-  with `nemo-relay install <agent>`. It registers an MCP lifecycle client and
-  trusted hooks in user configuration so the agent can use a shared local
-  gateway without a wrapper command. The installation uses an immutable
-  generation fence to reject stale managed entries.
+  with `nemo-relay install <agent>`. It registers the agent with one persistent
+  authenticated proxy for the OS user, patches user configuration, installs
+  trusted hooks, and records an immutable generation fence. The proxy endpoint
+  is discovered and persisted rather than fixed machine-wide.
 
 **PII Redaction**
 : PII redaction is the built-in `pii_redaction` plugin component that sanitizes
@@ -435,10 +435,9 @@ the rest of the documentation can use them consistently.
 ## R
 
 **Relay Gateway**
-: The Relay gateway is the local NeMo Relay process that receives coding-agent
-  lifecycle payloads and can route model-provider traffic. Compatible MCP
-  clients share a user-level gateway for persistent installations; transparent
-  runs use a private gateway.
+: The Relay gateway is the managed execution engine used for provider-facing
+  LLM traffic. In coding-agent integrations, a persistent per-user proxy invokes
+  that engine directly for authenticated HTTP, SSE, and WebSocket traffic.
 
 **Request Intercept**
 : A request intercept rewrites the request before execution continues
@@ -532,12 +531,6 @@ the rest of the documentation can use them consistently.
 : A trajectory is an ordered record of an agent run. In ATIF export, LLM events
   become agent steps, tool events become tool calls and observations, and scope
   nesting becomes lineage metadata.
-
-**Transparent Run**
-: A transparent run is a no-install CLI launch that starts a private local
-  gateway, injects temporary hook and gateway configuration into one coding
-  agent process tree, and stops the gateway when that agent exits. Use an agent
-  shortcut such as `nemo-relay codex` or `nemo-relay run -- <command>`.
 
 **Typed Value Codec**
 : A typed value codec converts application-facing values to JSON before NeMo

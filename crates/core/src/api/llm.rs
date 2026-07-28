@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -39,6 +40,40 @@ use crate::stream::LlmStreamWrapper;
 pub use nemo_relay_types::api::llm::{
     LLM_REQUEST_INTERCEPT_OUTCOME_SCHEMA, LlmAttributes, LlmRequest, LlmRequestInterceptOutcome,
 };
+
+/// Internal request header that declares interceptor-generated provider credential headers.
+///
+/// The marker is consumed by managed transports and the final LLM event redactor. It allows a
+/// target binding to use a provider-specific secret header without copying that secret into
+/// observability. It is not forwarded to providers.
+#[doc(hidden)]
+pub const PROVIDER_CREDENTIAL_HEADER_NAMES_HEADER: &str =
+    "x-nemo-relay-internal-provider-credential-headers";
+
+/// Returns whether a header name conventionally carries provider credentials.
+///
+/// Exact names cover the provider formats Relay supports today. Conservative secret-bearing
+/// suffixes cover provider-specific target headers even when a plugin does not declare them.
+#[doc(hidden)]
+pub fn is_provider_credential_header_name(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "authorization" | "cookie" | "x-api-key" | "api-key" | "anthropic-api-key"
+    ) || [
+        "-api-key",
+        "-provider-key",
+        "-authorization",
+        "-auth",
+        "-credential",
+        "-credentials",
+        "-password",
+        "-secret",
+        "-token",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
+}
 
 #[derive(Clone)]
 struct CapturedLlmScopeStack(ScopeStackHandle);
@@ -428,8 +463,10 @@ fn emit_llm_start_with_subscribers(
             .map_err(|error| FlowError::Internal(error.to_string()))?;
         state.llm_sanitize_request_entries(&scope_locals)
     };
+    let private_headers = declared_provider_credential_headers(&request.headers);
     let mut sanitized_request =
         NemoRelayContextState::llm_sanitize_request_snapshot_chain(request.clone(), &entries);
+    redact_provider_credentials_with(&mut sanitized_request, &private_headers);
     let mut annotated_request = match request_codec {
         Some(codec)
             if sanitized_request.headers != request.headers
@@ -459,10 +496,114 @@ fn emit_llm_start_with_subscribers(
             .map_err(|error| FlowError::Internal(error.to_string()))?;
         state.build_llm_start_event(handle, Some(input), annotated_request)
     };
-    if let Some(event) = sanitize_event_with_scope_stack(event, scope_stack) {
+    if let Some(mut event) = sanitize_event_with_scope_stack(event, scope_stack) {
+        redact_event_provider_credentials(&mut event, &private_headers);
         NemoRelayContextState::emit_event(&event, subscribers);
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn redact_provider_credentials(request: &mut LlmRequest) {
+    let private_headers = declared_provider_credential_headers(&request.headers);
+    redact_provider_credentials_with(request, &private_headers);
+}
+
+fn redact_provider_credentials_with(request: &mut LlmRequest, private_headers: &BTreeSet<String>) {
+    // This is deliberately outside the configurable sanitizer chain. A request interceptor can
+    // add target-owned credentials for the real provider call, but no later sanitizer may restore
+    // those credentials to the event snapshot.
+    request.headers.retain(|name, _| {
+        let normalized = name.to_ascii_lowercase();
+        normalized != PROVIDER_CREDENTIAL_HEADER_NAMES_HEADER
+            && !is_provider_credential_header_name(&normalized)
+            && !private_headers.contains(&normalized)
+    });
+}
+
+fn redact_event_provider_credentials(event: &mut Event, private_headers: &BTreeSet<String>) {
+    let Event::Scope(scope) = event else {
+        return;
+    };
+    if let Some(data) = scope.base.data.as_mut() {
+        redact_json_provider_credentials(data, private_headers);
+    }
+    if let Some(metadata) = scope.base.metadata.as_mut() {
+        redact_json_provider_credentials(metadata, private_headers);
+    }
+    if let Some(profile) = scope.category_profile.as_mut() {
+        redact_json_map_provider_credentials(&mut profile.extra, private_headers);
+    }
+}
+
+fn redact_json_provider_credentials(value: &mut Json, private_headers: &BTreeSet<String>) {
+    match value {
+        Json::Object(object) => redact_json_map_provider_credentials(object, private_headers),
+        Json::Array(items) => {
+            for item in items {
+                redact_json_provider_credentials(item, private_headers);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_json_map_provider_credentials(
+    object: &mut impl JsonObject,
+    private_headers: &BTreeSet<String>,
+) {
+    object.retain_json(|name| {
+        let normalized = name.to_ascii_lowercase();
+        normalized != PROVIDER_CREDENTIAL_HEADER_NAMES_HEADER
+            && !is_provider_credential_header_name(&normalized)
+            && !private_headers.contains(&normalized)
+    });
+    object.for_each_json_mut(|value| redact_json_provider_credentials(value, private_headers));
+}
+
+trait JsonObject {
+    fn retain_json(&mut self, keep: impl FnMut(&str) -> bool);
+    fn for_each_json_mut(&mut self, apply: impl FnMut(&mut Json));
+}
+
+impl JsonObject for serde_json::Map<String, Json> {
+    fn retain_json(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.retain(|name, _| keep(name));
+    }
+
+    fn for_each_json_mut(&mut self, apply: impl FnMut(&mut Json)) {
+        self.values_mut().for_each(apply);
+    }
+}
+
+impl JsonObject for std::collections::BTreeMap<String, Json> {
+    fn retain_json(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.retain(|name, _| keep(name));
+    }
+
+    fn for_each_json_mut(&mut self, apply: impl FnMut(&mut Json)) {
+        self.values_mut().for_each(apply);
+    }
+}
+
+fn declared_provider_credential_headers(
+    headers: &serde_json::Map<String, Json>,
+) -> BTreeSet<String> {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(PROVIDER_CREDENTIAL_HEADER_NAMES_HEADER))
+        .flat_map(|(_, value)| match value {
+            Json::Array(names) => names
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            Json::String(names) => names.split(',').map(str::to_owned).collect(),
+            _ => Vec::new(),
+        })
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 fn emit_pending_request_marks(
@@ -596,7 +737,9 @@ fn emit_optimization_marks_with(
 /// the caller-owned [`LlmRequest`]. When the owning agent is not fresh, the
 /// emitted request annotation is limited to the current user turn. Managed
 /// calls with a request codec also apply that projection to the event input,
-/// without changing the request used for provider execution.
+/// without changing the request used for provider execution. Authorization and
+/// provider API-key headers are always removed from the final event snapshot
+/// after configured sanitizers run.
 pub fn llm_call(params: LlmCallParams<'_>) -> Result<LlmHandle> {
     let handle_params = CreateLlmHandleParams::builder()
         .name(params.name)

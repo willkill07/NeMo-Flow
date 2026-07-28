@@ -10,14 +10,14 @@ mod claude_desktop;
 mod commands;
 mod configuration;
 mod diagnostics;
+#[cfg(test)]
+mod environment_policy;
 mod error;
 mod events;
 mod filesystem;
 mod gateway;
 mod hooks;
 mod installation;
-mod mcp;
-mod mcp_environment;
 mod plugins;
 mod process;
 mod provider_auth;
@@ -39,7 +39,6 @@ use std::process::ExitCode;
 /// This is an executable entrypoint, not a supported library API.
 #[doc(hidden)]
 pub fn run_cli() -> ExitCode {
-    mcp_environment::remove_unresolved_mcp_placeholders();
     let bootstrap_shutdown_token = take_bootstrap_shutdown_token();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -52,6 +51,21 @@ pub fn run_cli() -> ExitCode {
         }
     };
     runtime.block_on(commands::run(bootstrap_shutdown_token))
+}
+
+/// Runs the feature-gated repository integration-test server.
+///
+/// This entrypoint is absent from normal release builds and is not a supported public API.
+#[cfg(feature = "internal-test-server")]
+#[doc(hidden)]
+pub fn run_internal_test_server_cli() -> ExitCode {
+    match commands::run_internal_test_server_cli() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn take_bootstrap_shutdown_token() -> Option<String> {

@@ -124,6 +124,31 @@ pub(super) fn load_scoped_registries(
         .collect()
 }
 
+pub(super) fn load_persistent_scoped_registries(
+    user_config_dir: &Path,
+) -> Result<Vec<ScopedRegistry>, CliError> {
+    let global = global_plugin_config_path();
+    let user = user_config_dir.join(PLUGINS_TOML);
+    [
+        (
+            RegistryScope::Global,
+            global.clone(),
+            sibling_state_path(&global),
+        ),
+        (RegistryScope::User, user.clone(), sibling_state_path(&user)),
+    ]
+    .into_iter()
+    .map(|(scope, plugins_toml_path, state_path)| {
+        Ok(ScopedRegistry {
+            scope,
+            plugins_toml_path,
+            registry: read_registry(&state_path)?,
+            state_path,
+        })
+    })
+    .collect()
+}
+
 pub(super) fn scoped_paths_for_add(
     scope: TargetScope,
     explicit: Option<&PathBuf>,

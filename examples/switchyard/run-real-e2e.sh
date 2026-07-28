@@ -45,15 +45,18 @@ e2e_add_pid "$!"
 
 e2e_wait_for http://127.0.0.1:4000/health
 
+cp "$relay_root/examples/switchyard/real-e2e-plugins.toml" "$work_dir/plugins.toml"
+: > "$work_dir/config.toml"
 (
   if [[ -n "$relay_toolchain" ]]; then
     export RUSTUP_TOOLCHAIN="$relay_toolchain"
   fi
   cd "$work_dir"
   SWITCHYARD_AUTHORIZATION="Bearer $token" cargo run \
-    --manifest-path "$relay_root/Cargo.toml" -p nemo-relay-cli --features switchyard -- \
-    --plugin-config-path "$relay_root/examples/switchyard/real-e2e-plugins.toml" \
-    --bind 127.0.0.1:4041
+    --manifest-path "$relay_root/Cargo.toml" -p nemo-relay-cli \
+    --features switchyard,internal-test-server \
+    --bin nemo-relay-internal-managed-server -- \
+    --config "$work_dir/config.toml" --bind 127.0.0.1:4041
 ) >"$work_dir/relay.log" 2>&1 &
 relay_pid="$!"
 e2e_add_pid "$relay_pid"

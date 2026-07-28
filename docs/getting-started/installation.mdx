@@ -28,28 +28,42 @@ boundary, start from [Supported Integrations](/supported-integrations/about).
 ## CLI
 
 Install the NeMo Relay CLI when you want the `nemo-relay` executable for
-coding-agent hook and LLM gateway observability.
+persistent local coding-agent hooks and managed provider observability.
 
-Install the latest stable release:
+Choose a stable tag from GitHub Releases, download that tag's installer,
+review it, and run it as a separate step. Replace `<release-tag>` below with
+the selected tag:
 
 <Tabs>
 <Tab title="Unix shell">
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/main/install.sh | sh
+RELAY_VERSION="<release-tag>"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  "https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/${RELAY_VERSION}/install.sh" \
+  --output nemo-relay-install.sh
+less nemo-relay-install.sh
+NEMO_RELAY_VERSION="${RELAY_VERSION}" sh nemo-relay-install.sh
 ```
 </Tab>
 
 <Tab title="Windows PowerShell">
 ```powershell
-irm https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/main/install.ps1 | iex
+$RelayVersion = "<release-tag>"
+$Installer = "nemo-relay-install.ps1"
+Invoke-WebRequest `
+  -Uri "https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/$RelayVersion/install.ps1" `
+  -OutFile $Installer
+Get-Content -LiteralPath $Installer
+$env:NEMO_RELAY_VERSION = $RelayVersion
+& ".\$Installer"
 ```
 </Tab>
 
 </Tabs>
 
-These commands intentionally download the installer from `main` and install the
-latest stable CLI release. The version of this documentation page does not
-select the CLI version; set `NEMO_RELAY_VERSION` to install a specific release.
+Do not execute installer content directly from the repository's moving `main`
+branch. The tag pins the reviewed installer, and `NEMO_RELAY_VERSION` pins the
+matching release asset.
 
 The Unix installer downloads the matching GitHub Release binary to
 `$HOME/.local/bin`. The PowerShell installer downloads `nemo-relay.exe` to
@@ -66,12 +80,27 @@ Codex, and Hermes Agent integrations:
 
 ```bash
 nemo-relay install claude-code
+nemo-relay install claude-desktop
 nemo-relay install codex
 nemo-relay install hermes
 ```
 
 Refer to [Coding Agent Installation](/nemo-relay-cli/plugin-installation) for
 the persistent integration workflow.
+
+<Warning>
+The first coding-agent enrollment installs a constrained CA in the macOS login
+Keychain or Windows CurrentUser Root store. Linux instead writes agent-scoped
+CA bundles without changing system trust. Linux Codex launches must select the
+printed bundle with the preferred `CODEX_CA_CERTIFICATE` setting. When that
+variable is unset, Relay also accepts an existing `SSL_CERT_FILE` bundle
+containing the active Relay root. An installer cannot modify an already-running
+shell's environment. Enrollment also registers a
+persistent per-user proxy service. Relay discovers and persists an available
+loopback port; it does not reserve one machine-wide static port. Run
+`nemo-relay install <agent> --dry-run` to inspect the planned trust and
+configuration changes.
+</Warning>
 
 <Note>
 The installers download the published SHA-256 checksum for the selected release
@@ -104,13 +133,24 @@ refer to the [Support Matrix](/reference/support-matrix).
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/main/install.sh | NEMO_RELAY_VERSION=0.7.0 sh
+RELAY_VERSION="v0.7.0"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  "https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/${RELAY_VERSION}/install.sh" \
+  --output nemo-relay-install.sh
+less nemo-relay-install.sh
+NEMO_RELAY_VERSION="${RELAY_VERSION}" sh nemo-relay-install.sh
 ```
 
 Install into another directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/main/install.sh | sh -s -- --install-dir "$HOME/bin"
+RELAY_VERSION="v0.7.0"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  "https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/${RELAY_VERSION}/install.sh" \
+  --output nemo-relay-install.sh
+less nemo-relay-install.sh
+NEMO_RELAY_VERSION="${RELAY_VERSION}" \
+  sh nemo-relay-install.sh --install-dir "$HOME/bin"
 ```
 
 Add the selected directory to `PATH` before running `nemo-relay` if it is not
@@ -128,15 +168,27 @@ Set the same environment variable before invoking the installer to install a
 specific version:
 
 ```powershell
-$env:NEMO_RELAY_VERSION = '0.7.0'
-irm https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/main/install.ps1 | iex
+$RelayVersion = 'v0.7.0'
+$Installer = 'nemo-relay-install.ps1'
+Invoke-WebRequest `
+  -Uri "https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/$RelayVersion/install.ps1" `
+  -OutFile $Installer
+Get-Content -LiteralPath $Installer
+$env:NEMO_RELAY_VERSION = $RelayVersion
+& ".\$Installer"
 ```
 
 To choose an installation directory, download the script and pass `-InstallDir`:
 
 ```powershell
-iwr https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/main/install.ps1 -OutFile install.ps1
-.\install.ps1 -InstallDir "$HOME\bin"
+$RelayVersion = 'v0.7.0'
+$Installer = 'nemo-relay-install.ps1'
+Invoke-WebRequest `
+  -Uri "https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/$RelayVersion/install.ps1" `
+  -OutFile $Installer
+Get-Content -LiteralPath $Installer
+$env:NEMO_RELAY_VERSION = $RelayVersion
+& ".\$Installer" -InstallDir "$HOME\bin"
 ```
 
 | Interface | Purpose |
@@ -247,13 +299,15 @@ integration:
 
 ```bash
 nemo-relay install hermes
-nemo-relay doctor --plugin hermes
+nemo-relay doctor hermes
 ```
 
-Relay adds a native stdio MCP entry and trusts only the lifecycle hooks that it
-installs. The MCP process acquires the shared user-level gateway when it starts.
-Refer to the [Hermes Agent guide](/nemo-relay-cli/hermes) for provider routing,
-lifecycle, and removal steps.
+Relay enrolls local Hermes modes in the persistent per-user proxy, patches the
+selected `$HERMES_HOME` environment, and trusts only the lifecycle hooks that
+it installs. Native Anthropic and OpenAI providers use managed inference;
+unknown public providers are labeled hook-only/degraded. Refer to the
+[Hermes Agent guide](/nemo-relay-cli/hermes) for provider routing, lifecycle,
+and removal steps.
 
 ### Python Framework Integrations
 

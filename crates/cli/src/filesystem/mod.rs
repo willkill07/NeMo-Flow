@@ -25,7 +25,8 @@ pub(crate) use atomic::{
 pub(crate) use locks::normalize_lock_attempt;
 pub(crate) use locks::{LockAttempt, try_lock_exclusive, try_lock_shared, unlock_file};
 pub(crate) use snapshots::{
-    FileSnapshot, backup, backup_path, remove_backup, restore_file_snapshot, snapshot_optional_file,
+    DirectorySnapshot, FileSnapshot, backup, backup_path, remove_backup, restore_file_snapshot,
+    restore_file_snapshot_cas, snapshot_optional_file,
 };
 
 #[cfg(test)]

@@ -9,7 +9,6 @@ pub(super) mod assets;
 pub(crate) mod doctor;
 pub(crate) mod host;
 pub(crate) mod install;
-pub(crate) mod launch;
 
 pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     argument: "claude",

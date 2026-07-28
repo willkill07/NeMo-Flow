@@ -86,6 +86,17 @@ impl EnvScope {
             previous,
         }
     }
+
+    pub(crate) fn update(&self, values: &[(&'static str, Option<&OsStr>)]) {
+        for &(name, value) in values {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 }
 
 impl Drop for EnvScope {

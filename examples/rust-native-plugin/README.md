@@ -51,7 +51,7 @@ After materializing the library path and digest, run these commands from the
 repository root using the copied manifest path:
 
 ```bash
-nemo-relay plugins add ./examples/rust-native-plugin/relay-plugin.local.toml
+nemo-relay plugins add --user ./examples/rust-native-plugin/relay-plugin.local.toml
 nemo-relay plugins enable examples.rust_native_policy
 ```
 
@@ -70,20 +70,23 @@ emit_isolated_scope = true
 
 The manifest declares the `config_schema` capability and references
 `config.schema.json`. After adding the plugin, use the editor for the same
-configuration target (`--user`, `--project`, or `--global`) to configure the
-fields without loading the native library:
+user configuration target to configure the fields without loading the native
+library:
 
 ```bash
-nemo-relay plugins edit
+nemo-relay plugins edit --user
 ```
 
 The editor reads the schema file relative to `relay-plugin.toml`. It does not
 run the plugin during schema discovery.
 
-Start the gateway normally after the dynamic record is enabled:
+Enroll a supported coding agent after the dynamic record is enabled. The
+persistent proxy loads system and user plugin configuration:
 
 ```bash
-nemo-relay --bind 127.0.0.1:4040
+nemo-relay install codex
+# Linux only: export CODEX_CA_CERTIFICATE="<path printed by install>"
+nemo-relay doctor codex
 ```
 
 ## What the Example Registers

@@ -5,13 +5,17 @@ use super::*;
 use serde_json::json;
 
 #[test]
-fn no_proxy_sanitization_removes_anthropic_bypasses_only() {
+fn no_proxy_sanitization_removes_all_managed_provider_bypasses() {
     assert_eq!(
         sanitize_no_proxy(
-            "localhost .anthropic.com,example.com api.anthropic.com:443,.com,api.anthropic.com:80"
+            "localhost .anthropic.com,example.com api.anthropic.com:443,.com,\
+             api.openai.com,chatgpt.com:443,api.anthropic.com:80,127.0.0.1,[::1]:443,\
+             0.0.0.0/0,10.0.0.0/8,::/0,2001:db8::/32,[::/0]:443,\
+             [2001:db8::/32]:443,10.0.0.0/8:80,[2001:db8::/32]:80"
         ),
-        "localhost,example.com,api.anthropic.com:80"
+        "example.com,api.anthropic.com:80"
     );
+    assert_eq!(sanitize_no_proxy("* localhost"), "");
 }
 
 #[test]
@@ -19,6 +23,64 @@ fn upstream_proxy_validation_rejects_deferred_schemes() {
     let error = validate_upstream_proxy("socks5://proxy.example:1080", None).unwrap_err();
     assert!(error.contains("HTTP(S)"));
     assert!(validate_upstream_proxy("https://user:pass@proxy.example:8443", None).is_ok());
+}
+
+#[test]
+fn enrollment_captures_custom_ca_and_sanitizes_all_managed_no_proxy_hosts() {
+    let temp = tempfile::tempdir().unwrap();
+    let ca = temp.path().join("corporate.pem");
+    std::fs::write(
+        &ca,
+        "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    let settings = Map::from_iter([
+        ("HTTPS_PROXY".into(), json!("http://corporate.example:8080")),
+        (
+            "NO_PROXY".into(),
+            json!("localhost,api.openai.com,.anthropic.com,chatgpt.com"),
+        ),
+        ("REQUESTS_CA_BUNDLE".into(), json!(ca.display().to_string())),
+    ]);
+    let proxy = resolve_upstream_proxy_with_alias(
+        &settings,
+        &Map::new(),
+        "https://relay:secret@127.0.0.1:40000",
+        None,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(proxy.no_proxy, None);
+    let expected_ca = std::fs::canonicalize(&ca).unwrap();
+    assert_eq!(proxy.ca_bundle.as_deref(), Some(expected_ca.as_path()));
+}
+
+#[test]
+fn enrollment_rejects_ambiguous_custom_ca_bundles() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first.pem");
+    let second = temp.path().join("second.pem");
+    std::fs::write(&first, "first").unwrap();
+    std::fs::write(&second, "second").unwrap();
+    let settings = Map::from_iter([
+        ("HTTPS_PROXY".into(), json!("http://proxy.example:8080")),
+        (
+            "REQUESTS_CA_BUNDLE".into(),
+            json!(first.display().to_string()),
+        ),
+        ("SSL_CERT_FILE".into(), json!(second.display().to_string())),
+    ]);
+    let error = resolve_upstream_proxy_with_alias(
+        &settings,
+        &Map::new(),
+        "https://relay:secret@127.0.0.1:40000",
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(error.contains("different corporate CA bundles"));
 }
 
 #[test]
@@ -36,7 +98,7 @@ fn field_restore_preserves_concurrent_edits() {
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
-    let prepared = prepare_with_process_env(
+    let mut prepared = prepare_with_process_env(
         &path,
         "http://nemo-relay:secret@127.0.0.1:47633",
         &temp.path().join("state.json"),
@@ -53,7 +115,7 @@ fn field_restore_preserves_concurrent_edits() {
             .map(|proxy| proxy.url.as_str()),
         Some("http://corporate.example:8080/")
     );
-    apply(&prepared).unwrap();
+    apply(&mut prepared).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -91,6 +153,114 @@ fn field_restore_preserves_concurrent_edits() {
 }
 
 #[test]
+fn field_restore_retries_when_an_external_writer_wins_the_commit_barrier() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("settings.json");
+    crate::agents::shared::host::write_json(
+        &path,
+        &json!({"env": {"HTTPS_PROXY": "http://corporate.example:8080"}}),
+    )
+    .unwrap();
+    let mut prepared = prepare_with_process_env(
+        &path,
+        "http://nemo-relay:secret@127.0.0.1:47633",
+        &temp.path().join("state.json"),
+        &temp.path().join("root.pem"),
+        "macos",
+        None,
+        &Map::new(),
+    )
+    .unwrap();
+    apply(&mut prepared).unwrap();
+
+    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let completed = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let writer_path = path.clone();
+    let writer_release = release.clone();
+    let writer_completed = completed.clone();
+    let writer = std::thread::spawn(move || {
+        writer_release.wait();
+        let mut value = crate::agents::shared::host::read_json_object(&writer_path).unwrap();
+        value["external_edit"] = json!("preserved");
+        crate::agents::shared::host::write_json(&writer_path, &value).unwrap();
+        writer_completed.wait();
+    });
+    let mut first_attempt = true;
+    restore_with_hook(&prepared.patch, || {
+        if first_attempt {
+            first_attempt = false;
+            release.wait();
+            completed.wait();
+        }
+    })
+    .unwrap();
+    writer.join().unwrap();
+
+    let restored = crate::agents::shared::host::read_json_object(&path).unwrap();
+    assert_eq!(restored["external_edit"], json!("preserved"));
+    assert_eq!(
+        restored["env"]["HTTPS_PROXY"],
+        json!("http://corporate.example:8080")
+    );
+}
+
+#[test]
+fn settings_apply_rebases_external_edits_and_restores_the_latest_managed_value() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("settings.json");
+    crate::agents::shared::host::write_json(
+        &path,
+        &json!({
+            "theme": "dark",
+            "env": {"HTTPS_PROXY": "http://original.example:8080"}
+        }),
+    )
+    .unwrap();
+    let mut prepared = prepare_with_process_env(
+        &path,
+        "http://nemo-relay:secret@127.0.0.1:47633",
+        &temp.path().join("state.json"),
+        &temp.path().join("root.pem"),
+        "macos",
+        None,
+        &Map::new(),
+    )
+    .unwrap();
+    let mut first_attempt = true;
+    apply_with_hook(&mut prepared, || {
+        if first_attempt {
+            first_attempt = false;
+            crate::agents::shared::host::write_json(
+                &path,
+                &json!({
+                    "theme": "light",
+                    "external_edit": true,
+                    "env": {"HTTPS_PROXY": "http://latest.example:9090"}
+                }),
+            )
+            .unwrap();
+        }
+    })
+    .unwrap();
+
+    let installed = crate::agents::shared::host::read_json_object(&path).unwrap();
+    assert_eq!(installed["theme"], json!("light"));
+    assert_eq!(installed["external_edit"], json!(true));
+    assert_eq!(
+        prepared.patch.fields["HTTPS_PROXY"].previous,
+        Some(json!("http://latest.example:9090"))
+    );
+
+    restore(&prepared.patch).unwrap();
+    let restored = crate::agents::shared::host::read_json_object(&path).unwrap();
+    assert_eq!(
+        restored["env"]["HTTPS_PROXY"],
+        json!("http://latest.example:9090")
+    );
+    assert_eq!(restored["external_edit"], json!(true));
+}
+
+#[test]
 fn exact_restore_reinstates_managed_base_url_and_no_proxy() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("settings.json");
@@ -102,7 +272,7 @@ fn exact_restore_reinstates_managed_base_url_and_no_proxy() {
         }
     });
     crate::agents::shared::host::write_json(&path, &original).unwrap();
-    let prepared = prepare_with_process_env(
+    let mut prepared = prepare_with_process_env(
         &path,
         "http://nemo-relay:secret@127.0.0.1:47633",
         &temp.path().join("state.json"),
@@ -113,11 +283,8 @@ fn exact_restore_reinstates_managed_base_url_and_no_proxy() {
     )
     .unwrap();
     assert!(prepared.value["env"].get("ANTHROPIC_BASE_URL").is_none());
-    assert_eq!(
-        prepared.value["env"]["NO_PROXY"],
-        json!("localhost,example.com")
-    );
-    apply(&prepared).unwrap();
+    assert_eq!(prepared.value["env"]["NO_PROXY"], json!("example.com"));
+    apply(&mut prepared).unwrap();
     restore(&prepared.patch).unwrap();
     assert_eq!(
         crate::agents::shared::host::read_json_object(&path).unwrap(),
@@ -195,7 +362,7 @@ fn inherited_case_variant_proxy_and_no_proxy_are_overridden_and_restored() {
     }))
     .unwrap();
     let relay_proxy = "http://nemo-relay:secret@127.0.0.1:47633";
-    let prepared = prepare_with_process_env(
+    let mut prepared = prepare_with_process_env(
         &path,
         relay_proxy,
         &temp.path().join("state.json"),
@@ -208,14 +375,8 @@ fn inherited_case_variant_proxy_and_no_proxy_are_overridden_and_restored() {
 
     assert_eq!(prepared.value["env"]["HTTPS_PROXY"], json!(relay_proxy));
     assert_eq!(prepared.value["env"]["https_proxy"], json!(relay_proxy));
-    assert_eq!(
-        prepared.value["env"]["NO_PROXY"],
-        json!("localhost,example.com")
-    );
-    assert_eq!(
-        prepared.value["env"]["no_proxy"],
-        json!("localhost,example.com")
-    );
+    assert_eq!(prepared.value["env"]["NO_PROXY"], json!("example.com"));
+    assert_eq!(prepared.value["env"]["no_proxy"], json!("example.com"));
     assert_eq!(
         prepared.value["env"]["CLAUDE_CODE_CERT_STORE"],
         json!("bundled,system")
@@ -228,7 +389,7 @@ fn inherited_case_variant_proxy_and_no_proxy_are_overridden_and_restored() {
         Some("http://corporate.example:8080/")
     );
 
-    apply(&prepared).unwrap();
+    apply(&mut prepared).unwrap();
     restore(&prepared.patch).unwrap();
     assert!(!path.exists());
 }
@@ -261,6 +422,54 @@ fn macos_upstream_proxy_carries_an_explicit_custom_ca_into_the_sidecar() {
 }
 
 #[test]
+fn linux_preserves_non_node_ca_alias_for_the_corporate_proxy() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = temp.path().join("settings.json");
+    let custom_ca = temp.path().join("corporate-ca.pem");
+    std::fs::write(&custom_ca, "test certificate material").unwrap();
+    let combined = temp.path().join("relay-combined.pem");
+    std::fs::write(&combined, "combined certificate material").unwrap();
+    let process_env = serde_json::from_value::<Map<String, Value>>(json!({
+        "HTTPS_PROXY": "https://proxy.example:8443",
+        "REQUESTS_CA_BUNDLE": custom_ca
+    }))
+    .unwrap();
+
+    let prepared = prepare_with_process_env(
+        &settings,
+        "http://nemo-relay:secret@127.0.0.1:40000",
+        &temp.path().join("state.json"),
+        &combined,
+        "linux",
+        None,
+        &process_env,
+    )
+    .unwrap();
+    let expected = custom_ca.canonicalize().unwrap();
+
+    assert_eq!(
+        prepared.patch.original_ca_bundle.as_deref(),
+        Some(expected.as_path())
+    );
+    assert_eq!(
+        prepared
+            .upstream_proxy
+            .as_ref()
+            .and_then(|proxy| proxy.ca_bundle.as_deref()),
+        Some(expected.as_path())
+    );
+    assert_eq!(
+        prepared
+            .patch
+            .fields
+            .get("NODE_EXTRA_CA_CERTS")
+            .and_then(|field| field.installed.as_ref())
+            .and_then(Value::as_str),
+        Some(combined.to_str().unwrap())
+    );
+}
+
+#[test]
 fn upstream_proxy_errors_do_not_expose_basic_credentials() {
     let error = validate_upstream_proxy(
         "https://sensitive-user:sensitive-password@proxy.example/path",
@@ -280,7 +489,7 @@ fn linux_ca_bundle_composes_existing_material_before_relay_root() {
     compose_linux_ca_bundle(
         &combined,
         "-----BEGIN CERTIFICATE-----\nRELAY\n-----END CERTIFICATE-----\n",
-        existing.to_str(),
+        Some(existing.as_path()),
     )
     .unwrap();
     assert_eq!(
@@ -373,7 +582,7 @@ fn preparation_rejects_non_string_gateway_unknown_platform_and_automatic_proxy()
             &Map::new(),
         )
         .unwrap_err()
-        .contains("unsupported Claude Desktop platform")
+        .contains("unsupported coding-agent proxy platform")
     );
 
     let automatic = serde_json::from_value::<Map<String, Value>>(json!({
@@ -498,7 +707,7 @@ fn explicit_https_proxy_disambiguates_lower_priority_proxy_variables() {
 fn matches_detects_mutation_and_public_permissions() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("settings.json");
-    let prepared = prepare_with_process_env(
+    let mut prepared = prepare_with_process_env(
         &path,
         "http://nemo-relay:secret@127.0.0.1:47633",
         &temp.path().join("state.json"),
@@ -508,7 +717,7 @@ fn matches_detects_mutation_and_public_permissions() {
         &Map::new(),
     )
     .unwrap();
-    apply(&prepared).unwrap();
+    apply(&mut prepared).unwrap();
     let mut value = crate::agents::shared::host::read_json_object(&path).unwrap();
     value["env"]["NEMO_RELAY_FAIL_CLOSED"] = json!("0");
     crate::agents::shared::host::write_json(&path, &value).unwrap();

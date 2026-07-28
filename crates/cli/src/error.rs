@@ -34,10 +34,10 @@ pub(crate) enum CliError {
     InvalidPayload(String),
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
-    #[error("unauthorized gateway client: {0}")]
-    Unauthorized(String),
     #[error("gateway upstream error: {0}")]
     Upstream(#[from] reqwest::Error),
+    #[error("gateway upstream transport error: {0}")]
+    UpstreamTransport(String),
     #[error("{0}")]
     ProviderFailure(UpstreamFailure),
     #[error("http error: {0}")]
@@ -75,8 +75,7 @@ impl CliError {
             Self::GuardrailRejected(_) => "guardrail_rejected",
             Self::InvalidPayload(_) => "invalid_payload",
             Self::PayloadTooLarge(_) => "payload_too_large",
-            Self::Unauthorized(_) => "unauthorized",
-            Self::Upstream(_) => "upstream",
+            Self::Upstream(_) | Self::UpstreamTransport(_) => "upstream",
             Self::ProviderFailure(_) => "provider_failure",
             Self::Http(_) => "http",
             Self::Io(_) => "io",
@@ -136,9 +135,8 @@ impl IntoResponse for CliError {
         let status = match (guardrail_reason.is_some(), &self) {
             (true, _) => StatusCode::FORBIDDEN,
             (false, Self::PayloadTooLarge(_)) => StatusCode::PAYLOAD_TOO_LARGE,
-            (false, Self::Unauthorized(_)) => StatusCode::UNAUTHORIZED,
             (false, Self::InvalidPayload(_)) => StatusCode::BAD_REQUEST,
-            (false, Self::Upstream(_)) => StatusCode::BAD_GATEWAY,
+            (false, Self::Upstream(_) | Self::UpstreamTransport(_)) => StatusCode::BAD_GATEWAY,
             (false, Self::ProviderFailure(failure)) => failure
                 .status
                 .and_then(|status| StatusCode::from_u16(status).ok())

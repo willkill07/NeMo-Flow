@@ -20,12 +20,37 @@ Keep `scripts/` focused on helpers that are still script-native:
 
 ## Opt-In Coding-Agent E2E Tests
 
-These checks exercise installed coding-agent clients and are intentionally outside the default Rust and CI test suites. Run the recipe that matches an available local client:
+These checks exercise installed coding-agent clients and are intentionally
+outside the default Rust and CI test suites. Each proxy test requires its
+documented `NEMO_RELAY_*_LIVE_E2E=1` gate because it temporarily changes real
+agent configuration, makes a provider request, and restores the previous
+configuration on exit. On macOS and Windows, enrollment also changes
+current-user TLS trust. Linux instead writes agent-scoped CA bundles and leaves
+the system trust store unchanged. Once a lane is selected, missing agent or
+provider prerequisites fail instead of skipping. Individual scripts differ in
+their assertions: Claude Desktop is a manual GUI proof and does not currently perform
+the automated service-stop check. The Codex lane runs the installed provider
+with WebSockets enabled, forces an HTTP/SSE fallback, runs two concurrent
+sessions, verifies the two transport tags and overlapping call intervals from
+an isolated ATOF sink, verifies fail-closed service loss, and then checks
+uninstall. Automated CLI lanes stop and restart the per-user LaunchAgent,
+systemd user unit, or SID-derived Windows scheduled task; selected Windows
+lanes do not skip service-loss enforcement.
 
-- `just test-codex-plugin-e2e`
-- `just test-claude-plugin-e2e`
-- `NEMO_RELAY_CLAUDE_DESKTOP_LIVE_POC=1 just test-claude-desktop-live-poc` (installs user TLS trust and a login service, consumes real subscription requests, validates isolated ATOF and ATIF file output, and pauses for GUI confirmation)
-- `just test-hermes-mcp-e2e`
+- `NEMO_RELAY_CODEX_LIVE_E2E=1 just test-codex-plugin-e2e`
+- `NEMO_RELAY_CLAUDE_LIVE_E2E=1 just test-claude-plugin-e2e`
+- `NEMO_RELAY_CLAUDE_DESKTOP_LIVE_POC=1 just test-claude-desktop-live-poc` (configures platform-specific agent trust and the per-user service, opens the protected Code tab, and pauses for GUI confirmation)
+- `NEMO_RELAY_HERMES_LIVE_E2E=1 NEMO_RELAY_HERMES_UNKNOWN_PROVIDER_COMMAND='<successful unknown-provider Hermes command>' just test-hermes-agent-proxy-e2e` selects the provisioned Hermes release lane. Once selected, missing Hermes/provider setup or nonexclusive degraded markers fail instead of skipping.
+
+The Hermes live gate requires `NEMO_RELAY_HERMES_UNKNOWN_PROVIDER_COMMAND` to
+be an explicit Hermes command that uses an unsupported public HTTPS provider.
+The script gives the proxy an isolated ATOF sink, requires the command to
+succeed through the opaque tunnel, and verifies that every resulting provider
+classification is
+`managed_inference=false` and `observability_mode=hook_only_degraded`, with no
+managed classification in that command's event window. Run these tests only
+with no pre-existing Relay coding-agent enrollment; the installer refuses
+legacy or incompatible state instead of migrating it.
 
 ## Internal Layout
 

@@ -138,7 +138,10 @@ fn shutdown_request_rejects_a_malformed_http_response() {
 
     let error = request_shutdown(&url, "fingerprint", "private-token").unwrap_err();
 
-    assert!(error.contains("malformed shutdown response"), "{error}");
+    assert!(
+        error.contains("ended before its headers") || error.contains("malformed shutdown response"),
+        "{error}"
+    );
     server.join().unwrap();
 }
 

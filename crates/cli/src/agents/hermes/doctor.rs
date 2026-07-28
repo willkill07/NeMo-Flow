@@ -5,8 +5,8 @@ use std::path::Path;
 
 pub(crate) fn hook_status(hooks_path: Option<&Path>) -> Result<String, String> {
     match hooks_path {
-        Some(path) => super::diagnose_persistent(path).map_err(|error| {
-            format!("persistent MCP/hooks: {error}; run `nemo-relay install hermes --force`")
+        Some(path) => super::diagnose_persistent(path, None).map_err(|error| {
+            format!("persistent proxy/hooks: {error}; run `nemo-relay install hermes --force`")
         }),
         None => Ok("hooks: injected through an isolated HERMES_HOME during run".into()),
     }

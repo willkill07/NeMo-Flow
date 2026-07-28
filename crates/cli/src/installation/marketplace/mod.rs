@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::error::CliError;
@@ -27,14 +27,13 @@ use crate::installation::{InstallRequest, UninstallRequest};
 
 use crate::installation::operation_lock::{DEFAULT_OPERATION_LOCK_TIMEOUT, PluginOperationLock};
 use assets::{
-    marketplace_manifest, plugin_hooks, plugin_manifest, plugin_mcp_config,
-    write_plugin_marketplace, write_plugin_marketplace_for_generation,
+    marketplace_manifest, plugin_hooks, plugin_manifest, write_plugin_marketplace,
+    write_plugin_marketplace_for_generation,
 };
 use host::{
-    CommandOutput, CommandRunner, HostRegistrationReport, RealCommandRunner,
-    host_registration_report, require_host_cli, require_relay, run_host_marketplace_registration,
-    run_host_marketplace_removal, run_host_plugin_registration, run_host_plugin_removal,
-    validate_relay_hook_forward, validate_relay_mcp,
+    CommandOutput, CommandRunner, RealCommandRunner, host_registration_report, require_host_cli,
+    require_relay, run_host_marketplace_registration, run_host_marketplace_removal,
+    run_host_plugin_registration, run_host_plugin_removal, validate_relay_hook_forward,
 };
 use setup::{
     HostPluginSetupRunner, PluginSetupRunner, run_plugin_doctor_json,
@@ -48,7 +47,8 @@ use state::{
     write_state, write_state_for_host,
 };
 
-pub(super) use crate::bootstrap::DEFAULT_URL as DEFAULT_GATEWAY_URL;
+#[cfg(test)]
+pub(super) use crate::bootstrap::LEGACY_FIXED_URL as DEFAULT_GATEWAY_URL;
 pub(super) const MARKETPLACE_NAME: &str = "nemo-relay-local";
 pub(super) const PLUGIN_NAME: &str = "nemo-relay-plugin";
 pub(super) const RELAY_COMMAND: &str = "nemo-relay";
@@ -127,6 +127,248 @@ pub(crate) fn marketplace_install_roots(
 ) -> (PathBuf, PathBuf) {
     let layout = PluginLayout::new(host, install_dir);
     (layout.marketplace_root, layout.plugin_root)
+}
+
+pub(crate) fn marketplace_generation_lock(
+    host: impl MarketplaceHost,
+    install_dir: &Path,
+) -> PathBuf {
+    PluginLayout::new(host, install_dir).generation_lock
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct DurableMarketplaceSnapshot {
+    agent: crate::agents::CodingAgent,
+    install_dir: PathBuf,
+    directory: crate::filesystem::DirectorySnapshot,
+    state: crate::filesystem::FileSnapshot,
+    generation_lock: crate::filesystem::FileSnapshot,
+    host_plugin_registered: bool,
+    host_marketplace_registered: bool,
+    host_plugin_root: Option<PathBuf>,
+    host_marketplace_root: Option<PathBuf>,
+    #[serde(default)]
+    transient_paths_before: Vec<PathBuf>,
+}
+
+impl DurableMarketplaceSnapshot {
+    pub(crate) const fn agent(&self) -> crate::agents::CodingAgent {
+        self.agent
+    }
+
+    pub(crate) fn capture_current(&self) -> Result<Self, String> {
+        capture_marketplace_snapshot(self.agent, &self.install_dir)
+    }
+}
+
+pub(crate) fn capture_marketplace_snapshot(
+    agent: crate::agents::CodingAgent,
+    install_dir: &Path,
+) -> Result<DurableMarketplaceSnapshot, String> {
+    if !matches!(
+        agent,
+        crate::agents::CodingAgent::Codex | crate::agents::CodingAgent::ClaudeCode
+    ) || !install_dir.is_absolute()
+    {
+        return Err("marketplace snapshot requires an absolute supported-host path".into());
+    }
+    let (marketplace_root, _) = marketplace_install_roots(agent, install_dir);
+    let options = plugin_doctor_options(Some(install_dir.to_path_buf()));
+    let registration = host_registration_report(agent, &options, &RealCommandRunner)?;
+    Ok(DurableMarketplaceSnapshot {
+        agent,
+        install_dir: install_dir.to_path_buf(),
+        directory: crate::filesystem::DirectorySnapshot::capture(&marketplace_root)?,
+        state: crate::filesystem::snapshot_optional_file(&marketplace_state_path(
+            agent,
+            install_dir,
+        ))?,
+        generation_lock: crate::filesystem::snapshot_optional_file(&marketplace_generation_lock(
+            agent,
+            install_dir,
+        ))?,
+        host_plugin_registered: registration.host_plugin_registered,
+        host_marketplace_registered: registration.host_marketplace_registered,
+        host_plugin_root: registration.host_plugin_root,
+        host_marketplace_root: registration.host_marketplace_root,
+        transient_paths_before: marketplace_transient_paths(agent, install_dir)?,
+    })
+}
+
+pub(crate) fn restore_marketplace_snapshot_cas(
+    snapshot: &DurableMarketplaceSnapshot,
+    expected_current: Option<&DurableMarketplaceSnapshot>,
+) -> Result<(), String> {
+    validate_marketplace_snapshot(snapshot)?;
+    let current = snapshot.capture_current()?;
+    if current == *snapshot {
+        return Ok(());
+    }
+    if expected_current != Some(&current) {
+        return Err(format!(
+            "{} marketplace changed outside this Relay transaction; retained the current files and host registration",
+            snapshot.agent.label()
+        ));
+    }
+    let mut errors = Vec::new();
+    errors.extend(
+        [
+            snapshot.directory.restore(),
+            crate::filesystem::restore_file_snapshot(&snapshot.state),
+            crate::filesystem::restore_file_snapshot(&snapshot.generation_lock),
+        ]
+        .into_iter()
+        .filter_map(Result::err),
+    );
+    if errors.is_empty()
+        && let Err(error) = restore_host_registration(snapshot)
+    {
+        errors.push(error);
+    }
+    if errors.is_empty()
+        && let Err(error) = remove_new_marketplace_transients(snapshot)
+    {
+        errors.push(error);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn validate_marketplace_snapshot(snapshot: &DurableMarketplaceSnapshot) -> Result<(), String> {
+    if !matches!(
+        snapshot.agent,
+        crate::agents::CodingAgent::Codex | crate::agents::CodingAgent::ClaudeCode
+    ) || !snapshot.install_dir.is_absolute()
+    {
+        return Err("marketplace snapshot has invalid identity metadata".into());
+    }
+    let (expected_root, _) = marketplace_install_roots(snapshot.agent, &snapshot.install_dir);
+    if snapshot.directory.root() != expected_root
+        || snapshot.state.path() != marketplace_state_path(snapshot.agent, &snapshot.install_dir)
+        || snapshot.generation_lock.path()
+            != marketplace_generation_lock(snapshot.agent, &snapshot.install_dir)
+        || snapshot
+            .host_plugin_root
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        || snapshot
+            .host_marketplace_root
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        || snapshot
+            .transient_paths_before
+            .iter()
+            .any(|path| !safe_marketplace_transient(snapshot.agent, &snapshot.install_dir, path))
+    {
+        return Err("marketplace snapshot contains unsafe paths".into());
+    }
+    Ok(())
+}
+
+fn marketplace_transient_paths(
+    agent: crate::agents::CodingAgent,
+    install_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let entries = match fs::read_dir(install_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect marketplace transaction paths in {}: {error}",
+                install_dir.display()
+            ));
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("failed to inspect {}: {error}", install_dir.display()))?
+            .path();
+        if safe_marketplace_transient(agent, install_dir, &path) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn safe_marketplace_transient(
+    agent: crate::agents::CodingAgent,
+    install_dir: &Path,
+    path: &Path,
+) -> bool {
+    if path.parent() != Some(install_dir) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    [
+        format!(".{}-marketplace-backup-", agent.install_arg()),
+        format!(".{}-plugin-backup-", agent.install_arg()),
+        format!(".{}-install-stage-", agent.install_arg()),
+    ]
+    .iter()
+    .any(|prefix| {
+        name.strip_prefix(prefix).is_some_and(|suffix| {
+            !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    })
+}
+
+fn remove_new_marketplace_transients(snapshot: &DurableMarketplaceSnapshot) -> Result<(), String> {
+    for path in marketplace_transient_paths(snapshot.agent, &snapshot.install_dir)? {
+        if snapshot.transient_paths_before.contains(&path) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "refusing to remove non-directory marketplace transaction path {}",
+                path.display()
+            ));
+        }
+        fs::remove_dir_all(&path)
+            .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn restore_host_registration(snapshot: &DurableMarketplaceSnapshot) -> Result<(), String> {
+    let options = plugin_doctor_options(Some(snapshot.install_dir.clone()));
+    let runner = RealCommandRunner;
+    let current = host_registration_report(snapshot.agent, &options, &runner)?;
+    if current.host_plugin_registered && !snapshot.host_plugin_registered {
+        run_host_plugin_removal(snapshot.agent, &options, &runner)?;
+    }
+    if current.host_marketplace_registered && !snapshot.host_marketplace_registered {
+        run_host_marketplace_removal(snapshot.agent, &options, &runner)?;
+    }
+    if !current.host_marketplace_registered && snapshot.host_marketplace_registered {
+        let marketplace_root = snapshot
+            .host_marketplace_root
+            .as_deref()
+            .unwrap_or(snapshot.directory.root());
+        run_host_marketplace_registration(snapshot.agent, marketplace_root, &options, &runner)?;
+    }
+    let current = host_registration_report(snapshot.agent, &options, &runner)?;
+    if !current.host_plugin_registered && snapshot.host_plugin_registered {
+        run_host_plugin_registration(snapshot.agent, &options, &runner)?;
+    }
+    let restored = host_registration_report(snapshot.agent, &options, &runner)?;
+    if restored.host_plugin_registered != snapshot.host_plugin_registered
+        || restored.host_marketplace_registered != snapshot.host_marketplace_registered
+    {
+        return Err("host marketplace registration did not return to its snapshotted state".into());
+    }
+    Ok(())
 }
 
 pub(crate) fn collect_marketplace_readiness(
@@ -426,7 +668,6 @@ fn install_host_locked(
 ) -> Result<(), String> {
     let relay = require_relay(options, runner)?;
     validate_relay_hook_forward(&relay, options, runner)?;
-    validate_relay_mcp(&relay, options, runner)?;
     require_host_cli(host, options, runner)?;
     host::validate_host_version(host, options, runner)?;
     let layout = PluginLayout::new(host, &options.install_dir);
@@ -725,7 +966,7 @@ fn write_install_state<H: MarketplaceHost>(
                 Ok(retirement) => retirement,
                 Err(retirement_error) => {
                     return Err(format!(
-                        "{error}; refusing destructive rollback because the replacement MCP generation could not be retired: {retirement_error}"
+                        "{error}; refusing destructive rollback because the replacement hook installation generation could not be retired: {retirement_error}"
                     ));
                 }
             }
@@ -867,7 +1108,7 @@ fn recover_failed_install_registration<H: MarketplaceHost>(
     retire_live_replacement_before_rollback(host, layout, options, setup_runner, transaction, &registration)
         .map_err(|retirement_error| {
             format!(
-                "{error}; refusing destructive rollback because the replacement MCP generation could not be retired: {retirement_error}"
+                "{error}; refusing destructive rollback because the replacement hook installation generation could not be retired: {retirement_error}"
             )
         })?;
     let rollback_error = rollback_install(
@@ -986,7 +1227,7 @@ fn uninstall_host_locked(
     if let Some(retirement) = generation_retirement.as_mut() {
         retirement.invalidate_for_replacement().map_err(|error| {
             format!(
-                "failed to retire installed MCP generation before uninstalling {}: {error}",
+                "failed to retire installed hook installation generation before uninstalling {}: {error}",
                 plugin_root.display()
             )
         })?;
@@ -998,7 +1239,7 @@ fn uninstall_host_locked(
             && let Err(restore_error) = retirement.restore_after_rollback()
         {
             return Err(format!(
-                "{error}; additionally failed to restore the installed MCP generation: {restore_error}"
+                "{error}; additionally failed to restore the installed hook installation generation: {restore_error}"
             ));
         }
         return Err(error);
@@ -1037,7 +1278,7 @@ fn retire_installed_generation(
         let registration = host_registration_report(host, options, runner)?;
         existing_install |=
             registration.host_plugin_registered || registration.host_marketplace_registered;
-        if existing_install && !legacy_plugin_without_mcp(host, plugin_root)? {
+        if existing_install {
             return Err(missing_generation_fence_error(host, &generation_fence));
         }
     }
@@ -1049,7 +1290,7 @@ fn retire_installed_generation(
         existing_install =
             registration.host_plugin_registered || registration.host_marketplace_registered;
     }
-    if retirement.is_none() && existing_install && !legacy_plugin_without_mcp(host, plugin_root)? {
+    if retirement.is_none() && existing_install {
         return Err(missing_generation_fence_error(host, &generation_fence));
     }
     Ok(retirement)
@@ -1070,7 +1311,7 @@ fn retire_replacement_before_rollback(
     {
         let visible = retirement.retire_visible_replacement().map_err(|error| {
             format!(
-                "failed to retire replacement MCP generation {} before rollback: {error}",
+                "failed to retire replacement hook installation generation {} before rollback: {error}",
                 layout.generation_fence.display()
             )
         })?;
@@ -1078,7 +1319,7 @@ fn retire_replacement_before_rollback(
             return match retirement.restore_visible_replacement(visible) {
                 Ok(()) => Err(error),
                 Err(restore_error) => Err(format!(
-                    "{error}; additionally failed to restore the replacement MCP generation after rollback refresh failed: {restore_error}"
+                    "{error}; additionally failed to restore the replacement hook installation generation after rollback refresh failed: {restore_error}"
                 )),
             };
         }
@@ -1092,7 +1333,7 @@ fn retire_replacement_before_rollback(
             .ok_or_else(|| missing_generation_fence_error(host, &layout.generation_fence))?;
     retirement.invalidate_for_replacement().map_err(|error| {
         format!(
-            "failed to retire replacement MCP generation {} before rollback: {error}",
+            "failed to retire replacement hook installation generation {} before rollback: {error}",
             layout.generation_fence.display()
         )
     })?;
@@ -1100,7 +1341,7 @@ fn retire_replacement_before_rollback(
         return match retirement.restore_after_rollback() {
             Ok(()) => Err(error),
             Err(restore_error) => Err(format!(
-                "{error}; additionally failed to restore the replacement MCP generation after rollback refresh failed: {restore_error}"
+                "{error}; additionally failed to restore the replacement hook installation generation after rollback refresh failed: {restore_error}"
             )),
         };
     }
@@ -1139,84 +1380,6 @@ fn invalid_generation_fence_error(
 
 fn unsafe_generation_fence_error(host: impl MarketplaceHost, problem: &str) -> String {
     host.unsafe_generation_fence_error(problem)
-}
-
-fn legacy_plugin_without_mcp(
-    host: impl MarketplaceHost,
-    plugin_root: &Path,
-) -> Result<bool, String> {
-    if !host.accepts_legacy_hook_only_plugin() || plugin_root.join(".mcp.json").exists() {
-        return Ok(false);
-    }
-    let manifest_path = plugin_manifest_path(host, plugin_root);
-    let raw = match fs::read_to_string(&manifest_path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(format!(
-                "failed to inspect legacy plugin manifest {}: {error}",
-                manifest_path.display()
-            ));
-        }
-    };
-    let manifest = serde_json::from_str::<Value>(&raw).map_err(|error| {
-        format!(
-            "failed to inspect legacy plugin manifest {}: {error}",
-            manifest_path.display()
-        )
-    })?;
-    Ok(manifest.get("mcpServers").is_none())
-}
-
-fn registered_relay_legacy_plugin_without_mcp(
-    host: impl MarketplaceHost,
-    layout: &PluginLayout,
-    registration: &HostRegistrationReport,
-) -> Result<bool, String> {
-    if !host.accepts_legacy_hook_only_plugin()
-        || !registration.host_plugin_registered
-        || !registration.host_marketplace_registered
-    {
-        return Ok(false);
-    }
-    let Some(plugin_root) = registration.host_plugin_root.as_deref() else {
-        return Ok(false);
-    };
-    let Some(marketplace_root) = registration.host_marketplace_root.as_deref() else {
-        return Ok(false);
-    };
-    if !selected_paths_match(marketplace_root, &layout.marketplace_root)
-        || !legacy_plugin_without_mcp(host, plugin_root)?
-    {
-        return Ok(false);
-    }
-    let manifest_path = plugin_manifest_path(host, plugin_root);
-    let raw = fs::read_to_string(&manifest_path).map_err(|error| {
-        format!(
-            "failed to inspect registered legacy plugin manifest {}: {error}",
-            manifest_path.display()
-        )
-    })?;
-    let manifest = serde_json::from_str::<Value>(&raw).map_err(|error| {
-        format!(
-            "failed to inspect registered legacy plugin manifest {}: {error}",
-            manifest_path.display()
-        )
-    })?;
-    Ok(
-        manifest.get("name").and_then(Value::as_str) == Some(PLUGIN_NAME)
-            && manifest.get("repository").and_then(Value::as_str)
-                == Some("https://github.com/NVIDIA/NeMo-Relay"),
-    )
-}
-
-fn selected_paths_match(left: &Path, right: &Path) -> bool {
-    left == right
-        || left
-            .canonicalize()
-            .ok()
-            .zip(right.canonicalize().ok())
-            .is_some_and(|(left, right)| left == right)
 }
 
 fn uninstall_host_with_setup_override(
@@ -1405,27 +1568,14 @@ fn collect_host_plugin_readiness(
                 }),
             );
         }
-        readiness.push(
-            "Relay MCP support",
-            validate_relay_mcp(&relay, options, runner)
-                .map(|_| "native mcp subcommand is supported".into()),
-        );
         if let Some(plugin) = readiness.plugin.as_ref() {
             let generation_fence =
                 plugin.join(crate::installation::generation::GENERATION_FILE_NAME);
-            let mcp_config = plugin_mcp_config_path(plugin);
             readiness.push(
-                "MCP generation fence",
+                "Hook generation fence",
                 InstallGeneration::capture(generation_fence.clone())
                     .map(|_| format!("valid generation at {}", generation_fence.display())),
             );
-            let check =
-                InstallGeneration::capture(generation_fence.clone()).and_then(|generation| {
-                    plugin_mcp_config(host, &relay, &generation_fence, generation.token()).and_then(
-                        |expected| generated_mcp_config_check(host, &mcp_config, &expected),
-                    )
-                });
-            readiness.push("Generated MCP server", check);
         }
     }
 
@@ -1492,12 +1642,12 @@ fn collect_host_plugin_readiness(
 }
 
 fn append_plugin_setup_checks(readiness: &mut HostPluginReadiness, report: &Value) {
-    if let Some(health) = report.get("sidecar_health").and_then(Value::as_str) {
-        readiness.push("Sidecar health", Ok(health.to_string()));
+    if let Some(health) = report.get("proxy_service_health").and_then(Value::as_str) {
+        readiness.push("Proxy service health", Ok(health.to_string()));
     }
     if let Some(checks) = report.get("checks").and_then(Value::as_object) {
         for (name, value) in checks {
-            if name == "sidecar_running" {
+            if name == "proxy_service_running" {
                 continue;
             }
             let details = name.replace('_', " ");
@@ -1539,122 +1689,6 @@ fn generated_manifest_check(path: &Path, expected: &Value, label: &str) -> Resul
     }
 }
 
-fn generated_mcp_config_check(
-    host: impl MarketplaceHost,
-    path: &Path,
-    expected: &Value,
-) -> Result<String, String> {
-    generated_mcp_config_check_for_platform(host, path, expected, cfg!(windows))
-}
-
-fn generated_mcp_config_check_for_platform(
-    host: impl MarketplaceHost,
-    path: &Path,
-    expected: &Value,
-    windows: bool,
-) -> Result<String, String> {
-    let raw = std::fs::read_to_string(path).map_err(|error| {
-        format!(
-            "missing or unreadable MCP server manifest {}: {error}",
-            path.display()
-        )
-    })?;
-    let actual = serde_json::from_str::<Value>(&raw)
-        .map_err(|error| format!("invalid MCP server manifest {}: {error}", path.display()))?;
-    if actual == *expected {
-        return Ok(format!("valid at {}", path.display()));
-    }
-    if !host.accepts_mcp_environment_superset() {
-        return Err(format!(
-            "unexpected MCP server manifest contents at {}; run `nemo-relay install {} --force`",
-            path.display(),
-            host.install_arg()
-        ));
-    }
-    let expected_server = &expected["nemo-relay"];
-    let actual_server = &actual["nemo-relay"];
-    let Some(expected_vars) = mcp_env_var_names(expected_server) else {
-        return Err(format!(
-            "unexpected MCP server manifest contents at {}; run `nemo-relay install {} --force`",
-            path.display(),
-            host.install_arg()
-        ));
-    };
-    let Some(actual_vars) = mcp_env_var_names(actual_server) else {
-        return Err(format!(
-            "unexpected MCP server manifest contents at {}; run `nemo-relay install {} --force`",
-            path.display(),
-            host.install_arg()
-        ));
-    };
-    let duplicate = actual_vars.iter().enumerate().any(|(index, name)| {
-        actual_vars[..index].iter().any(|other| {
-            crate::mcp_environment::forwarded_names_match_for_platform(name, other, windows)
-        })
-    });
-    if duplicate
-        || actual_vars.iter().any(|name| {
-            !expected_vars.iter().any(|expected| {
-                crate::mcp_environment::forwarded_names_match_for_platform(name, expected, windows)
-            }) && !crate::mcp_environment::previously_forwardable_name_for_platform(name, windows)
-        })
-    {
-        return Err(format!(
-            "unexpected MCP server manifest contents at {}; run `nemo-relay install {} --force`",
-            path.display(),
-            host.install_arg()
-        ));
-    }
-    let missing = expected_vars
-        .iter()
-        .filter(|expected| {
-            !actual_vars.iter().any(|actual| {
-                crate::mcp_environment::forwarded_names_match_for_platform(
-                    expected, actual, windows,
-                )
-            })
-        })
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(format!(
-            "MCP server at {} is missing forwarded environment variables: {}; run `nemo-relay install {} --force`",
-            path.display(),
-            missing.join(", "),
-            host.install_arg()
-        ));
-    }
-    let mut expected_without_vars = expected.clone();
-    let mut actual_without_vars = actual.clone();
-    let expected_server = expected_without_vars
-        .get_mut("nemo-relay")
-        .and_then(Value::as_object_mut);
-    let actual_server = actual_without_vars
-        .get_mut("nemo-relay")
-        .and_then(Value::as_object_mut);
-    if let (Some(expected_server), Some(actual_server)) = (expected_server, actual_server) {
-        expected_server.remove("env_vars");
-        actual_server.remove("env_vars");
-        if actual_without_vars == expected_without_vars {
-            return Ok(format!("valid at {}", path.display()));
-        }
-    }
-    Err(format!(
-        "unexpected MCP server manifest contents at {}; run `nemo-relay install {} --force`",
-        path.display(),
-        host.install_arg()
-    ))
-}
-
-fn mcp_env_var_names(server: &Value) -> Option<Vec<String>> {
-    server
-        .get("env_vars")?
-        .as_array()?
-        .iter()
-        .map(|value| value.as_str().map(str::to_owned))
-        .collect()
-}
-
 fn marketplace_manifest_path(host: impl MarketplaceHost, root: &Path) -> PathBuf {
     host.marketplace_manifest_relative()
         .iter()
@@ -1665,10 +1699,6 @@ fn plugin_manifest_path(host: impl MarketplaceHost, root: &Path) -> PathBuf {
     host.plugin_manifest_relative()
         .iter()
         .fold(root.to_path_buf(), |path, component| path.join(component))
-}
-
-fn plugin_mcp_config_path(root: &Path) -> PathBuf {
-    root.join(".mcp.json")
 }
 
 struct StagedPluginMarketplace {
@@ -1738,11 +1768,11 @@ impl Drop for ReplacementGenerationLock {
                         log::warn!(
                             target: "nemo_relay.installation",
                             event = "installation_cleanup_deferred",
-                            component = "mcp_generation_lock",
+                            component = "hook_installation_generation_lock",
                             path = lock_path.as_str(),
                             marker_path = marker_path.as_str(),
                             error_kind = error_kind.as_str();
-                            "An MCP generation lock was retained because its marker could not be inspected"
+                            "A hook installation generation lock was retained because its marker could not be inspected"
                         );
                         false
                     }
@@ -1753,10 +1783,10 @@ impl Drop for ReplacementGenerationLock {
                             log::warn!(
                                 target: "nemo_relay.installation",
                                 event = "installation_cleanup_deferred",
-                                component = "mcp_generation_lock",
+                                component = "hook_installation_generation_lock",
                                 path = lock_path.as_str(),
                                 error_kind = "marker_reference";
-                                "An MCP generation lock was retained because its marker reference could not be verified"
+                                "A hook installation generation lock was retained because its marker reference could not be verified"
                             );
                             false
                         }
@@ -1848,16 +1878,10 @@ fn prepare_plugin_install(
         || marketplace_registered;
     let generation_retirement = if previous_install_exists {
         if !previous_generation_fence.exists() {
-            if legacy_plugin_without_mcp(host, &previous_plugin_root)?
-                || registered_relay_legacy_plugin_without_mcp(host, layout, &registration)?
-            {
-                None
-            } else {
-                return Err(missing_generation_fence_error(
-                    host,
-                    &previous_generation_fence,
-                ));
-            }
+            return Err(missing_generation_fence_error(
+                host,
+                &previous_generation_fence,
+            ));
         } else {
             Some(
                 GenerationRetirement::acquire_for_plugin(
@@ -1953,7 +1977,9 @@ fn remove_generation_lock_best_effort(path: &Path) {
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => log_cleanup_failure("mcp_generation_lock", path, error.kind()),
+        Err(error) => {
+            log_cleanup_failure("hook_installation_generation_lock", path, error.kind());
+        }
     }
 }
 
@@ -2113,7 +2139,7 @@ fn begin_force_replacement(
         if let Some(retirement) = snapshot.generation_retirement.as_mut() {
             retirement.invalidate_for_replacement().map_err(|error| {
                 format!(
-                    "failed to retire previous MCP generation {} before replacement: {error}",
+                    "failed to retire previous hook installation generation {} before replacement: {error}",
                     snapshot.original_generation_fence.display()
                 )
             })?;
@@ -2121,7 +2147,7 @@ fn begin_force_replacement(
                 .release_legacy_lock_for_tree_mutation()
                 .map_err(|error| {
                     format!(
-                        "failed to release previous MCP generation {} before moving its plugin tree: {error}",
+                        "failed to release previous hook installation generation {} before moving its plugin tree: {error}",
                         snapshot.original_generation_fence.display()
                     )
                 })?;

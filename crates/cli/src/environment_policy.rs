@@ -1,15 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Environment names shared by MCP generation and gateway compatibility checks.
+//! Environment-name policy for persistent proxy identity fingerprinting.
 
 use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-use crate::installation::generation::{GENERATION_FILE_ENV, GENERATION_TOKEN_ENV};
-
-const BASE_MCP_ENV_VARS: &[&str] = &[
+const BASE_FINGERPRINT_ENV_VARS: &[&str] = &[
     "ALL_PROXY",
     "ANTHROPIC_API_KEY",
     "APPDATA",
@@ -45,9 +43,7 @@ const BASE_MCP_ENV_VARS: &[&str] = &[
     "NEMO_RELAY_MAX_PASSTHROUGH_BODY_BYTES",
     "NEMO_RELAY_OPENAI_AUTH_HEADER",
     "NEMO_RELAY_OPENAI_BASE_URL",
-    "NEMO_RELAY_PLUGIN_IDLE_TIMEOUT_SECS",
     "NEMO_RELAY_PYTHON",
-    "NEMO_RELAY_TRANSPARENT_RUN",
     "NO_PROXY",
     "OPENAI_API_KEY",
     "OTEL_EXPORTER_OTLP_COMPRESSION",
@@ -76,7 +72,7 @@ const BASE_MCP_ENV_VARS: &[&str] = &[
     "no_proxy",
 ];
 
-const BLOCKED_MCP_ENV_VARS: &[&str] = &[
+const BLOCKED_FINGERPRINT_ENV_VARS: &[&str] = &[
     "NEMO_RELAY_BINDING_KIND",
     "NEMO_RELAY_BOOTSTRAP_AGENT",
     "NEMO_RELAY_BOOTSTRAP_FINGERPRINT",
@@ -97,6 +93,7 @@ const BLOCKED_MCP_ENV_VARS: &[&str] = &[
     "NEMO_RELAY_PLUGIN_CONFIG_PATH",
     "NEMO_RELAY_PLUGIN_GATEWAY_URL",
     "NEMO_RELAY_PLUGIN_ID",
+    "NEMO_RELAY_PLUGIN_IDLE_TIMEOUT_SECS",
     "NEMO_RELAY_RUNTIME_OWNER",
     "NEMO_RELAY_WORKER_ENDPOINT_FILE",
     "NEMO_RELAY_WORKER_ID",
@@ -104,20 +101,20 @@ const BLOCKED_MCP_ENV_VARS: &[&str] = &[
     "NEMO_RELAY_WORKER_TOKEN",
 ];
 
-pub(crate) fn forwarded_names(
+pub(crate) fn fingerprinted_names(
     environment: impl IntoIterator<Item = String>,
     config: Option<&Value>,
 ) -> Vec<String> {
-    forwarded_names_for_platform(environment, config, cfg!(windows))
+    fingerprinted_names_for_platform(environment, config, cfg!(windows))
 }
 
-pub(crate) fn forwarded_names_for_platform(
+pub(crate) fn fingerprinted_names_for_platform(
     environment: impl IntoIterator<Item = String>,
     config: Option<&Value>,
     windows: bool,
 ) -> Vec<String> {
     let mut names = BTreeSet::new();
-    for name in BASE_MCP_ENV_VARS {
+    for name in BASE_FINGERPRINT_ENV_VARS {
         insert_name(&mut names, (*name).to_string(), windows);
     }
     for name in environment {
@@ -131,66 +128,6 @@ pub(crate) fn forwarded_names_for_platform(
     names.into_iter().collect()
 }
 
-/// Removes unresolved `${NAME}` values injected by MCP hosts before CLI parsing.
-///
-/// Hermes forwards environment names through placeholder values rather than a separate
-/// `env_vars` list. When a variable is absent, Hermes preserves the self-placeholder. Relay must
-/// treat that value as unset before clap reads numeric or socket-valued environment options. The
-/// generation fence scopes this cleanup to managed persistent MCP launches; internal variables
-/// remain untouched so malformed or retired generation identities fail closed during validation.
-pub(crate) fn remove_unresolved_mcp_placeholders() {
-    if std::env::var_os(GENERATION_FILE_ENV).is_none()
-        || std::env::var_os(GENERATION_TOKEN_ENV).is_none()
-    {
-        return;
-    }
-    let unresolved = std::env::vars_os()
-        .filter_map(|(name, value)| {
-            let name_text = name.to_str()?;
-            let value = value.to_str()?;
-            (!blocked(name_text)
-                && unresolved_self_placeholder_for_platform(name_text, value, cfg!(windows)))
-            .then_some(name)
-        })
-        .collect::<Vec<_>>();
-    for name in unresolved {
-        // SAFETY: The synchronous CLI entrypoint calls this before constructing the Tokio runtime,
-        // so no other thread can read or write the process environment concurrently.
-        unsafe { std::env::remove_var(name) };
-    }
-}
-
-pub(crate) fn forwarded_names_match_for_platform(left: &str, right: &str, windows: bool) -> bool {
-    if windows {
-        left.eq_ignore_ascii_case(right)
-    } else {
-        left == right
-    }
-}
-
-/// Returns whether a name could have been captured from an earlier process environment.
-///
-/// Arbitrary config-referenced names remain in the current expected set. Historical extras are
-/// therefore limited to the static allowlist and approved dynamic prefixes.
-pub(crate) fn previously_forwardable_name_for_platform(name: &str, windows: bool) -> bool {
-    !blocked(name)
-        && (BASE_MCP_ENV_VARS
-            .iter()
-            .any(|base| forwarded_names_match_for_platform(name, base, windows))
-            || prefix_allowed(name, windows))
-}
-
-pub(crate) fn unresolved_self_placeholder_for_platform(
-    name: &str,
-    value: &str,
-    windows: bool,
-) -> bool {
-    value
-        .strip_prefix("${")
-        .and_then(|value| value.strip_suffix('}'))
-        .is_some_and(|placeholder| forwarded_names_match_for_platform(name, placeholder, windows))
-}
-
 fn prefix_allowed(name: &str, windows: bool) -> bool {
     ["NEMO_RELAY_", "OTEL_", "AWS_"].iter().any(|prefix| {
         if windows {
@@ -202,7 +139,7 @@ fn prefix_allowed(name: &str, windows: bool) -> bool {
 }
 
 fn blocked(name: &str) -> bool {
-    BLOCKED_MCP_ENV_VARS
+    BLOCKED_FINGERPRINT_ENV_VARS
         .iter()
         .any(|blocked| name.eq_ignore_ascii_case(blocked))
         || starts_with_ignore_ascii_case(name, "NEMO_RELAY_TEST_")

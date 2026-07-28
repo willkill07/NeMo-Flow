@@ -13,9 +13,8 @@ use crate::events::{AgentKind, LlmEvent, NormalizedEvent};
 
 /// Normalizes Hermes shell hook payloads without emitting control directives.
 ///
-/// Hermes hooks are installed as shell commands and may run outside `run`, so this adapter keeps
-/// responses minimal and relies on the forwarder fail-open/fail-closed setting to decide whether
-/// hook delivery problems affect the invoking agent.
+/// Hermes hooks are installed as shell commands and may run in several local Hermes modes, so this
+/// adapter keeps responses minimal. The installed forwarder is always fail closed.
 pub(crate) fn adapt(payload: Value, headers: &HeaderMap) -> AdapterOutcome {
     let event_name = event_name(&payload, &HERMES_PAYLOAD_EXTRACTOR);
     let normalized = normalize_name(&event_name);
@@ -106,8 +105,18 @@ fn hermes_llm_event(payload: &Value, headers: &HeaderMap, event_name: &str) -> L
         &HERMES_PAYLOAD_EXTRACTOR,
     );
     if let Value::Object(ref mut object) = event_metadata {
+        let managed_native = hermes_managed_native_provider(payload, headers);
         object.insert("api_call_id".into(), json!(api_call_id.clone()));
         object.insert("provider_payload_exact".into(), json!(payload_exact));
+        object.insert("managed_inference".into(), json!(managed_native));
+        object.insert(
+            "observability_mode".into(),
+            json!(if managed_native {
+                "managed_proxy"
+            } else {
+                "hook_only_degraded"
+            }),
+        );
         object.insert(
             "fidelity_source".into(),
             json!(if payload_exact {
@@ -128,6 +137,16 @@ fn hermes_llm_event(payload: &Value, headers: &HeaderMap, event_name: &str) -> L
         response: hermes_llm_response(payload),
         metadata: event_metadata,
     }
+}
+
+fn hermes_managed_native_provider(payload: &Value, headers: &HeaderMap) -> bool {
+    let enrolled = headers
+        .get(crate::claude_desktop::ENROLLED_AGENT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some("hermes");
+    enrolled
+        && hermes_string_at(payload, "base_url")
+            .is_some_and(|base_url| crate::claude_desktop::managed_native_provider_url(&base_url))
 }
 
 fn hermes_api_call_id(payload: &Value, session_id: &str) -> String {

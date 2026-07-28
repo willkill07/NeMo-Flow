@@ -3,8 +3,6 @@
 
 use serde_json::{Value, json};
 
-use crate::mcp::SERVER_NAME;
-
 pub(crate) fn marketplace_manifest(marketplace: &str, plugin: &str) -> Value {
     json!({
         "name": marketplace,
@@ -12,7 +10,7 @@ pub(crate) fn marketplace_manifest(marketplace: &str, plugin: &str) -> Value {
         "owner": { "name": "NVIDIA Corporation and Affiliates", "email": "noreply@nvidia.com" },
         "plugins": [{
             "name": plugin,
-            "description": "Run the shared native Relay gateway and capture Claude Code lifecycle events.",
+            "description": "Use the unified Relay proxy and capture Claude Code lifecycle events.",
             "source": "./plugins/nemo-relay-plugin",
             "category": "development"
         }]
@@ -23,20 +21,11 @@ pub(crate) fn plugin_manifest(plugin: &str) -> Value {
     json!({
         "name": plugin,
         "version": env!("CARGO_PKG_VERSION"),
-        "description": "Native Relay gateway lifecycle and Claude Code hooks for complete local observability.",
+        "description": "Preview integration for Relay proxy enrollment and Claude Code lifecycle hooks.",
         "author": { "name": "NVIDIA Corporation and Affiliates", "url": "https://github.com/NVIDIA/NeMo-Relay" },
         "homepage": "https://github.com/NVIDIA/NeMo-Relay",
         "repository": "https://github.com/NVIDIA/NeMo-Relay",
         "license": "Apache-2.0",
-        "keywords": ["nemo-relay", "claude-code", "hooks", "observability"],
-        "mcpServers": "./.mcp.json"
+        "keywords": ["nemo-relay", "claude-code", "hooks", "observability"]
     })
-}
-
-pub(crate) fn mcp_config(mut server: Value) -> Value {
-    server
-        .as_object_mut()
-        .expect("persistent MCP server is a JSON object")
-        .insert("alwaysLoad".into(), json!(true));
-    json!({ "mcpServers": { (SERVER_NAME): server } })
 }

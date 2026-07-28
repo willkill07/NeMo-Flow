@@ -39,6 +39,8 @@ integrations/openclaw/.test-dist/
 .uv-cache/
 .cache/pre-commit/
 .coverage
+crates/core/tests/fixtures/native_plugin/Cargo.lock
+go/nemo_relay/.nemo-relay/
 *.profraw
 *.profdata
 go/nemo_relay/coverage.out

@@ -60,7 +60,7 @@ use self::responses::{
 };
 use self::state::{
     RegistryScope, ScopedDynamicPluginRecord, ScopedRegistry, collect_records, find_record_by_id,
-    load_scoped_registries, scoped_paths_for_add,
+    load_persistent_scoped_registries, load_scoped_registries, scoped_paths_for_add,
 };
 use self::target::PluginTarget;
 use self::trust::{EvaluatedDynamicPluginTrust, evaluate_dynamic_plugin_trust};
@@ -1742,6 +1742,7 @@ fn make_snapshot_removable(root: &Path) {
     }
 }
 
+#[cfg(any(test, feature = "internal-test-server"))]
 pub(crate) fn active_dynamic_plugin_components(
     explicit: Option<&PathBuf>,
     resolved: &ResolvedConfig,
@@ -1749,14 +1750,23 @@ pub(crate) fn active_dynamic_plugin_components(
     active_dynamic_plugin_components_inner(explicit, resolved, true)
 }
 
-pub(crate) fn active_dynamic_plugin_components_for_identity(
-    explicit: Option<&PathBuf>,
+pub(crate) fn active_dynamic_plugin_components_for_identity_at(
     resolved: &ResolvedConfig,
+    user_config_dir: &Path,
 ) -> Result<Vec<ActiveDynamicPluginComponent>, CliError> {
-    let scopes = load_scoped_registries(explicit)?;
+    let scopes = load_persistent_scoped_registries(user_config_dir)?;
     active_dynamic_plugin_components_from_scopes(&scopes, resolved, false)
 }
 
+pub(crate) fn active_persistent_dynamic_plugin_components(
+    resolved: &ResolvedConfig,
+    user_config_dir: &Path,
+) -> Result<Vec<ActiveDynamicPluginComponent>, CliError> {
+    let scopes = load_persistent_scoped_registries(user_config_dir)?;
+    active_dynamic_plugin_components_from_scopes(&scopes, resolved, true)
+}
+
+#[cfg(any(test, feature = "internal-test-server"))]
 fn active_dynamic_plugin_components_inner(
     explicit: Option<&PathBuf>,
     resolved: &ResolvedConfig,

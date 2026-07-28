@@ -8,7 +8,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::state::{PluginInstallOptions, PluginLayout};
-use super::{DEFAULT_GATEWAY_URL, MarketplaceHost, PluginSetupSnapshot};
+use super::{MarketplaceHost, PluginSetupSnapshot};
 
 #[cfg(test)]
 pub(super) fn run_plugin_setup(
@@ -31,9 +31,10 @@ pub(super) fn run_plugin_setup_with_generation(
         println!("{}", setup_runner.action_description("configure"));
         return Ok(());
     }
+    let gateway_url = host.enrolled_proxy_url()?;
     setup_runner.setup_with_generation(
         host.install_arg(),
-        DEFAULT_GATEWAY_URL,
+        &gateway_url,
         &layout.plugin_root,
         generation_token,
     )
@@ -49,7 +50,8 @@ pub(super) fn run_plugin_uninstall(
         println!("{}", setup_runner.action_description("restore"));
         return Ok(());
     }
-    setup_runner.uninstall(host.install_arg(), DEFAULT_GATEWAY_URL, plugin_root)
+    let gateway_url = host.enrolled_proxy_url()?;
+    setup_runner.uninstall(host.install_arg(), &gateway_url, plugin_root)
 }
 
 #[cfg(test)]
@@ -73,9 +75,10 @@ pub(super) fn run_plugin_doctor_with_generation(
         println!("{}", setup_runner.action_description("doctor"));
         return Ok(());
     }
+    let gateway_url = host.enrolled_proxy_url()?;
     setup_runner.doctor_with_generation(
         host.install_arg(),
-        DEFAULT_GATEWAY_URL,
+        &gateway_url,
         plugin_root,
         generation_token,
     )
@@ -86,7 +89,8 @@ pub(super) fn run_plugin_doctor_json(
     plugin_root: &Path,
     setup_runner: &dyn PluginSetupRunner,
 ) -> Result<Value, String> {
-    setup_runner.doctor_json(host.install_arg(), DEFAULT_GATEWAY_URL, plugin_root)
+    let gateway_url = host.enrolled_proxy_url()?;
+    setup_runner.doctor_json(host.install_arg(), &gateway_url, plugin_root)
 }
 
 pub(super) trait PluginSetupRunner {
@@ -165,7 +169,9 @@ impl<H: MarketplaceHost> PluginSetupRunner for HostPluginSetupRunner<H> {
     }
 
     fn refresh_gateway(&self) -> Result<(), String> {
-        crate::bootstrap::state::stop_owned_and_reset(crate::bootstrap::DEFAULT_URL)
+        // Hook generations are verified at delivery time by the persistent proxy. Replacing or
+        // retiring one host plugin does not require stopping that shared per-user service.
+        Ok(())
     }
 
     fn setup(&self, _host_arg: &str, gateway_url: &str, plugin_root: &Path) -> Result<(), String> {

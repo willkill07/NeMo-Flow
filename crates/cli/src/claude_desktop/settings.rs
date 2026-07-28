@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-const RELAY_BASE_URLS: [&str; 2] = [crate::bootstrap::DEFAULT_URL, "http://localhost:47632"];
+const RELAY_BASE_URLS: [&str; 2] = [crate::bootstrap::LEGACY_FIXED_URL, "http://localhost:47632"];
 const INTERCEPTED_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+const RESTORE_CAS_ATTEMPTS: usize = 4;
 
 fn uses_intercepted_anthropic_origin(raw: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(raw) else {
@@ -29,16 +30,16 @@ fn uses_intercepted_anthropic_origin(raw: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct UpstreamProxy {
+pub(crate) struct UpstreamProxy {
     /// The URL is secret-bearing when Basic authentication is configured. The containing state
     /// file is always owner-only and diagnostics use [`Self::redacted_url`].
-    pub(super) url: String,
-    pub(super) no_proxy: Option<String>,
-    /// Linux carries an existing Claude-scoped CA bundle into the sidecar so an HTTPS
+    pub(crate) url: String,
+    pub(crate) no_proxy: Option<String>,
+    /// Linux carries an existing Claude-scoped CA bundle into the proxy so an HTTPS
     /// corporate proxy signed by that CA remains reachable. macOS and Windows use their
     /// current-user trust stores instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) ca_bundle: Option<PathBuf>,
+    pub(crate) ca_bundle: Option<PathBuf>,
 }
 
 impl UpstreamProxy {
@@ -69,6 +70,8 @@ pub(super) struct SettingsPatch {
     pub(super) fields: BTreeMap<String, FieldPatch>,
     #[serde(default)]
     pub(super) previous_permissions: Option<SettingsPermissions>,
+    #[serde(default)]
+    pub(super) original_ca_bundle: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -82,6 +85,9 @@ pub(super) struct PreparedSettings {
     pub(super) value: Value,
     pub(super) patch: SettingsPatch,
     pub(super) upstream_proxy: Option<UpstreamProxy>,
+    source_revision: crate::filesystem::FileSnapshot,
+    source_env: Map<String, Value>,
+    preserve_restore_origin: bool,
 }
 
 pub(super) fn prepare(
@@ -104,6 +110,46 @@ pub(super) fn prepare(
     )
 }
 
+pub(super) fn retarget(
+    path: &Path,
+    proxy_url: &str,
+    state_path: &Path,
+    root_pem: &Path,
+    platform: &str,
+    prior_upstream: Option<&UpstreamProxy>,
+    prior_patch: &SettingsPatch,
+) -> Result<PreparedSettings, String> {
+    let prior_relay_proxy = prior_patch
+        .fields
+        .get("HTTPS_PROXY")
+        .and_then(|field| field.installed.as_ref())
+        .and_then(Value::as_str);
+    let process_env = process_proxy_environment()?;
+    let mut prepared = prepare_with_process_env_alias(
+        path,
+        proxy_url,
+        state_path,
+        root_pem,
+        platform,
+        prior_upstream,
+        &process_env,
+        prior_relay_proxy,
+    )?;
+    if prior_patch.fields.is_empty() {
+        return Ok(prepared);
+    }
+    prepared.preserve_restore_origin = true;
+    prepared.patch.original_settings_absent = prior_patch.original_settings_absent;
+    prepared.patch.previous_permissions = prior_patch.previous_permissions.clone();
+    prepared.patch.original_ca_bundle = prior_patch.original_ca_bundle.clone();
+    for (name, field) in &mut prepared.patch.fields {
+        if let Some(prior) = prior_patch.fields.get(name) {
+            field.previous = prior.previous.clone();
+        }
+    }
+    Ok(prepared)
+}
+
 fn prepare_with_process_env(
     path: &Path,
     proxy_url: &str,
@@ -113,17 +159,47 @@ fn prepare_with_process_env(
     prior_upstream: Option<&UpstreamProxy>,
     process_env: &Map<String, Value>,
 ) -> Result<PreparedSettings, String> {
-    let original_settings_absent = !path.exists();
+    prepare_with_process_env_alias(
+        path,
+        proxy_url,
+        state_path,
+        root_pem,
+        platform,
+        prior_upstream,
+        process_env,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_with_process_env_alias(
+    path: &Path,
+    proxy_url: &str,
+    state_path: &Path,
+    root_pem: &Path,
+    platform: &str,
+    prior_upstream: Option<&UpstreamProxy>,
+    process_env: &Map<String, Value>,
+    prior_relay_proxy: Option<&str>,
+) -> Result<PreparedSettings, String> {
+    let source_revision = crate::filesystem::snapshot_optional_file(path)?;
+    let original_settings_absent = source_revision.bytes().is_none();
     let previous_permissions = capture_permissions(path)?;
-    let mut value = crate::agents::shared::host::read_json_object(path)?;
+    let mut value = json_object_from_revision(&source_revision)?;
     let original_env = env_object(&value)?.cloned().unwrap_or_default();
-    let mut upstream_proxy =
-        resolve_upstream_proxy(&original_env, process_env, proxy_url, prior_upstream)?;
+    let original_ca_bundle = resolve_layered_ca_bundle(&original_env, process_env)?;
+    let upstream_proxy = resolve_upstream_proxy_with_alias(
+        &original_env,
+        process_env,
+        proxy_url,
+        prior_relay_proxy,
+        prior_upstream,
+    )?;
     if let Some(base_url) = unique_case_insensitive_string(process_env, "ANTHROPIC_BASE_URL")?
         && !uses_intercepted_anthropic_origin(&base_url)
     {
         return Err(format!(
-            "the installer inherited ANTHROPIC_BASE_URL={base_url:?}, which is a custom endpoint; unset it before installing Claude Desktop protection so terminal Claude Code cannot bypass TLS interception"
+            "the installer inherited ANTHROPIC_BASE_URL={base_url:?}, which is a custom endpoint; unset it before installing coding-agent proxy protection so terminal Claude Code cannot bypass TLS interception"
         ));
     }
     let mut desired = original_env.clone();
@@ -162,7 +238,7 @@ fn prepare_with_process_env(
             .any(|managed| current.trim_end_matches('/') == managed.trim_end_matches('/'))
         {
             return Err(format!(
-                "Claude setting env.{key} points at custom Anthropic gateway {current:?}; remove it or use the direct gateway integration instead"
+                "Claude setting env.{key} points at custom Anthropic gateway {current:?}; remove it before enrolling the native provider route"
             ));
         }
         desired.remove(&key);
@@ -171,8 +247,6 @@ fn prepare_with_process_env(
     touched.insert("ANTHROPIC_BASE_URL".into());
 
     let no_proxy = layered_environment_string(&original_env, process_env, "NO_PROXY")?;
-    let existing_custom_ca =
-        layered_environment_string(&original_env, process_env, "NODE_EXTRA_CA_CERTS")?;
     remove_case_insensitive(&mut desired, "NO_PROXY", &mut touched);
     let sanitized_no_proxy = no_proxy
         .as_deref()
@@ -193,9 +267,6 @@ fn prepare_with_process_env(
                 Value::String(root_pem.display().to_string()),
             );
             touched.insert("NODE_EXTRA_CA_CERTS".into());
-            if let Some(proxy) = upstream_proxy.as_mut() {
-                proxy.ca_bundle = Some(root_pem.to_path_buf());
-            }
         }
         "macos" | "windows" => {
             remove_case_insensitive(&mut desired, "CLAUDE_CODE_CERT_STORE", &mut touched);
@@ -204,13 +275,8 @@ fn prepare_with_process_env(
                 Value::String("bundled,system".into()),
             );
             touched.insert("CLAUDE_CODE_CERT_STORE".into());
-            if let (Some(proxy), Some(custom_ca)) =
-                (upstream_proxy.as_mut(), existing_custom_ca.as_deref())
-            {
-                proxy.ca_bundle = Some(resolve_ca_bundle(custom_ca)?);
-            }
         }
-        other => return Err(format!("unsupported Claude Desktop platform {other}")),
+        other => return Err(format!("unsupported coding-agent proxy platform {other}")),
     }
 
     set_env_object(&mut value, desired.clone())?;
@@ -235,19 +301,110 @@ fn prepare_with_process_env(
             original_settings_absent,
             fields,
             previous_permissions,
+            original_ca_bundle,
         },
         upstream_proxy,
+        source_revision,
+        source_env: original_env,
+        preserve_restore_origin: false,
     })
 }
 
-pub(super) fn apply(prepared: &PreparedSettings) -> Result<(), String> {
-    write_private_json(&prepared.patch.settings_path, &prepared.value)
+pub(super) fn apply(prepared: &mut PreparedSettings) -> Result<(), String> {
+    apply_with_hook(prepared, || {})
+}
+
+fn apply_with_hook(
+    prepared: &mut PreparedSettings,
+    mut before_commit: impl FnMut(),
+) -> Result<(), String> {
+    for attempt in 0..RESTORE_CAS_ATTEMPTS {
+        let revision = if attempt == 0 {
+            prepared.source_revision.clone()
+        } else {
+            crate::filesystem::snapshot_optional_file(&prepared.patch.settings_path)?
+        };
+        let (value, patch) = rebased_prepared_settings(&revision, prepared)?;
+        before_commit();
+        if !revision.is_current()? {
+            continue;
+        }
+        revision.require_current()?;
+        write_private_json(&patch.settings_path, &value)?;
+        prepared.value = value;
+        prepared.patch = patch;
+        prepared.source_revision =
+            crate::filesystem::snapshot_optional_file(&prepared.patch.settings_path)?;
+        prepared.source_env = env_object(&prepared.value)?.cloned().unwrap_or_default();
+        return Ok(());
+    }
+    Err(format!(
+        "{} kept changing while Relay tried to apply settings; retained the current file",
+        prepared.patch.settings_path.display()
+    ))
+}
+
+fn rebased_prepared_settings(
+    revision: &crate::filesystem::FileSnapshot,
+    prepared: &PreparedSettings,
+) -> Result<(Value, SettingsPatch), String> {
+    let mut value = json_object_from_revision(revision)?;
+    let current_env = env_object(&value)?.cloned().unwrap_or_default();
+    let mut desired = current_env.clone();
+    let mut patch = prepared.patch.clone();
+    if !prepared.preserve_restore_origin {
+        patch.original_settings_absent = revision.bytes().is_none();
+        patch.previous_permissions = capture_permissions(&patch.settings_path)?;
+    }
+    for (key, field) in &mut patch.fields {
+        let current = current_env.get(key).cloned();
+        if current != prepared.source_env.get(key).cloned() {
+            field.previous = current;
+        }
+        match &field.installed {
+            Some(installed) => {
+                desired.insert(key.clone(), installed.clone());
+            }
+            None => {
+                desired.remove(key);
+            }
+        }
+    }
+    set_env_object(&mut value, desired)?;
+    Ok((value, patch))
 }
 
 /// Restore only fields that still equal the value installed by Relay. Unrelated keys and
 /// concurrent edits are retained.
 pub(super) fn restore(patch: &SettingsPatch) -> Result<Vec<String>, String> {
-    let mut value = crate::agents::shared::host::read_json_object(&patch.settings_path)?;
+    restore_with_hook(patch, || {})
+}
+
+fn restore_with_hook(
+    patch: &SettingsPatch,
+    mut before_commit: impl FnMut(),
+) -> Result<Vec<String>, String> {
+    for _ in 0..RESTORE_CAS_ATTEMPTS {
+        let revision = crate::filesystem::snapshot_optional_file(&patch.settings_path)?;
+        let (value, retained_edits) = restored_settings_value(&revision, patch)?;
+        before_commit();
+        if !revision.is_current()? {
+            continue;
+        }
+        commit_restored_settings(&revision, patch, &value)?;
+        return Ok(retained_edits);
+    }
+    Err(format!(
+        "{} kept changing while Relay tried to restore settings; retained the current file",
+        patch.settings_path.display()
+    ))
+}
+
+fn restored_settings_value(
+    revision: &crate::filesystem::FileSnapshot,
+    patch: &SettingsPatch,
+) -> Result<(Value, Vec<String>), String> {
+    let mut value = json_object_from_revision(revision)?;
     let mut env = env_object(&value)?.cloned().unwrap_or_default();
     let mut retained_edits = Vec::new();
     for (key, field) in &patch.fields {
@@ -266,6 +423,15 @@ pub(super) fn restore(patch: &SettingsPatch) -> Result<Vec<String>, String> {
         }
     }
     set_env_object(&mut value, env)?;
+    Ok((value, retained_edits))
+}
+
+fn commit_restored_settings(
+    revision: &crate::filesystem::FileSnapshot,
+    patch: &SettingsPatch,
+    value: &Value,
+) -> Result<(), String> {
+    revision.require_current()?;
     if patch.original_settings_absent && value.as_object().is_some_and(serde_json::Map::is_empty) {
         match std::fs::remove_file(&patch.settings_path) {
             Ok(()) => {}
@@ -280,11 +446,23 @@ pub(super) fn restore(patch: &SettingsPatch) -> Result<Vec<String>, String> {
     } else {
         write_with_previous_permissions(
             &patch.settings_path,
-            &value,
+            value,
             patch.previous_permissions.as_ref(),
         )?;
     }
-    Ok(retained_edits)
+    Ok(())
+}
+
+fn json_object_from_revision(revision: &crate::filesystem::FileSnapshot) -> Result<Value, String> {
+    let Some(bytes) = revision.bytes() else {
+        return Ok(Value::Object(Map::new()));
+    };
+    let value = serde_json::from_slice::<Value>(bytes)
+        .map_err(|error| format!("invalid JSON in {}: {error}", revision.path().display()))?;
+    value
+        .is_object()
+        .then_some(value)
+        .ok_or_else(|| format!("{} must contain a JSON object", revision.path().display()))
 }
 
 pub(super) fn matches(patch: &SettingsPatch) -> Result<(), String> {
@@ -307,6 +485,7 @@ pub(super) fn matches(patch: &SettingsPatch) -> Result<(), String> {
     settings_file_is_private(&patch.settings_path)
 }
 
+#[cfg(test)]
 pub(super) fn effective_state_path() -> Result<Option<PathBuf>, String> {
     Ok(unique_case_insensitive_string(
         &process_environment(&["NEMO_RELAY_CLAUDE_DESKTOP_STATE"])?,
@@ -315,6 +494,7 @@ pub(super) fn effective_state_path() -> Result<Option<PathBuf>, String> {
     .map(PathBuf::from))
 }
 
+#[cfg(test)]
 pub(super) fn effective_environment_matches(patch: &SettingsPatch) -> Result<(), String> {
     let env = process_environment(&[
         "HTTPS_PROXY",
@@ -329,33 +509,43 @@ pub(super) fn effective_environment_matches(patch: &SettingsPatch) -> Result<(),
 }
 
 pub(super) fn apply_installed(patch: &SettingsPatch) -> Result<(), String> {
-    let mut value = crate::agents::shared::host::read_json_object(&patch.settings_path)?;
-    let mut env = env_object(&value)?.cloned().unwrap_or_default();
-    for (key, field) in &patch.fields {
-        match &field.installed {
-            Some(installed) => {
-                env.insert(key.clone(), installed.clone());
-            }
-            None => {
-                env.remove(key);
+    for _ in 0..RESTORE_CAS_ATTEMPTS {
+        let revision = crate::filesystem::snapshot_optional_file(&patch.settings_path)?;
+        let mut value = json_object_from_revision(&revision)?;
+        let mut env = env_object(&value)?.cloned().unwrap_or_default();
+        for (key, field) in &patch.fields {
+            match &field.installed {
+                Some(installed) => {
+                    env.insert(key.clone(), installed.clone());
+                }
+                None => {
+                    env.remove(key);
+                }
             }
         }
+        set_env_object(&mut value, env)?;
+        if !revision.is_current()? {
+            continue;
+        }
+        revision.require_current()?;
+        return write_private_json(&patch.settings_path, &value);
     }
-    set_env_object(&mut value, env)?;
-    write_private_json(&patch.settings_path, &value)
+    Err(format!(
+        "{} kept changing while Relay tried to reapply settings; retained the current file",
+        patch.settings_path.display()
+    ))
 }
 
 pub(super) fn compose_linux_ca_bundle(
     destination: &Path,
     root_pem: &str,
-    existing: Option<&str>,
+    existing: Option<&Path>,
 ) -> Result<(), String> {
     let mut bytes = Vec::new();
-    if let Some(existing) = existing.filter(|value| !value.trim().is_empty()) {
-        let existing_path = resolve_ca_bundle(existing)?;
+    if let Some(existing_path) = existing {
         bytes.extend(crate::filesystem::bounded::read_bounded_regular_file(
-            &existing_path,
-            "existing NODE_EXTRA_CA_CERTS bundle",
+            existing_path,
+            "existing coding-agent CA bundle",
         )?);
         if !bytes.ends_with(b"\n") {
             bytes.push(b'\n');
@@ -368,10 +558,10 @@ pub(super) fn compose_linux_ca_bundle(
     crate::filesystem::atomic_write(destination, &bytes)
 }
 
-pub(super) fn existing_env_string(path: &Path, name: &str) -> Result<Option<String>, String> {
+pub(super) fn existing_ca_bundle_path(path: &Path) -> Result<Option<PathBuf>, String> {
     let value = crate::agents::shared::host::read_json_object(path)?;
     let env = env_object(&value)?.cloned().unwrap_or_default();
-    layered_environment_string(&env, &process_environment(&[name])?, name)
+    resolve_layered_ca_bundle(&env, &process_proxy_environment()?)
 }
 
 fn resolve_upstream_proxy(
@@ -380,17 +570,30 @@ fn resolve_upstream_proxy(
     relay_proxy_url: &str,
     prior_upstream: Option<&UpstreamProxy>,
 ) -> Result<Option<UpstreamProxy>, String> {
+    resolve_upstream_proxy_with_alias(env, process_env, relay_proxy_url, None, prior_upstream)
+}
+
+fn resolve_upstream_proxy_with_alias(
+    env: &Map<String, Value>,
+    process_env: &Map<String, Value>,
+    relay_proxy_url: &str,
+    prior_relay_proxy: Option<&str>,
+    prior_upstream: Option<&UpstreamProxy>,
+) -> Result<Option<UpstreamProxy>, String> {
     for deferred in ["PROXY_PAC_URL", "AUTO_PROXY_URL"] {
         if unique_case_insensitive_string(env, deferred)?.is_some()
             || unique_case_insensitive_string(process_env, deferred)?.is_some()
         {
             return Err(format!(
-                "{deferred} is configured, but PAC/automatic proxy discovery is not supported by Claude Desktop wrapping"
+                "{deferred} is configured, but PAC/automatic proxy discovery is not supported by coding-agent proxy wrapping"
             ));
         }
     }
     let settings_https = unique_case_insensitive_string(env, "HTTPS_PROXY")?;
-    if settings_https.as_deref() == Some(relay_proxy_url) {
+    if settings_https
+        .as_deref()
+        .is_some_and(|value| value == relay_proxy_url || prior_relay_proxy == Some(value))
+    {
         return Ok(prior_upstream.cloned());
     }
     let https = merge_environment_values(
@@ -398,16 +601,25 @@ fn resolve_upstream_proxy(
         unique_case_insensitive_string(process_env, "HTTPS_PROXY")?,
         "HTTPS_PROXY",
     )?;
-    if https.as_deref() == Some(relay_proxy_url) {
+    if https
+        .as_deref()
+        .is_some_and(|value| value == relay_proxy_url || prior_relay_proxy == Some(value))
+    {
         return Ok(prior_upstream.cloned());
     }
     let all = layered_environment_string(env, process_env, "ALL_PROXY")?;
     let http = layered_environment_string(env, process_env, "HTTP_PROXY")?;
     let selected = select_proxy_value(https, all, http)?;
     let no_proxy = layered_environment_string(env, process_env, "NO_PROXY")?;
-    selected
+    let mut selected = selected
         .map(|url| validate_upstream_proxy(&url, no_proxy))
-        .transpose()
+        .transpose()?;
+    if let Some(proxy) = selected.as_mut()
+        && let Some(bundle) = resolve_layered_ca_bundle(env, process_env)?
+    {
+        proxy.ca_bundle = Some(bundle);
+    }
+    Ok(selected)
 }
 
 fn layered_environment_string(
@@ -454,7 +666,7 @@ fn select_proxy_value(
 }
 
 fn process_proxy_environment() -> Result<Map<String, Value>, String> {
-    const RELEVANT: [&str; 8] = [
+    const RELEVANT: [&str; 11] = [
         "HTTPS_PROXY",
         "HTTP_PROXY",
         "ALL_PROXY",
@@ -463,22 +675,71 @@ fn process_proxy_environment() -> Result<Map<String, Value>, String> {
         "AUTO_PROXY_URL",
         "ANTHROPIC_BASE_URL",
         "NODE_EXTRA_CA_CERTS",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "AWS_CA_BUNDLE",
     ];
     process_environment(&RELEVANT)
 }
 
+pub(super) fn process_upstream_proxy_with_host_environment(
+    host_environment: &Map<String, Value>,
+    relay_proxy_url: &str,
+    prior_upstream: Option<&UpstreamProxy>,
+) -> Result<Option<UpstreamProxy>, String> {
+    resolve_upstream_proxy(
+        host_environment,
+        &process_proxy_environment()?,
+        relay_proxy_url,
+        prior_upstream,
+    )
+}
+
+fn resolve_layered_ca_bundle(
+    settings: &Map<String, Value>,
+    process: &Map<String, Value>,
+) -> Result<Option<PathBuf>, String> {
+    let mut selected: Option<(String, PathBuf)> = None;
+    for name in [
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "NODE_EXTRA_CA_CERTS",
+        "AWS_CA_BUNDLE",
+    ] {
+        let Some(raw) = layered_environment_string(settings, process, name)? else {
+            continue;
+        };
+        let resolved = resolve_ca_bundle_named(name, &raw)?;
+        if let Some((prior_name, prior)) = selected.as_ref()
+            && prior != &resolved
+        {
+            return Err(format!(
+                "{prior_name} and {name} select different corporate CA bundles; make the \
+                 effective proxy trust bundle unambiguous before enrollment"
+            ));
+        }
+        selected = Some((name.into(), resolved));
+    }
+    Ok(selected.map(|(_, path)| path))
+}
+
+#[cfg(test)]
 fn resolve_ca_bundle(raw: &str) -> Result<PathBuf, String> {
+    resolve_ca_bundle_named("NODE_EXTRA_CA_CERTS", raw)
+}
+
+fn resolve_ca_bundle_named(name: &str, raw: &str) -> Result<PathBuf, String> {
     let path = Path::new(raw);
     if !path.is_absolute() {
         return Err(format!(
-            "NODE_EXTRA_CA_CERTS must be an absolute path for the persistent Claude Desktop service, got {raw:?}"
+            "{name} must be an absolute path for the persistent coding-agent proxy, got {raw:?}"
         ));
     }
     let resolved = std::fs::canonicalize(path)
-        .map_err(|error| format!("failed to resolve NODE_EXTRA_CA_CERTS {raw:?}: {error}"))?;
+        .map_err(|error| format!("failed to resolve {name} {raw:?}: {error}"))?;
     if !resolved.is_file() {
         return Err(format!(
-            "NODE_EXTRA_CA_CERTS {} must resolve to a regular file",
+            "{name} {} must resolve to a regular file",
             resolved.display()
         ));
     }
@@ -554,7 +815,7 @@ pub(super) fn validate_upstream_proxy(
         .map_err(|error| format!("invalid corporate proxy URL: {error}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!(
-            "unsupported corporate proxy scheme {:?}; Claude Desktop wrapping currently supports explicit HTTP(S) proxies with optional Basic authentication, not SOCKS, PAC, NTLM, or Kerberos",
+            "unsupported corporate proxy scheme {:?}; coding-agent proxy wrapping currently supports explicit HTTP(S) proxies with optional Basic authentication, not SOCKS, PAC, NTLM, or Kerberos",
             url.scheme()
         ));
     }
@@ -571,16 +832,18 @@ pub(super) fn validate_upstream_proxy(
     }
     Ok(UpstreamProxy {
         url: url.to_string(),
-        no_proxy: no_proxy.filter(|value| !value.trim().is_empty()),
+        no_proxy: no_proxy
+            .map(|value| sanitize_no_proxy(&value))
+            .filter(|value| !value.is_empty()),
         ca_bundle: None,
     })
 }
 
-pub(super) fn sanitize_no_proxy(raw: &str) -> String {
+pub(crate) fn sanitize_no_proxy(raw: &str) -> String {
     no_proxy_entries(raw)
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
-        .filter(|entry| !bypasses_anthropic(entry))
+        .filter(|entry| !bypasses_managed_provider(entry) && !bypasses_loopback(entry))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -597,16 +860,15 @@ fn no_proxy_entries(raw: &str) -> impl Iterator<Item = &str> {
     raw.split(|character: char| character == ',' || character.is_ascii_whitespace())
 }
 
-fn bypasses_anthropic(entry: &str) -> bool {
-    let (entry, port) = entry
-        .rsplit_once(':')
-        .map_or((entry, None), |(host, port)| {
-            if port.chars().all(|character| character.is_ascii_digit()) {
-                (host, port.parse::<u16>().ok())
-            } else {
-                (entry, None)
-            }
-        });
+fn bypasses_managed_provider(entry: &str) -> bool {
+    let (entry, port) = split_no_proxy_host_port(entry);
+    // Provider addresses change and enrollment must work offline, so Relay cannot prove that an
+    // arbitrary CIDR excludes every current and future managed-provider address. Drop CIDRs from
+    // the captured bypass list instead of allowing a broad network such as 0.0.0.0/0 or ::/0 to
+    // silently route managed traffic around the selected corporate proxy.
+    if entry.parse::<ipnet::IpNet>().is_ok() {
+        return true;
+    }
     if port.is_some_and(|port| port != 443) {
         return false;
     }
@@ -616,8 +878,39 @@ fn bypasses_anthropic(entry: &str) -> bool {
         .trim_end_matches('.')
         .to_ascii_lowercase();
     host == "*"
-        || super::certificate::INTERCEPTED_HOST.eq_ignore_ascii_case(&host)
-        || super::certificate::INTERCEPTED_HOST.ends_with(&format!(".{host}"))
+        || super::certificate::INTERCEPTED_HOSTS.iter().any(|managed| {
+            managed.eq_ignore_ascii_case(&host) || managed.ends_with(&format!(".{host}"))
+        })
+}
+
+fn bypasses_loopback(entry: &str) -> bool {
+    let (host, _) = split_no_proxy_host_port(entry.trim());
+    let host = host
+        .trim_start_matches("*.")
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
+fn split_no_proxy_host_port(entry: &str) -> (&str, Option<u16>) {
+    if let Some(bracketed) = entry.strip_prefix('[')
+        && let Some((host, suffix)) = bracketed.split_once(']')
+    {
+        return suffix
+            .strip_prefix(':')
+            .and_then(|port| port.parse::<u16>().ok())
+            .map_or((entry, None), |port| (host, Some(port)));
+    }
+    if entry.parse::<std::net::IpAddr>().is_ok() || entry.parse::<ipnet::IpNet>().is_ok() {
+        return (entry, None);
+    }
+    entry
+        .rsplit_once(':')
+        .map_or((entry, None), |(host, port)| {
+            port.parse::<u16>()
+                .map_or((entry, None), |port| (host, Some(port)))
+        })
 }
 
 fn redacted_proxy_url(url: &reqwest::Url) -> String {
@@ -776,7 +1069,7 @@ fn unique_case_insensitive_string(
         .collect::<Result<BTreeSet<_>, _>>()?;
     if values.len() > 1 {
         return Err(format!(
-            "conflicting case variants of {name} are ambiguous; keep one explicit value before installing Claude Desktop protection"
+            "conflicting case variants of {name} are ambiguous; keep one explicit value before installing coding-agent proxy protection"
         ));
     }
     Ok(values.into_iter().next())

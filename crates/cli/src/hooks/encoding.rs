@@ -27,33 +27,37 @@ pub(crate) fn persistent_hook_forward_command(
     generation_file: &Path,
     generation_token: &str,
 ) -> Result<String, String> {
-    hook_command(
+    let gateway_url = match crate::claude_desktop::hook_enrollment(agent)? {
+        Some(enrollment) => enrollment.gateway_url,
+        #[cfg(test)]
+        None => crate::bootstrap::LEGACY_FIXED_URL.into(),
+        #[cfg(not(test))]
+        None => {
+            return Err(format!(
+                "{} is not enrolled in the per-user coding-agent proxy",
+                agent.label()
+            ));
+        }
+    };
+    persistent_hook_forward_command_at(
         relay,
-        &persistent_hook_arguments(agent, generation_file, generation_token),
+        agent,
+        &gateway_url,
+        generation_file,
+        generation_token,
     )
 }
 
-/// Canonical transparent hook command. It embeds the process-private dynamic gateway so hook hosts
-/// that filter inherited environment variables cannot redirect delivery to the fixed endpoint.
-pub(crate) fn transparent_hook_forward_command(
+pub(crate) fn persistent_hook_forward_command_at(
     relay: &Path,
     agent: CodingAgent,
     gateway_url: &str,
+    generation_file: &Path,
+    generation_token: &str,
 ) -> Result<String, String> {
-    hook_command(relay, &transparent_hook_arguments(agent, gateway_url))
-}
-
-#[cfg(test)]
-pub(crate) fn transparent_hook_forward_command_for_platform(
-    relay: &Path,
-    agent: CodingAgent,
-    gateway_url: &str,
-    windows: bool,
-) -> String {
-    hook_command_for_platform(
+    hook_command(
         relay,
-        &transparent_hook_arguments(agent, gateway_url),
-        windows,
+        &persistent_hook_arguments(agent, gateway_url, generation_file, generation_token),
     )
 }
 
@@ -67,23 +71,19 @@ pub(crate) fn persistent_hook_forward_command_for_platform(
 ) -> String {
     hook_command_for_platform(
         relay,
-        &persistent_hook_arguments(agent, generation_file, generation_token),
+        &persistent_hook_arguments(
+            agent,
+            crate::bootstrap::LEGACY_FIXED_URL,
+            generation_file,
+            generation_token,
+        ),
         windows,
     )
 }
 
-pub(super) fn transparent_hook_arguments(agent: CodingAgent, gateway_url: &str) -> Vec<String> {
-    vec![
-        "hook-forward".into(),
-        agent.as_arg().into(),
-        "--gateway-url".into(),
-        gateway_url.into(),
-        "--transparent-run".into(),
-    ]
-}
-
 pub(super) fn persistent_hook_arguments(
     agent: CodingAgent,
+    gateway_url: &str,
     generation_file: &Path,
     generation_token: &str,
 ) -> Vec<String> {
@@ -91,11 +91,12 @@ pub(super) fn persistent_hook_arguments(
         "hook-forward".into(),
         agent.as_arg().into(),
         "--gateway-url".into(),
-        crate::bootstrap::DEFAULT_URL.into(),
+        gateway_url.into(),
         "--generation-file".into(),
         generation_file.display().to_string(),
         "--generation-token".into(),
         generation_token.into(),
+        "--fail-closed".into(),
     ]
 }
 

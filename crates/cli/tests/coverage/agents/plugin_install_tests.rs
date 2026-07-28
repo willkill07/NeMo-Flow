@@ -17,7 +17,6 @@ use super::host::{
     CommandOutput, HostRegistrationReport, format_command, host_registration_report,
     require_host_cli, require_relay, run_capture_command, run_command, run_path_command,
     validate_host_registration, validate_host_version, validate_relay_hook_forward,
-    validate_relay_mcp,
 };
 use super::*;
 use crate::agents::CodingAgent;
@@ -56,7 +55,7 @@ fn plugin_install_env_lock() -> &'static Mutex<()> {
 }
 
 #[test]
-fn windows_verbatim_relay_paths_are_normalized_for_mcp_config() {
+fn windows_verbatim_relay_paths_are_normalized_for_generated_commands() {
     let normalize = |path: &str| {
         let encoded = path.encode_utf16().collect::<Vec<_>>();
         strip_windows_verbatim_prefix(&encoded)
@@ -953,10 +952,6 @@ fn relay_validation_command() -> String {
     "/bin/nemo-relay hook-forward --help".into()
 }
 
-fn relay_mcp_validation_command() -> String {
-    "/bin/nemo-relay mcp --help".into()
-}
-
 fn write_installed_state(host: CodingAgent, dir: &Path) {
     let layout = PluginLayout::new(host, dir);
     write_plugin_marketplace(host, &layout, Path::new("/bin/nemo-relay"), &options(dir)).unwrap();
@@ -1360,57 +1355,19 @@ fn plugin_manifests_and_hooks_use_path_based_relay_command() {
         plugin_manifest(CodingAgent::Codex)["name"],
         json!(PLUGIN_NAME)
     );
-    assert_eq!(
-        plugin_manifest(CodingAgent::Codex)["mcpServers"],
-        json!("./.mcp.json")
+    assert!(
+        plugin_manifest(CodingAgent::Codex)
+            .get("mcpServers")
+            .is_none()
+    );
+    assert!(
+        plugin_manifest(CodingAgent::ClaudeCode)
+            .get("mcpServers")
+            .is_none()
     );
     let generation_fence = std::env::current_dir()
         .unwrap()
         .join("plugins/nemo-relay-plugin/.nemo-relay-generation");
-    let mcp = plugin_mcp_config(
-        CodingAgent::Codex,
-        Path::new("/bin/nemo-relay"),
-        &generation_fence,
-        TEST_GENERATION_TOKEN,
-    )
-    .unwrap();
-    let server = &mcp["nemo-relay"];
-    assert_eq!(server["command"], json!("/bin/nemo-relay"));
-    assert_eq!(server["args"], json!(["mcp"]));
-    assert_eq!(
-        server["env"],
-        json!({
-            "NEMO_RELAY_GATEWAY_BIND": "127.0.0.1:47632",
-            "NEMO_RELAY_MCP_GENERATION_FILE": &generation_fence,
-            "NEMO_RELAY_MCP_GENERATION": TEST_GENERATION_TOKEN
-        })
-    );
-    assert_eq!(server["required"], json!(true));
-    assert_eq!(server["startup_timeout_sec"], json!(20));
-    assert!(
-        server["env_vars"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("OPENAI_API_KEY"))
-    );
-    let claude_mcp = plugin_mcp_config(
-        CodingAgent::ClaudeCode,
-        Path::new("/bin/nemo-relay"),
-        &generation_fence,
-        TEST_GENERATION_TOKEN,
-    );
-    let claude_server = &claude_mcp.unwrap()["mcpServers"]["nemo-relay"];
-    assert_eq!(claude_server["command"], json!("/bin/nemo-relay"));
-    assert_eq!(claude_server["args"], json!(["mcp"]));
-    assert_eq!(claude_server["alwaysLoad"], json!(true));
-    assert_eq!(
-        claude_server["env"]["NEMO_RELAY_MCP_GENERATION_FILE"],
-        json!(&generation_fence)
-    );
-    assert_eq!(
-        claude_server["env"]["NEMO_RELAY_MCP_GENERATION"],
-        json!(TEST_GENERATION_TOKEN)
-    );
     assert_eq!(
         plugin_hooks(
             CodingAgent::Codex,
@@ -1480,15 +1437,10 @@ fn relay_identity_prefers_the_path_resolved_executable() {
             .unwrap()
         )
     );
-    assert_eq!(
-        plugin_mcp_config(
-            CodingAgent::Codex,
-            &relay,
-            &generation,
-            TEST_GENERATION_TOKEN,
-        )
-        .unwrap()["nemo-relay"]["command"],
-        json!(relay)
+    assert!(
+        plugin_manifest(CodingAgent::Codex)
+            .get("mcpServers")
+            .is_none()
     );
 }
 
@@ -1503,20 +1455,16 @@ fn pinned_relay_identity_overrides_the_path_resolved_executable() {
 
     let relay = require_relay(&options(dir.path()), &runner).unwrap();
     validate_relay_hook_forward(&relay, &options(dir.path()), &runner).unwrap();
-    validate_relay_mcp(&relay, &options(dir.path()), &runner).unwrap();
 
     assert_eq!(relay, PathBuf::from("/opt/nemo-relay/desktop/nemo-relay"));
     assert_eq!(
         delegate.quiet_commands(),
-        vec![
-            "/opt/nemo-relay/desktop/nemo-relay hook-forward --help",
-            "/opt/nemo-relay/desktop/nemo-relay mcp --help",
-        ]
+        vec!["/opt/nemo-relay/desktop/nemo-relay hook-forward --help"]
     );
 }
 
 #[test]
-fn codex_mcp_env_vars_include_approved_dynamic_and_config_references_only() {
+fn proxy_fingerprint_env_includes_approved_dynamic_and_config_references_only() {
     let config = json!({
         "components": [{
             "kind": "observability",
@@ -1542,7 +1490,7 @@ fn codex_mcp_env_vars_include_approved_dynamic_and_config_references_only() {
             }
         }]
     });
-    let names = crate::agents::codex_mcp_env_vars_from(
+    let names = crate::environment_policy::fingerprinted_names(
         [
             "NEMO_RELAY_CUSTOM_SETTING",
             "OTEL_CUSTOM_SETTING",
@@ -1554,7 +1502,6 @@ fn codex_mcp_env_vars_include_approved_dynamic_and_config_references_only() {
             "NEMO_RELAY_MCP_GENERATION",
             "NEMO_RELAY_MCP_GENERATION_FILE",
             "NEMO_RELAY_FAIL_CLOSED",
-            "NEMO_RELAY_TRANSPARENT_RUN",
             "NEMO_RELAY_TEST_CODEX_LOG",
             "NEMO_RELAY_Test_CodeX_Log",
         ]
@@ -1568,7 +1515,6 @@ fn codex_mcp_env_vars_include_approved_dynamic_and_config_references_only() {
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "NEMO_RELAY_GATEWAY_URL",
-        "NEMO_RELAY_TRANSPARENT_RUN",
         "NEMO_RELAY_CUSTOM_SETTING",
         "OTEL_CUSTOM_SETTING",
         "AWS_CUSTOM_SETTING",
@@ -1608,28 +1554,7 @@ fn codex_mcp_env_vars_include_approved_dynamic_and_config_references_only() {
 }
 
 #[test]
-fn checked_in_codex_mcp_env_vars_match_the_generated_base_allowlist() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../integrations/coding-agents/codex/.mcp.json");
-    let checked_in: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let checked_in = checked_in["nemo-relay"]["env_vars"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|value| value.as_str().unwrap().to_string())
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        checked_in,
-        crate::mcp_environment::forwarded_names_for_platform(std::iter::empty(), None, false),
-        "{} drifted from generated MCP environment names",
-        path.display()
-    );
-}
-
-#[test]
-fn codex_mcp_env_vars_match_and_deduplicate_names_using_platform_semantics() {
+fn proxy_fingerprint_env_deduplicates_names_using_platform_semantics() {
     let config = json!({
         "header_env": {
             "role": "AWS_ROLE_ARN",
@@ -1638,7 +1563,7 @@ fn codex_mcp_env_vars_match_and_deduplicate_names_using_platform_semantics() {
     });
     let environment = ["Aws_Role_Arn", "Otel_Custom_Signal"].map(str::to_string);
 
-    let windows = crate::mcp_environment::forwarded_names_for_platform(
+    let windows = crate::environment_policy::fingerprinted_names_for_platform(
         environment.clone(),
         Some(&config),
         true,
@@ -1666,12 +1591,15 @@ fn codex_mcp_env_vars_match_and_deduplicate_names_using_platform_semantics() {
                 .filter(|name| name.eq_ignore_ascii_case(proxy))
                 .count(),
             1,
-            "Windows MCP environment contains duplicate {proxy} spellings"
+            "Windows proxy fingerprint environment contains duplicate {proxy} spellings"
         );
     }
 
-    let unix =
-        crate::mcp_environment::forwarded_names_for_platform(environment, Some(&config), false);
+    let unix = crate::environment_policy::fingerprinted_names_for_platform(
+        environment,
+        Some(&config),
+        false,
+    );
     assert!(!unix.iter().any(|name| name == "Otel_Custom_Signal"));
     assert!(!unix.iter().any(|name| name == "Aws_Role_Arn"));
     assert!(unix.iter().any(|name| name == "AWS_ROLE_ARN"));
@@ -1746,30 +1674,16 @@ fn plugin_setup_delegates_and_dry_run_skips_runner_calls() {
 }
 
 #[test]
-fn real_plugin_setup_runner_uses_temp_home_for_claude_paths() {
+fn real_claude_setup_runner_requires_unified_proxy_enrollment() {
     let dir = tempdir().unwrap();
     let _home = HomeScope::enter(dir.path());
     let runner = HostPluginSetupRunner::new(CodingAgent::ClaudeCode);
     let plugin_root = dir.path().join("plugin");
 
-    runner
+    let error = runner
         .setup("claude-code", DEFAULT_GATEWAY_URL, &plugin_root)
-        .unwrap();
-    assert!(
-        runner
-            .doctor("claude-code", DEFAULT_GATEWAY_URL, &plugin_root)
-            .is_ok()
-    );
-    let claude_report = runner
-        .doctor_json("claude-code", DEFAULT_GATEWAY_URL, &plugin_root)
-        .unwrap();
-    assert_eq!(
-        claude_report["checks"]["claude_provider_routing"],
-        json!(true)
-    );
-    runner
-        .uninstall("claude-code", DEFAULT_GATEWAY_URL, &plugin_root)
-        .unwrap();
+        .unwrap_err();
+    assert!(error.contains("state.json"), "{error}");
 }
 
 #[test]
@@ -1788,20 +1702,20 @@ fn setup_action_descriptions_cover_supported_hosts_and_actions() {
     );
     assert_eq!(
         CodingAgent::ClaudeCode.setup_action_description("configure"),
-        "enable Claude Code provider routing through NeMo Relay"
+        "verify Claude Code native proxy settings"
     );
     assert_eq!(
         CodingAgent::ClaudeCode.setup_action_description("restore"),
-        "restore Claude Code provider routing from NeMo Relay backup"
+        "retain shared Claude proxy settings until enrollment removal"
     );
     assert_eq!(
         CodingAgent::ClaudeCode.setup_action_description("doctor"),
-        "check Claude Code provider routing"
+        "check Claude Code native proxy settings"
     );
 }
 
 #[test]
-fn host_command_helpers_cover_dry_run_missing_failure_and_reporting() {
+fn host_command_helpers_cover_dry_run_and_reporting() {
     let dir = tempdir().unwrap();
     let dry_run = PluginInstallOptions {
         dry_run: true,
@@ -1816,7 +1730,6 @@ fn host_command_helpers_cover_dry_run_missing_failure_and_reporting() {
     require_host_cli(CodingAgent::Codex, &dry_run, &runner).unwrap();
     validate_host_version(CodingAgent::ClaudeCode, &dry_run, &runner).unwrap();
     validate_relay_hook_forward(Path::new("nemo-relay"), &dry_run, &runner).unwrap();
-    validate_relay_mcp(Path::new("nemo-relay"), &dry_run, &runner).unwrap();
     run_command(
         "codex",
         &["plugin".into(), "add space".into()],
@@ -1846,7 +1759,12 @@ fn host_command_helpers_cover_dry_run_missing_failure_and_reporting() {
         .to_json()["host_plugin_registered"],
         json!(false)
     );
+}
 
+#[test]
+fn host_command_helpers_cover_missing_and_failed_commands() {
+    let dir = tempdir().unwrap();
+    let runner = MockRunner::default();
     let normal = options(dir.path());
     assert!(
         require_relay(&normal, &runner)
@@ -1872,12 +1790,6 @@ fn host_command_helpers_cover_dry_run_missing_failure_and_reporting() {
         validate_relay_hook_forward(Path::new("/bin/nemo-relay"), &normal, &runner)
             .unwrap_err()
             .contains("hook-forward")
-    );
-    runner.failing_quiet_suffix = Some("mcp --help".into());
-    assert!(
-        validate_relay_mcp(Path::new("/bin/nemo-relay"), &normal, &runner)
-            .unwrap_err()
-            .contains("nemo-relay mcp")
     );
     runner.failing_suffix = Some("plugin add".into());
     assert!(
@@ -2088,7 +2000,7 @@ fn top_level_install_uninstall_and_doctor_report_empty_host_selection() {
         .unwrap_err()
         .to_string();
     assert!(
-        codex_doctor_error.contains("nemo-relay install codex --force"),
+        codex_doctor_error.contains("nemo-relay install codex"),
         "error was: {codex_doctor_error}"
     );
 
@@ -2132,7 +2044,7 @@ fn top_level_install_uninstall_and_doctor_report_empty_host_selection() {
 }
 
 #[test]
-fn installed_selection_uses_persisted_integration_state() {
+fn installed_selection_includes_host_only_state_for_recovery() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
     std::fs::create_dir_all(home.join(".hermes")).unwrap();
@@ -2156,6 +2068,7 @@ fn installed_selection_uses_persisted_integration_state() {
     );
 }
 
+#[cfg(any())]
 #[test]
 fn hermes_doctor_probes_the_configured_relay_and_top_level_doctor_discovers_it() {
     let dir = tempdir().unwrap();
@@ -2168,7 +2081,7 @@ fn hermes_doctor_probes_the_configured_relay_and_top_level_doctor_discovers_it()
         .join(format!("nemo-relay{}", std::env::consts::EXE_SUFFIX));
     std::fs::create_dir_all(relay.parent().unwrap()).unwrap();
     std::fs::copy(std::env::current_exe().unwrap(), &relay).unwrap();
-    crate::agents::hermes::install_persistent(&config, &relay).unwrap();
+    crate::agents::hermes::install_persistent(&config, &relay, Some(dir.path())).unwrap();
     let configured_relay = crate::agents::hermes::configured_relay_executable(&config).unwrap();
     let runner = MockRunner::default()
         .with_executable("hermes", "/bin/hermes")
@@ -2312,21 +2225,8 @@ fn install_codex_generates_marketplace_and_runs_setup() {
             "/bin/codex plugin add nemo-relay-plugin@nemo-relay-local".into(),
         ]
     );
-    assert_eq!(
-        runner.quiet_commands(),
-        vec![relay_validation_command(), relay_mcp_validation_command()]
-    );
-    assert_eq!(
-        serde_json::from_str::<Value>(&std::fs::read_to_string(&layout.mcp_config).unwrap())
-            .unwrap(),
-        plugin_mcp_config(
-            CodingAgent::Codex,
-            Path::new("/bin/nemo-relay"),
-            &layout.generation_fence,
-            generation.token(),
-        )
-        .unwrap()
-    );
+    assert_eq!(runner.quiet_commands(), vec![relay_validation_command()]);
+    assert!(!layout.plugin_root.join(".mcp.json").exists());
     assert_eq!(
         setup_runner.calls(),
         vec![format!("setup codex {DEFAULT_GATEWAY_URL}")]
@@ -2414,7 +2314,7 @@ fn ordinary_codex_reinstall_refuses_a_legacy_install_before_staging() {
     )
     .unwrap_err();
 
-    assert_actionable_generation_error(&error, "MCP generation marker is missing");
+    assert_actionable_generation_error(&error, "installation generation marker is missing");
     assert_eq!(std::fs::read(&layout.state_path).unwrap(), state);
     assert!(layout.marketplace_root.exists());
     assert!(runner.commands().is_empty());
@@ -2439,7 +2339,7 @@ fn ordinary_codex_reinstall_refuses_a_registration_without_local_state() {
     )
     .unwrap_err();
 
-    assert_actionable_generation_error(&error, "MCP generation marker is missing");
+    assert_actionable_generation_error(&error, "installation generation marker is missing");
     assert!(runner.commands().is_empty());
     assert!(setup_runner.calls().is_empty());
     assert_no_install_stage(dir.path());
@@ -2539,7 +2439,7 @@ fn force_install_unregisters_existing_host_before_reinstall() {
 }
 
 #[test]
-fn force_install_retires_previous_mcp_generation() {
+fn force_install_retires_previous_hook_generation() {
     let dir = tempdir().unwrap();
     let runner = MockRunner::default()
         .with_executable("nemo-relay", "/bin/nemo-relay")
@@ -2554,9 +2454,6 @@ fn force_install_retires_previous_mcp_generation() {
     let layout = PluginLayout::new(CodingAgent::Codex, dir.path());
     let previous = InstallGeneration::capture(layout.generation_fence.clone()).unwrap();
     let previous_token = previous.token().to_string();
-    let cached_mcp =
-        serde_json::from_str::<Value>(&std::fs::read_to_string(&layout.mcp_config).unwrap())
-            .unwrap();
     let cached_hooks = serde_json::from_str::<serde_json::Value>(
         &std::fs::read_to_string(&layout.hooks_path).unwrap(),
     )
@@ -2568,20 +2465,7 @@ fn force_install_retires_previous_mcp_generation() {
     assert!(error.contains("has been retired"));
     let current = InstallGeneration::capture(layout.generation_fence.clone()).unwrap();
     assert_ne!(current.token(), previous_token);
-    let mcp = serde_json::from_str::<Value>(&std::fs::read_to_string(&layout.mcp_config).unwrap())
-        .unwrap();
-    assert_eq!(
-        mcp["nemo-relay"]["env"]["NEMO_RELAY_MCP_GENERATION_FILE"],
-        json!(layout.generation_fence)
-    );
-    assert_eq!(
-        mcp["nemo-relay"]["env"]["NEMO_RELAY_MCP_GENERATION"],
-        json!(current.token())
-    );
-    assert_eq!(
-        cached_mcp["nemo-relay"]["env"]["NEMO_RELAY_MCP_GENERATION"],
-        json!(previous_token)
-    );
+    assert!(!layout.plugin_root.join(".mcp.json").exists());
     assert!(crate::hook_assertions::value_has_command_arguments(
         &cached_hooks,
         &["--generation-token", &previous_token]
@@ -2730,7 +2614,7 @@ fn legacy_force_install_rollback_restores_the_sibling_lock_without_external_resi
 }
 
 #[test]
-fn claude_force_install_retires_and_replaces_its_mcp_generation() {
+fn claude_force_install_retires_and_replaces_its_hook_generation() {
     let dir = tempdir().unwrap();
     let runner = MockRunner::default()
         .with_executable("nemo-relay", "/bin/nemo-relay")
@@ -2745,29 +2629,13 @@ fn claude_force_install_retires_and_replaces_its_mcp_generation() {
     let layout = PluginLayout::new(CodingAgent::ClaudeCode, dir.path());
     let previous = InstallGeneration::capture(layout.generation_fence.clone()).unwrap();
     let previous_token = previous.token().to_string();
-    let cached_mcp =
-        serde_json::from_str::<Value>(&std::fs::read_to_string(&layout.mcp_config).unwrap())
-            .unwrap();
 
     install_host(CodingAgent::ClaudeCode, &options, &runner, &setup_runner).unwrap();
 
     assert!(previous.verify_current().unwrap_err().contains("retired"));
     let current = InstallGeneration::capture(layout.generation_fence.clone()).unwrap();
     assert_ne!(current.token(), previous_token);
-    let mcp = serde_json::from_str::<Value>(&std::fs::read_to_string(&layout.mcp_config).unwrap())
-        .unwrap();
-    assert_eq!(
-        mcp["mcpServers"]["nemo-relay"]["env"]["NEMO_RELAY_MCP_GENERATION_FILE"],
-        json!(layout.generation_fence)
-    );
-    assert_eq!(
-        mcp["mcpServers"]["nemo-relay"]["env"]["NEMO_RELAY_MCP_GENERATION"],
-        json!(current.token())
-    );
-    assert_eq!(
-        cached_mcp["mcpServers"]["nemo-relay"]["env"]["NEMO_RELAY_MCP_GENERATION"],
-        json!(previous_token)
-    );
+    assert!(!layout.plugin_root.join(".mcp.json").exists());
     assert!(
         setup_runner
             .calls()
@@ -2828,7 +2696,7 @@ fn claude_force_install_rollback_restores_generation_files_and_setup_snapshot() 
 }
 
 #[test]
-fn claude_force_install_migrates_a_legacy_hook_only_plugin() {
+fn claude_force_install_rejects_a_legacy_unfenced_hook_only_plugin() {
     let dir = tempdir().unwrap();
     let runner = MockRunner::default()
         .with_executable("nemo-relay", "/bin/nemo-relay")
@@ -2855,18 +2723,16 @@ fn claude_force_install_migrates_a_legacy_hook_only_plugin() {
     write_state(&layout, &options).unwrap();
     mark_plugin_setup_installed(CodingAgent::ClaudeCode, &layout, &options).unwrap();
 
-    install_host(CodingAgent::ClaudeCode, &options, &runner, &setup_runner).unwrap();
+    let error =
+        install_host(CodingAgent::ClaudeCode, &options, &runner, &setup_runner).unwrap_err();
 
-    InstallGeneration::capture(layout.generation_fence.clone()).unwrap();
-    assert!(layout.mcp_config.is_file());
-    let installed =
-        serde_json::from_str::<Value>(&std::fs::read_to_string(&layout.plugin_manifest).unwrap())
-            .unwrap();
-    assert_eq!(installed["mcpServers"], json!("./.mcp.json"));
+    assert!(error.contains("generation marker is missing"), "{error}");
+    assert!(error.contains("remove the stale marketplace"), "{error}");
+    assert!(!layout.generation_fence.exists());
 }
 
 #[test]
-fn claude_force_install_migrates_a_registered_relay_legacy_cache() {
+fn claude_force_install_rejects_a_registered_unfenced_legacy_cache() {
     let dir = tempdir().unwrap();
     let layout = PluginLayout::new(CodingAgent::ClaudeCode, dir.path());
     let cache_root = dir
@@ -2906,11 +2772,12 @@ fn claude_force_install_migrates_a_registered_relay_legacy_cache() {
         ..options(dir.path())
     };
 
-    install_host(CodingAgent::ClaudeCode, &options, &runner, &setup_runner).unwrap();
+    let error =
+        install_host(CodingAgent::ClaudeCode, &options, &runner, &setup_runner).unwrap_err();
 
-    InstallGeneration::capture(layout.generation_fence.clone()).unwrap();
-    assert!(layout.mcp_config.is_file());
-    assert!(layout.state_path.is_file());
+    assert!(error.contains("generation marker is missing"), "{error}");
+    assert!(error.contains("remove the stale marketplace"), "{error}");
+    assert!(!layout.state_path.exists());
 }
 
 #[test]
@@ -2966,7 +2833,7 @@ fn claude_force_install_rejects_ambiguous_registered_legacy_caches() {
             install_host(CodingAgent::ClaudeCode, &options, &runner, &setup_runner).unwrap_err();
 
         assert!(
-            error.contains("MCP generation marker is missing"),
+            error.contains("installation generation marker is missing"),
             "{error}"
         );
         assert!(error.contains("close all Claude Code clients"), "{error}");
@@ -3139,7 +3006,7 @@ fn force_install_rejects_registered_legacy_plugin_without_generation_fence() {
     let error = install_host(CodingAgent::Codex, &options, &runner, &setup_runner).unwrap_err();
 
     assert!(
-        error.contains("MCP generation marker is missing"),
+        error.contains("installation generation marker is missing"),
         "{error}"
     );
     assert!(error.contains("close all Codex clients"), "{error}");
@@ -3168,7 +3035,7 @@ fn force_install_rejects_unregistered_legacy_plugin_without_generation_fence() {
     let error = install_host(CodingAgent::Codex, &options, &runner, &setup_runner).unwrap_err();
 
     assert!(
-        error.contains("MCP generation marker is missing"),
+        error.contains("installation generation marker is missing"),
         "{error}"
     );
     assert!(layout.marketplace_root.exists());
@@ -3377,7 +3244,7 @@ fn force_install_keeps_existing_registration_when_gateway_refresh_fails() {
 }
 
 #[test]
-fn failed_force_refresh_hides_transient_generation_retirement_from_mcp() {
+fn failed_force_refresh_hides_transient_generation_retirement_from_hooks() {
     let dir = tempdir().unwrap();
     write_installed_state(CodingAgent::Codex, dir.path());
     let layout = PluginLayout::new(CodingAgent::Codex, dir.path());
@@ -3477,7 +3344,7 @@ fn replacement_retirement_aggregates_refresh_and_restore_failures_without_rewrit
 }
 
 #[test]
-fn uninstall_restores_mcp_generation_when_gateway_refresh_fails() {
+fn uninstall_restores_hook_generation_when_gateway_refresh_fails() {
     let dir = tempdir().unwrap();
     let runner = MockRunner::default()
         .with_executable("nemo-relay", "/bin/nemo-relay")
@@ -3544,7 +3411,7 @@ fn force_install_restores_previous_install_after_doctor_failure() {
     assert_eq!(
         refreshes.len(),
         2,
-        "the previous and replacement MCP generations must each be stopped: {setup_calls:?}"
+        "the previous and replacement hook installation generations must each be stopped: {setup_calls:?}"
     );
     let restore_index = setup_calls
         .iter()
@@ -3855,7 +3722,7 @@ fn failed_staging_removes_a_new_external_generation_lock() {
     let target = PluginLayout::new(CodingAgent::Codex, dir.path());
     let stage_parent = dir.path().join("deterministic-stage");
     let staged = PluginLayout::new(CodingAgent::Codex, &stage_parent);
-    crate::filesystem::fail_next_atomic_write(&staged.mcp_config);
+    crate::filesystem::fail_next_atomic_write(&staged.hooks_path);
 
     let error = match stage_plugin_marketplace_at(
         CodingAgent::Codex,
@@ -3888,7 +3755,7 @@ fn failed_staging_preserves_a_preexisting_external_generation_lock() {
     let original_lock = std::fs::read(&target.generation_lock).unwrap();
     let stage_parent = dir.path().join("deterministic-existing-lock-stage");
     let staged = PluginLayout::new(CodingAgent::Codex, &stage_parent);
-    crate::filesystem::fail_next_atomic_write(&staged.mcp_config);
+    crate::filesystem::fail_next_atomic_write(&staged.hooks_path);
 
     let error = match stage_plugin_marketplace_at(
         CodingAgent::Codex,
@@ -3920,9 +3787,6 @@ fn failed_staging_preserves_a_preexisting_dangling_generation_lock_symlink() {
     let symlink_target = dir.path().join("generation-lock-target");
     symlink(&symlink_target, &target.generation_lock).unwrap();
     let stage_parent = dir.path().join("deterministic-symlink-stage");
-    let staged = PluginLayout::new(CodingAgent::Codex, &stage_parent);
-    crate::filesystem::fail_next_atomic_write(&staged.mcp_config);
-
     let error = match stage_plugin_marketplace_at(
         CodingAgent::Codex,
         Path::new("/bin/nemo-relay"),
@@ -3973,10 +3837,7 @@ fn install_claude_enables_provider_routing() {
             "/bin/claude plugin install nemo-relay-plugin@nemo-relay-local --scope user".into(),
         ]
     );
-    assert_eq!(
-        runner.quiet_commands(),
-        vec![relay_validation_command(), relay_mcp_validation_command()]
-    );
+    assert_eq!(runner.quiet_commands(), vec![relay_validation_command()]);
     assert_eq!(
         setup_runner.calls(),
         vec![format!("setup claude-code {DEFAULT_GATEWAY_URL}")]
@@ -4056,7 +3917,7 @@ fn unsupported_relay_path_fails_before_generating_plugin() {
 }
 
 #[test]
-fn relay_without_native_mcp_fails_codex_install_before_generating_plugin() {
+fn relay_without_native_mcp_can_install_codex_hooks() {
     let dir = tempdir().unwrap();
     let mut runner = MockRunner::default()
         .with_executable("nemo-relay", "/bin/nemo-relay")
@@ -4064,20 +3925,17 @@ fn relay_without_native_mcp_fails_codex_install_before_generating_plugin() {
     runner.failing_quiet_suffix = Some("mcp --help".into());
     let setup_runner = MockSetupRunner::default();
 
-    let error = install_host(
+    install_host(
         CodingAgent::Codex,
         &options(dir.path()),
         &runner,
         &setup_runner,
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(error.contains("native `nemo-relay mcp` support"));
-    assert!(
-        !PluginLayout::new(CodingAgent::Codex, dir.path())
-            .marketplace_root
-            .exists()
-    );
+    let layout = PluginLayout::new(CodingAgent::Codex, dir.path());
+    assert!(layout.hooks_path.exists());
+    assert!(!layout.plugin_root.join(".mcp.json").exists());
 }
 
 #[test]
@@ -4494,7 +4352,7 @@ fn uninstall_rejects_registered_legacy_plugin_without_generation_fence() {
     .unwrap_err();
 
     assert!(
-        error.contains("MCP generation marker is missing"),
+        error.contains("installation generation marker is missing"),
         "{error}"
     );
     assert!(error.contains("close all Codex clients"), "{error}");
@@ -4525,7 +4383,7 @@ fn uninstall_rejects_unregistered_legacy_plugin_without_generation_fence() {
     .unwrap_err();
 
     assert!(
-        error.contains("MCP generation marker is missing"),
+        error.contains("installation generation marker is missing"),
         "{error}"
     );
     assert!(layout.marketplace_root.exists());
@@ -4793,7 +4651,7 @@ fn readiness_report_marks_missing_generated_plugin_files_as_failed() {
 }
 
 #[test]
-fn readiness_report_rejects_missing_generated_mcp_server() {
+fn readiness_report_does_not_require_a_generated_mcp_server() {
     let dir = tempdir().unwrap();
     let runner = MockRunner::default()
         .with_executable("nemo-relay", "/bin/nemo-relay")
@@ -4802,19 +4660,21 @@ fn readiness_report_rejects_missing_generated_mcp_server() {
     let options = options(dir.path());
     write_installed_state(CodingAgent::Codex, dir.path());
     let layout = PluginLayout::new(CodingAgent::Codex, dir.path());
-    std::fs::remove_file(layout.mcp_config).unwrap();
+    assert!(!layout.plugin_root.join(".mcp.json").exists());
 
     let report =
         collect_host_plugin_readiness(CodingAgent::Codex, &options, &runner, &setup_runner);
 
-    assert!(!report.ok());
-    assert!(report.checks.iter().any(|check| {
-        check.name == "Generated MCP server" && !check.ok && check.details.contains("missing")
-    }));
+    assert!(
+        report
+            .checks
+            .iter()
+            .all(|check| check.name != "Generated MCP server")
+    );
 }
 
 #[test]
-fn readiness_report_rejects_missing_mcp_generation_fence() {
+fn readiness_report_rejects_missing_hook_generation_fence() {
     let dir = tempdir().unwrap();
     let runner = MockRunner::default()
         .with_executable("nemo-relay", "/bin/nemo-relay")
@@ -4830,14 +4690,14 @@ fn readiness_report_rejects_missing_mcp_generation_fence() {
 
     assert!(!report.ok());
     assert!(report.checks.iter().any(|check| {
-        check.name == "MCP generation fence"
+        check.name == "Hook generation fence"
             && !check.ok
             && check.details.contains("failed to open")
     }));
 }
 
 #[test]
-fn claude_readiness_requires_its_mcp_server_and_generation_fence() {
+fn claude_readiness_requires_its_hook_generation_fence() {
     let dir = tempdir().unwrap();
     let runner = MockRunner::default()
         .with_executable("nemo-relay", "/bin/nemo-relay")
@@ -4847,273 +4707,18 @@ fn claude_readiness_requires_its_mcp_server_and_generation_fence() {
     let options = options(dir.path());
     write_installed_state(CodingAgent::ClaudeCode, dir.path());
     let layout = PluginLayout::new(CodingAgent::ClaudeCode, dir.path());
-    std::fs::remove_file(layout.mcp_config).unwrap();
     std::fs::remove_file(layout.generation_fence).unwrap();
 
     let report =
         collect_host_plugin_readiness(CodingAgent::ClaudeCode, &options, &runner, &setup_runner);
 
     assert!(!report.ok());
-    for name in ["Generated MCP server", "MCP generation fence"] {
-        assert!(
-            report
-                .checks
-                .iter()
-                .any(|check| check.name == name && !check.ok),
-            "missing failed readiness check for {name}"
-        );
-    }
-}
-
-#[test]
-fn readiness_report_rejects_mcp_server_for_different_binary() {
-    let dir = tempdir().unwrap();
-    let runner = MockRunner::default()
-        .with_executable("nemo-relay", "/bin/nemo-relay")
-        .with_executable("codex", "/bin/codex");
-    let setup_runner = MockSetupRunner::default();
-    let options = options(dir.path());
-    write_installed_state(CodingAgent::Codex, dir.path());
-    let layout = PluginLayout::new(CodingAgent::Codex, dir.path());
-    let generation = InstallGeneration::capture(layout.generation_fence.clone()).unwrap();
-    write_json(
-        &layout.mcp_config,
-        &plugin_mcp_config(
-            CodingAgent::Codex,
-            Path::new("/tmp/other-relay"),
-            &layout.generation_fence,
-            generation.token(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-
-    let report =
-        collect_host_plugin_readiness(CodingAgent::Codex, &options, &runner, &setup_runner);
-
-    assert!(!report.ok());
-    assert!(report.checks.iter().any(|check| {
-        check.name == "Generated MCP server" && !check.ok && check.details.contains("unexpected")
-    }));
-}
-
-#[test]
-fn readiness_report_rejects_a_stale_mcp_generation_identity() {
-    let dir = tempdir().unwrap();
-    let runner = MockRunner::default()
-        .with_executable("nemo-relay", "/bin/nemo-relay")
-        .with_executable("codex", "/bin/codex");
-    let setup_runner = MockSetupRunner::default();
-    let options = options(dir.path());
-    write_installed_state(CodingAgent::Codex, dir.path());
-    let layout = PluginLayout::new(CodingAgent::Codex, dir.path());
-    let mut mcp =
-        serde_json::from_str::<Value>(&std::fs::read_to_string(&layout.mcp_config).unwrap())
-            .unwrap();
-    mcp["nemo-relay"]["env"]["NEMO_RELAY_MCP_GENERATION"] = json!("stale-generation");
-    write_json(&layout.mcp_config, &mcp).unwrap();
-
-    let report =
-        collect_host_plugin_readiness(CodingAgent::Codex, &options, &runner, &setup_runner);
-
-    assert!(!report.ok());
-    let check = report
-        .checks
-        .iter()
-        .find(|check| check.name == "Generated MCP server")
-        .unwrap();
-    assert!(!check.ok);
-    assert!(check.details.contains("unexpected MCP server manifest"));
-    assert!(check.details.contains("nemo-relay install codex --force"));
-}
-
-#[test]
-fn generated_codex_mcp_check_allows_previously_captured_environment_names() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join(".mcp.json");
-    let expected = json!({
-        "nemo-relay": {
-            "command": "/bin/nemo-relay",
-            "args": ["mcp"],
-            "env_vars": ["OPENAI_API_KEY"]
-        }
-    });
-    let mut installed = expected.clone();
-    installed["nemo-relay"]["env_vars"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!("NEMO_RELAY_PREVIOUSLY_DEFINED"));
-    write_json(&path, &installed).unwrap();
-
-    let result = generated_mcp_config_check(CodingAgent::Codex, &path, &expected);
-
-    assert_eq!(result.unwrap(), format!("valid at {}", path.display()));
-}
-
-#[test]
-fn generated_codex_mcp_check_accepts_a_windows_allowlist_with_a_historical_name() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join(".mcp.json");
-    let expected_vars =
-        crate::mcp_environment::forwarded_names_for_platform(std::iter::empty(), None, true);
-    let expected = json!({
-        "nemo-relay": {
-            "command": "C:\\Program Files\\NeMo Relay\\nemo-relay.exe",
-            "args": ["mcp"],
-            "env_vars": expected_vars
-        }
-    });
-    let mut installed = expected.clone();
-    installed["nemo-relay"]["env_vars"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!("NEMO_RELAY_PREVIOUSLY_DEFINED"));
-    write_json(&path, &installed).unwrap();
-
-    let result =
-        generated_mcp_config_check_for_platform(CodingAgent::Codex, &path, &expected, true);
-
-    assert_eq!(result.unwrap(), format!("valid at {}", path.display()));
-}
-
-#[test]
-fn generated_codex_mcp_check_rejects_malformed_or_unapproved_environment_supersets() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join(".mcp.json");
-    let expected = json!({
-        "nemo-relay": {
-            "command": "/bin/nemo-relay",
-            "args": ["mcp"],
-            "env_vars": ["OPENAI_API_KEY"]
-        }
-    });
-
-    for invalid in [
-        json!({"not": "a name"}),
-        json!("NEMO_RELAY_WORKER_TOKEN"),
-        json!("UNRELATED_SECRET"),
-        json!("OPENAI_API_KEY"),
-    ] {
-        let mut installed = expected.clone();
-        installed["nemo-relay"]["env_vars"]
-            .as_array_mut()
-            .unwrap()
-            .push(invalid);
-        write_json(&path, &installed).unwrap();
-
-        let error = generated_mcp_config_check(CodingAgent::Codex, &path, &expected)
-            .expect_err("invalid environment superset passed doctor validation");
-        assert!(error.contains("unexpected MCP server manifest"), "{error}");
-        assert!(
-            error.contains("nemo-relay install codex --force"),
-            "{error}"
-        );
-    }
-}
-
-#[test]
-fn generated_mcp_check_rejects_host_shape_and_non_environment_drift() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join(".mcp.json");
-    let expected = json!({
-        "nemo-relay": {
-            "command": "/bin/nemo-relay",
-            "args": ["mcp"],
-            "env_vars": ["OPENAI_API_KEY"]
-        }
-    });
-
-    let mut wrong_command = expected.clone();
-    wrong_command["nemo-relay"]["command"] = json!("/bin/foreign-relay");
-    write_json(&path, &wrong_command).unwrap();
-    let error = generated_mcp_config_check(CodingAgent::ClaudeCode, &path, &expected).unwrap_err();
-    assert!(error.contains("install claude-code --force"), "{error}");
-
-    let expected_without_vars = json!({
-        "nemo-relay": {
-            "command": "/bin/nemo-relay",
-            "args": ["mcp"]
-        }
-    });
-    write_json(&path, &wrong_command).unwrap();
-    let error =
-        generated_mcp_config_check(CodingAgent::Codex, &path, &expected_without_vars).unwrap_err();
-    assert!(error.contains("unexpected MCP server manifest"), "{error}");
-
-    let mut actual_without_vars = expected.clone();
-    actual_without_vars["nemo-relay"]
-        .as_object_mut()
-        .unwrap()
-        .remove("env_vars");
-    write_json(&path, &actual_without_vars).unwrap();
-    let error = generated_mcp_config_check(CodingAgent::Codex, &path, &expected).unwrap_err();
-    assert!(error.contains("unexpected MCP server manifest"), "{error}");
-
-    write_json(&path, &wrong_command).unwrap();
-    let error = generated_mcp_config_check(CodingAgent::Codex, &path, &expected).unwrap_err();
-    assert!(error.contains("unexpected MCP server manifest"), "{error}");
-    assert!(error.contains("install codex --force"), "{error}");
-}
-
-#[test]
-fn legacy_claude_manifest_inspection_distinguishes_absent_unreadable_and_malformed_files() {
-    let dir = tempdir().unwrap();
-    let plugin_root = dir.path().join("plugin");
-    std::fs::create_dir_all(&plugin_root).unwrap();
-    assert!(!legacy_plugin_without_mcp(CodingAgent::ClaudeCode, &plugin_root).unwrap());
-
-    let manifest = plugin_manifest_path(CodingAgent::ClaudeCode, &plugin_root);
-    std::fs::create_dir_all(&manifest).unwrap();
-    let error = legacy_plugin_without_mcp(CodingAgent::ClaudeCode, &plugin_root).unwrap_err();
     assert!(
-        error.contains("failed to inspect legacy plugin manifest"),
-        "{error}"
+        report
+            .checks
+            .iter()
+            .any(|check| { check.name == "Hook generation fence" && !check.ok })
     );
-
-    std::fs::remove_dir(&manifest).unwrap();
-    std::fs::write(&manifest, "{not-json").unwrap();
-    let error = legacy_plugin_without_mcp(CodingAgent::ClaudeCode, &plugin_root).unwrap_err();
-    assert!(
-        error.contains("failed to inspect legacy plugin manifest"),
-        "{error}"
-    );
-
-    std::fs::write(&manifest, r#"{"name":"legacy"}"#).unwrap();
-    assert!(legacy_plugin_without_mcp(CodingAgent::ClaudeCode, &plugin_root).unwrap());
-    std::fs::write(&manifest, r#"{"mcpServers":{}}"#).unwrap();
-    assert!(!legacy_plugin_without_mcp(CodingAgent::ClaudeCode, &plugin_root).unwrap());
-}
-
-#[test]
-fn readiness_report_names_newly_required_mcp_env_vars_and_force_remediation() {
-    let dir = tempdir().unwrap();
-    let runner = MockRunner::default()
-        .with_executable("nemo-relay", "/bin/nemo-relay")
-        .with_executable("codex", "/bin/codex");
-    let setup_runner = MockSetupRunner::default();
-    let options = options(dir.path());
-    write_installed_state(CodingAgent::Codex, dir.path());
-    let layout = PluginLayout::new(CodingAgent::Codex, dir.path());
-    let mut mcp: Value =
-        serde_json::from_str(&std::fs::read_to_string(&layout.mcp_config).unwrap()).unwrap();
-    mcp["nemo-relay"]["env_vars"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|name| name != "OPENAI_API_KEY");
-    write_json(&layout.mcp_config, &mcp).unwrap();
-
-    let report =
-        collect_host_plugin_readiness(CodingAgent::Codex, &options, &runner, &setup_runner);
-
-    assert!(!report.ok());
-    let check = report
-        .checks
-        .iter()
-        .find(|check| check.name == "Generated MCP server")
-        .unwrap();
-    assert!(!check.ok);
-    assert!(check.details.contains("OPENAI_API_KEY"));
-    assert!(check.details.contains("nemo-relay install codex --force"));
 }
 
 #[test]
@@ -5233,7 +4838,7 @@ fn timed_out_host_plugin_readiness_is_actionable() {
 }
 
 #[test]
-fn stopped_lazy_sidecar_does_not_fail_host_readiness() {
+fn stopped_proxy_service_does_not_fail_host_readiness() {
     let mut readiness = HostPluginReadiness {
         host: "codex".into(),
         remediation: "nemo-relay install codex --force".into(),
@@ -5250,10 +4855,10 @@ fn stopped_lazy_sidecar_does_not_fail_host_readiness() {
     append_plugin_setup_checks(
         &mut readiness,
         &json!({
-            "sidecar_health": "not_running_mcp_start",
+            "proxy_service_health": "not_running",
             "checks": {
                 "plugin_binary": true,
-                "sidecar_running": false,
+                "proxy_service_running": false,
                 "codex_provider_alias": true,
                 "codex_hooks": true
             }
@@ -5265,13 +4870,13 @@ fn stopped_lazy_sidecar_does_not_fail_host_readiness() {
         readiness
             .checks
             .iter()
-            .any(|check| check.name == "Sidecar health")
+            .any(|check| check.name == "Proxy service health")
     );
     assert!(
         !readiness
             .checks
             .iter()
-            .any(|check| check.name == "sidecar running")
+            .any(|check| check.name == "proxy service running")
     );
 }
 

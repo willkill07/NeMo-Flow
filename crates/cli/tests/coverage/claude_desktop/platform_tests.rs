@@ -8,6 +8,8 @@ use crate::installation::marketplace::host::CommandOutput;
 
 use super::*;
 
+const TEST_WINDOWS_SID: &str = "S-1-5-21-1000";
+
 #[derive(Default)]
 struct FakeRunner {
     outputs: RefCell<HashMap<String, VecDeque<CommandOutput>>>,
@@ -93,7 +95,7 @@ impl PlatformFixture {
         let config = temp.path().join("config");
         let local = temp.path().join("local");
         std::fs::create_dir_all(home.join("Library").join("Keychains")).unwrap();
-        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(config.join("nemo-relay")).unwrap();
         std::fs::create_dir_all(&local).unwrap();
         let environment = crate::test_support::EnvScope::set(&[
             ("HOME", Some(home.as_os_str())),
@@ -103,7 +105,7 @@ impl PlatformFixture {
             ("USERNAME", Some(std::ffi::OsStr::new("Test User"))),
             ("USERDOMAIN", Some(std::ffi::OsStr::new("DOMAIN"))),
         ]);
-        let root = temp.path().join("marketplace").join("claude-desktop");
+        let root = temp.path().join("marketplace").join("agent-proxy");
         std::fs::create_dir_all(&root).unwrap();
         let certificate = super::super::certificate::generate(&root, "generation").unwrap();
         let relay = temp.path().join("NeMo Relay").join("nemo-relay");
@@ -116,7 +118,10 @@ impl PlatformFixture {
             relay_version: "0.7.0".into(),
             relay_binary: relay,
             install_root: root.clone(),
+            user_config_dir: config.join("nemo-relay"),
             platform: platform.as_str().into(),
+            service_identity: (platform == Platform::Windows).then(|| TEST_WINDOWS_SID.into()),
+            bind: super::super::LEGACY_PROXY_BIND,
             proxy_username: "relay".into(),
             proxy_token: "token".into(),
             upstream_proxy: None,
@@ -125,7 +130,9 @@ impl PlatformFixture {
             configuration_fingerprint: "configuration".into(),
             certificate,
             settings: Default::default(),
-            plugin_preexisting: false,
+            claude_code_installed: false,
+            claude_desktop_installed: false,
+            enrollments: Default::default(),
         };
         Self {
             _temp: temp,
@@ -148,7 +155,7 @@ fn service_definitions_preserve_paths_with_spaces() {
         Path::new("C:\\Program Files\\NeMo Relay\\nemo-relay.exe"),
         Path::new("C:\\Users\\Test User\\state.json"),
         root,
-        Some("DOMAIN\\Test User"),
+        Some(TEST_WINDOWS_SID),
     )
     .unwrap();
     assert!(task.contains("&quot;C:\\Users\\Test User\\state.json&quot;"));
@@ -231,11 +238,16 @@ fn version_validation_covers_supported_and_rejected_platforms() {
 
     assert!(validate_linux_release("ID=ubuntu\nVERSION_ID=\"22.04\"\n", 0).is_ok());
     assert!(validate_linux_release("ID=debian\nVERSION_ID=\"12\"\n", 0).is_ok());
-    assert!(validate_linux_release("ID=ubuntu\nVERSION_ID=\"20.04\"\n", 0).is_err());
-    assert!(validate_linux_release("ID=fedora\nVERSION_ID=\"40\"\n", 0).is_err());
+    assert!(validate_linux_release("ID=ubuntu\nVERSION_ID=\"20.04\"\n", 0).is_ok());
+    assert_eq!(
+        validate_linux_release("ID=fedora\nVERSION_ID=\"40\"\n", 0).unwrap(),
+        "fedora 40 with systemd user session"
+    );
+    assert_eq!(
+        validate_linux_release("NAME=Custom Linux\n", 0).unwrap(),
+        "Linux with systemd user session"
+    );
     assert!(validate_linux_release("ID=debian\nVERSION_ID=\"12\"\n", 1).is_err());
-    assert_eq!(version_major("22.04"), Some(22));
-    assert_eq!(version_major("rolling"), None);
     assert_eq!(
         os_release_value("ID='debian'\nNAME=Debian\n", "ID").as_deref(),
         Some("debian")
@@ -388,12 +400,19 @@ fn application_identity_rejects_wrong_bundle_package_and_empty_msix_identity() {
 #[test]
 fn process_discovery_is_platform_specific_and_deduplicated() {
     let runner = FakeRunner::default();
+    let uid = unix_effective_uid();
     for name in ["Claude", "Claude Helper", "claude", "claude-desktop"] {
-        runner.enqueue("pgrep", &["-x", name], i32::from(name != "Claude"), "", "");
+        runner.enqueue(
+            "pgrep",
+            &["-u", &uid, "-x", name],
+            i32::from(name != "Claude"),
+            "",
+            "",
+        );
     }
     runner.enqueue(
         "ps",
-        &["-axo", "comm=,args="],
+        &["-U", &uid, "-o", "comm=,args="],
         0,
         "node /opt/node_modules/@anthropic-ai/claude-code/cli.js\n/usr/bin/claude-desktop --type=utility\n",
         "",
@@ -420,6 +439,8 @@ fn process_discovery_is_platform_specific_and_deduplicated() {
         active_claude_processes_with(Platform::Windows, &runner).unwrap(),
         vec!["Claude Code (Node.js)", "Claude.exe"]
     );
+    assert!(WINDOWS_PROCESS_QUERY.contains("GetOwnerSid"));
+    assert!(WINDOWS_PROCESS_QUERY.contains("WindowsIdentity"));
 
     runner.enqueue(
         "powershell.exe",
@@ -443,7 +464,7 @@ fn process_discovery_is_platform_specific_and_deduplicated() {
 fn registration_output(platform: Platform, state: &DesktopState) -> String {
     match platform {
         Platform::MacOs => format!(
-            "{} {} claude-desktop-sidecar",
+            "{} agent-proxy-service --state {}",
             state.relay_binary.display(),
             state.state_path().display()
         ),
@@ -452,10 +473,18 @@ fn registration_output(platform: Platform, state: &DesktopState) -> String {
             &state.relay_binary,
             &state.state_path(),
             &state.install_root,
-            Some("DOMAIN\\Test User"),
+            Some(TEST_WINDOWS_SID),
         )
         .unwrap(),
-        Platform::Linux => "enabled\n".into(),
+        Platform::Linux => format!(
+            "FragmentPath={}\nDropInPaths=\nNeedDaemonReload=no\nExecStart={{ path={} ; argv[]={} agent-proxy-service --state {} ; }}\n",
+            installed_service_definition_path(state, Platform::Linux)
+                .unwrap()
+                .display(),
+            state.relay_binary.display(),
+            state.relay_binary.display(),
+            state.state_path().display()
+        ),
     }
 }
 
@@ -471,20 +500,52 @@ fn queue_registration_status(runner: &FakeRunner, platform: Platform, output: &s
             output,
             "",
         ),
-        Platform::Windows => runner.enqueue(
-            "schtasks.exe",
-            &["/Query", "/TN", WINDOWS_TASK_NAME, "/XML"],
-            0,
-            output,
-            "",
-        ),
-        Platform::Linux => runner.enqueue(
-            "systemctl",
-            &["--user", "is-enabled", LINUX_SERVICE_NAME],
-            0,
-            output,
-            "",
-        ),
+        Platform::Windows => {
+            let task_name = windows_task_name(TEST_WINDOWS_SID);
+            runner.enqueue(
+                "schtasks.exe",
+                &["/Query", "/TN", &task_name, "/XML"],
+                0,
+                output,
+                "",
+            );
+        }
+        Platform::Linux => {
+            runner.enqueue(
+                "systemctl",
+                &[
+                    "--user",
+                    "show",
+                    LINUX_SERVICE_NAME,
+                    "--property=FragmentPath",
+                    "--property=DropInPaths",
+                    "--property=NeedDaemonReload",
+                    "--property=ExecStart",
+                    "--no-pager",
+                ],
+                0,
+                output,
+                "",
+            );
+            runner.enqueue(
+                "systemctl",
+                &["--user", "is-enabled", LINUX_SERVICE_NAME],
+                0,
+                "enabled\n",
+                "",
+            );
+        }
+    }
+}
+
+fn queue_registration_status_times(
+    runner: &FakeRunner,
+    platform: Platform,
+    output: &str,
+    count: usize,
+) {
+    for _ in 0..count {
+        queue_registration_status(runner, platform, output);
     }
 }
 
@@ -503,12 +564,15 @@ fn exercise_service_lifecycle(platform: Platform) {
             .unwrap()
             .contains("registered")
     );
+    queue_registration_status_times(&runner, platform, &registered, 2);
     stop_service_with(&fixture.state, &runner).unwrap();
 
-    queue_registration_status(&runner, platform, &registered);
-    if platform == Platform::Windows {
-        queue_registration_status(&runner, platform, &registered);
-    }
+    queue_registration_status_times(
+        &runner,
+        platform,
+        &registered,
+        if platform == Platform::MacOs { 3 } else { 4 },
+    );
     unregister_service_with(&fixture.state, false, &runner).unwrap();
     assert!(!definition.exists());
 }
@@ -542,12 +606,13 @@ fn service_dry_runs_and_mismatch_checks_are_non_destructive() {
 fn service_commands_surface_command_and_registration_failures() {
     let fixture = PlatformFixture::new(Platform::Windows);
     let runner = FakeRunner::default();
+    let task_name = windows_task_name(TEST_WINDOWS_SID);
     runner.enqueue(
         "schtasks.exe",
         &[
             "/Create",
             "/TN",
-            WINDOWS_TASK_NAME,
+            &task_name,
             "/XML",
             service_definition_path(Platform::Windows, &fixture.root)
                 .unwrap()
@@ -568,7 +633,7 @@ fn service_commands_surface_command_and_registration_failures() {
     let runner = FakeRunner::default();
     runner.enqueue(
         "schtasks.exe",
-        &["/Query", "/TN", WINDOWS_TASK_NAME, "/XML"],
+        &["/Query", "/TN", &task_name, "/XML"],
         1,
         "",
         "",
@@ -578,6 +643,112 @@ fn service_commands_surface_command_and_registration_failures() {
             .unwrap_err()
             .contains("not registered")
     );
+}
+
+#[test]
+fn windows_service_identity_is_stable_and_distinct_per_user() {
+    assert_eq!(
+        windows_task_name("S-1-5-21-1000"),
+        windows_task_name("s-1-5-21-1000")
+    );
+    assert_ne!(
+        windows_task_name("S-1-5-21-1000"),
+        windows_task_name("S-1-5-21-2000")
+    );
+    assert!(windows_task_name(TEST_WINDOWS_SID).starts_with(WINDOWS_TASK_PREFIX));
+}
+
+#[test]
+fn windows_service_identity_rejects_modified_trigger_or_principal_sid() {
+    let fixture = PlatformFixture::new(Platform::Windows);
+    let registered = registration_output(Platform::Windows, &fixture.state);
+
+    for modified in [
+        registered.replacen(TEST_WINDOWS_SID, "S-1-5-21-2000", 1),
+        registered.replacen(
+            &format!("<Principal id=\"Author\"><UserId>{TEST_WINDOWS_SID}</UserId>"),
+            "<Principal id=\"Author\"><UserId>S-1-5-21-2000</UserId>",
+            1,
+        ),
+        registered.replace(
+            "<RunLevel>LeastPrivilege</RunLevel>",
+            "<RunLevel>HighestAvailable</RunLevel>",
+        ),
+        registered.replace("<Hidden>true</Hidden>", "<Hidden>false</Hidden>"),
+        registered.replace("<Count>999</Count>", "<Count>1</Count>"),
+        registered.replace(
+            "</LogonTrigger>",
+            "</LogonTrigger><TimeTrigger><Enabled>true</Enabled></TimeTrigger>",
+        ),
+        registered.replace(
+            "</Principals>",
+            &format!(
+                "<Principal id=\"Other\"><UserId>{TEST_WINDOWS_SID}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>"
+            ),
+        ),
+        registered.replace(
+            "</Actions>",
+            "<Exec><Command>C:\\malware.exe</Command><Arguments>run</Arguments></Exec></Actions>",
+        ),
+        registered.replace(
+            "</Arguments>",
+            " --unexpected</Arguments>",
+        ),
+    ] {
+        let runner = FakeRunner::default();
+        queue_registration_status(&runner, Platform::Windows, &modified);
+        assert!(
+            service_registration_status(Platform::Windows, Some(&fixture.state), &runner)
+                .unwrap_err()
+                .contains("unexpected triggers")
+        );
+    }
+
+    let reformatted = registered.replace("><", ">\n  <");
+    let runner = FakeRunner::default();
+    queue_registration_status(&runner, Platform::Windows, &reformatted);
+    service_registration_status(Platform::Windows, Some(&fixture.state), &runner).unwrap();
+}
+
+#[test]
+fn linux_service_lifecycle_uses_the_persisted_xdg_root() {
+    let fixture = PlatformFixture::new(Platform::Linux);
+    let runner = FakeRunner::default();
+    register_service_with(&fixture.state, false, &runner).unwrap();
+    let definition = installed_service_definition_path(&fixture.state, Platform::Linux).unwrap();
+    assert!(definition.exists());
+    let registered = registration_output(Platform::Linux, &fixture.state);
+
+    let unrelated = fixture._temp.path().join("unrelated-xdg");
+    std::fs::create_dir_all(&unrelated).unwrap();
+    fixture
+        ._environment
+        .update(&[("XDG_CONFIG_HOME", Some(unrelated.as_os_str()))]);
+
+    queue_registration_status(&runner, Platform::Linux, &registered);
+    service_definition_matches_with(&fixture.state, &runner).unwrap();
+    queue_registration_status_times(&runner, Platform::Linux, &registered, 4);
+    unregister_service_with(&fixture.state, false, &runner).unwrap();
+    assert!(!definition.exists());
+}
+
+#[test]
+fn windows_uninstall_uses_persisted_sid_after_environment_changes() {
+    let fixture = PlatformFixture::new(Platform::Windows);
+    let runner = FakeRunner::default();
+    register_service_with(&fixture.state, false, &runner).unwrap();
+    let registered = registration_output(Platform::Windows, &fixture.state);
+    queue_registration_status_times(&runner, Platform::Windows, &registered, 4);
+
+    fixture._environment.update(&[
+        ("USERNAME", Some(std::ffi::OsStr::new("Different User"))),
+        ("USERDOMAIN", Some(std::ffi::OsStr::new("OTHER"))),
+    ]);
+    unregister_service_with(&fixture.state, false, &runner).unwrap();
+
+    let persisted = windows_task_name(TEST_WINDOWS_SID);
+    assert!(runner.called("schtasks.exe", &persisted));
+    assert!(!runner.called("schtasks.exe", &windows_task_name("OTHER\\Different User")));
 }
 
 #[test]
@@ -596,6 +767,26 @@ fn service_identity_and_unregistration_fail_closed_on_foreign_state() {
         );
         assert!(service_registration_status(platform, Some(&fixture.state), &runner).is_err());
     }
+
+    let fixture = PlatformFixture::new(Platform::Linux);
+    let definition = service_definition_path(Platform::Linux, &fixture.root).unwrap();
+    let expected = render_service_definition(
+        Platform::Linux,
+        &fixture.state.relay_binary,
+        &fixture.state.state_path(),
+        &fixture.state.install_root,
+        None,
+    )
+    .unwrap();
+    crate::filesystem::atomic_write(&definition, expected.as_bytes()).unwrap();
+    let runner = FakeRunner::default();
+    let live = registration_output(Platform::Linux, &fixture.state)
+        .replace("DropInPaths=", "DropInPaths=/tmp/foreign.conf");
+    queue_registration_status(&runner, Platform::Linux, &live);
+    let error = stop_service_with(&fixture.state, &runner).unwrap_err();
+    assert!(error.contains("no longer owns"), "{error}");
+    assert!(!runner.called("systemctl", "stop"));
+    drop(fixture);
 
     let fixture = PlatformFixture::new(Platform::Windows);
     let runner = FakeRunner::default();
@@ -621,20 +812,93 @@ fn service_identity_and_unregistration_fail_closed_on_foreign_state() {
     assert!(stop_service_with(&fixture.state, &runner).is_err());
     drop(fixture);
 
+    for platform in [Platform::Windows, Platform::Linux] {
+        let fixture = PlatformFixture::new(platform);
+        let runner = FakeRunner::default();
+        match platform {
+            Platform::Windows => {
+                let task_name = windows_task_name(TEST_WINDOWS_SID);
+                runner.enqueue(
+                    "schtasks.exe",
+                    &["/End", "/TN", &task_name],
+                    1,
+                    "",
+                    "access denied",
+                );
+            }
+            Platform::Linux => runner.enqueue(
+                "systemctl",
+                &["--user", "stop", LINUX_SERVICE_NAME],
+                1,
+                "",
+                "failed",
+            ),
+            Platform::MacOs => unreachable!(),
+        }
+        assert!(stop_service_with(&fixture.state, &runner).is_err());
+    }
+
     let fixture = PlatformFixture::new(Platform::Windows);
     let definition = service_definition_path(Platform::Windows, &fixture.root).unwrap();
-    crate::filesystem::atomic_write(&definition, b"owned").unwrap();
+    let expected = render_service_definition(
+        Platform::Windows,
+        &fixture.state.relay_binary,
+        &fixture.state.state_path(),
+        &fixture.state.install_root,
+        Some(TEST_WINDOWS_SID),
+    )
+    .unwrap();
+    crate::filesystem::atomic_write(&definition, expected.as_bytes()).unwrap();
     let runner = FakeRunner::default();
-    queue_registration_status(&runner, Platform::Windows, "registered");
-    queue_registration_status(&runner, Platform::Windows, "registered");
+    let task_name = windows_task_name(TEST_WINDOWS_SID);
+    let registered = registration_output(Platform::Windows, &fixture.state);
+    queue_registration_status_times(&runner, Platform::Windows, &registered, 2);
     runner.enqueue(
         "schtasks.exe",
-        &["/Delete", "/TN", WINDOWS_TASK_NAME, "/F"],
+        &["/End", "/TN", &task_name],
+        1,
+        "",
+        "ERROR: The scheduled task is not running.",
+    );
+    stop_service_with(&fixture.state, &runner).unwrap();
+    drop(fixture);
+
+    let fixture = PlatformFixture::new(Platform::Windows);
+    let definition = service_definition_path(Platform::Windows, &fixture.root).unwrap();
+    let expected = render_service_definition(
+        Platform::Windows,
+        &fixture.state.relay_binary,
+        &fixture.state.state_path(),
+        &fixture.state.install_root,
+        Some(TEST_WINDOWS_SID),
+    )
+    .unwrap();
+    crate::filesystem::atomic_write(&definition, expected.as_bytes()).unwrap();
+    let runner = FakeRunner::default();
+    let registered = registration_output(Platform::Windows, &fixture.state);
+    queue_registration_status_times(&runner, Platform::Windows, &registered, 4);
+    let task_name = windows_task_name(TEST_WINDOWS_SID);
+    runner.enqueue(
+        "schtasks.exe",
+        &["/Delete", "/TN", &task_name, "/F"],
         1,
         "",
         "",
     );
     assert!(unregister_service_with(&fixture.state, false, &runner).is_err());
+    drop(fixture);
+
+    let fixture = PlatformFixture::new(Platform::Linux);
+    let definition = service_definition_path(Platform::Linux, &fixture.root).unwrap();
+    crate::filesystem::atomic_write(&definition, b"foreign service").unwrap();
+    let runner = FakeRunner::default();
+    let error = unregister_service_with(&fixture.state, false, &runner).unwrap_err();
+    assert!(error.contains("differs from the installed generation"));
+    assert_eq!(
+        std::fs::read_to_string(&definition).unwrap(),
+        "foreign service"
+    );
+    assert!(runner.calls.borrow().is_empty());
 }
 
 fn exercise_trust_lifecycle(platform: Platform) {

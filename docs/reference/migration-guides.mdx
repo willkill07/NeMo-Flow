@@ -13,7 +13,53 @@ intervening release in sequence.
 
 ## Upgrade to NeMo Relay 0.7
 
-Migration guidance will be added before the 0.7 release.
+### Reinstall Coding-Agent Integrations
+
+NeMo Relay 0.7 replaces transparent agent wrappers, MCP-owned gateway
+lifecycle, standalone coding-agent gateways, and the branch-era Claude Desktop
+sidecar with one persistent per-user proxy. There is no in-place state
+migration or dual-mode compatibility.
+
+Before installing a 0.7 coding-agent integration:
+
+1. Close Claude Code, Claude Desktop, Codex, Hermes, and standalone legacy Relay
+   MCP or gateway processes.
+2. With the old Relay binary, run `nemo-relay uninstall all`, then run
+   `nemo-relay uninstall claude-desktop` if Desktop was installed.
+3. Verify that the old wrapper/MCP gateway and Claude Desktop sidecar
+   processes or user services are stopped, their old state and locator entries
+   are gone, and the old gateway health endpoint no longer responds.
+4. Install the 0.7 binary.
+5. Run `nemo-relay install <agent>` for each required agent. Alternatively,
+   run `nemo-relay install all` for Claude Code, Codex, and Hermes, then run
+   `nemo-relay install claude-desktop` explicitly when Desktop is required.
+6. On Linux, when Codex was enrolled, prefer the exact
+   `CODEX_CA_CERTIFICATE` path printed by installation in the launch
+   environment. If that variable remains unset, an existing `SSL_CERT_FILE`
+   selection is also valid when its bundle contains the active Relay root.
+7. Run `nemo-relay doctor <agent>`.
+
+The 0.7 installer refuses legacy wrapper/MCP-gateway and Claude Desktop state
+before making changes. It prints the exact detected path and clean-reinstall
+sequence; do not delete an unknown state directory manually.
+
+The first 0.7 enrollment installs a constrained current-user CA and a
+user-scoped service. The service uses a discovered, persisted loopback port
+instead of `127.0.0.1:47632`, which permits independent enrollments for
+multiple OS users on the same machine.
+
+Remove any automation that invokes these deleted public paths:
+
+- `nemo-relay run`
+- `nemo-relay claude`
+- `nemo-relay codex`
+- `nemo-relay hermes`
+- `nemo-relay mcp`
+- Standalone `nemo-relay serve` or a no-subcommand gateway launch
+
+Start enrolled agents normally. `hook-forward` remains an internal installed
+hook transport, and `nemo-relay claude-desktop` remains the protected Desktop
+Code deep-link command.
 
 ## Related Release Information
 

@@ -1,82 +1,65 @@
 ---
 title: "About"
-description: ""
+description: "Use the NeMo Relay CLI with locally enrolled coding agents."
 position: 1
 ---
 {/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0 */}
 
+Use the `nemo-relay` CLI to enroll local Claude Code/Desktop, Codex, and Hermes
+clients in one persistent NeMo Relay proxy for your OS user account. The proxy
+combines native lifecycle hooks with managed Anthropic and OpenAI provider
+traffic so Relay can apply observability, guardrails, and interceptors without
+launching the agent through a wrapper.
 
-Use this section when you want the `nemo-relay` binary to observe local coding
-agent sessions through hooks, a passthrough LLM gateway, and NVIDIA NeMo Relay
-observability exporters.
+The integration covers local GUI, CLI, and background clients that use the
+enrolled user configuration. Remote and cloud execution that does not traverse
+the local machine is outside its scope.
 
-Install the NeMo Relay CLI with the curl-based installer described in
-[Installation](/getting-started/installation). The installer provides the
-`nemo-relay` binary without requiring a Rust toolchain. The CLI can run supported
-coding agents through a managed local gateway, forward agent hook payloads into
-NeMo Relay lifecycle events, route OpenAI-compatible or Anthropic-compatible
-model traffic through the gateway, and diagnose local configuration. The
-`nemo-relay-cli` Cargo package remains available for source-based installation
-and unsupported platforms.
+## Architecture
 
-Persistent integrations use one lifecycle path:
+```text
+Claude Code/Desktop --- authenticated CONNECT ---\
+Codex ------------- authenticated HTTP/SSE/WS ----> per-user Relay proxy
+Hermes ---------------- authenticated CONNECT ----/        |
+installed hooks -------- authenticated hook POST ----------+
+                                                           |
+                                   sessions + middleware + exporters
+```
 
-`Codex / Claude Code / Hermes Agent` → `nemo-relay mcp` → `shared Relay gateway`
+The service binds a discovered loopback address and stores it in protected
+per-user state. It does not depend on a machine-wide fixed port, so several OS
+users can enroll Relay on the same machine. Each enrollment has a distinct
+stored credential. Claude Code and Claude Desktop share one effective provider
+credential and corporate route because both use the same Claude settings file.
 
-The host-specific layer installs and emits canonical lifecycle hooks. The MCP
-process is host-neutral and keeps the shared user-level gateway available.
+## Start Here
 
-## Start Here When
+- [Basic Usage](/nemo-relay-cli/basic-usage) explains service, routing,
+  configuration, security, and diagnostics.
+- [Coding Agent Installation](/nemo-relay-cli/plugin-installation) explains
+  install, uninstall, trust, ownership, and clean reinstall.
+- [Claude Code](/nemo-relay-cli/claude-code) covers terminal Claude.
+- [Claude Desktop](/nemo-relay-cli/claude-desktop) covers the protected Code
+  tab and deep-link launcher.
+- [Codex](/nemo-relay-cli/codex) covers HTTP/SSE and Responses WebSockets.
+- [Hermes Agent](/nemo-relay-cli/hermes) covers local modes and unknown-provider
+  degraded observability.
 
-Use these guides when you need to:
+For supported versions and limitations, refer to the
+[Support Matrix](/reference/support-matrix).
 
-- Observe Claude Code, Codex, or Hermes Agent sessions locally.
-- Configure coding-agent hooks for NeMo Relay lifecycle events.
-- Route model-provider traffic through the local NeMo Relay gateway.
-- Install persistent Claude Code, Codex, or Hermes Agent integrations without
-  wrapping the agent command.
-- Validate and install model pricing catalog sources for local cost estimates.
-- Export local sessions to Agent Trajectory Interchange Format (ATIF), Agent
-  Trajectory Observability Format (ATOF) JSONL, OpenTelemetry, or
-  OpenInference.
-- Diagnose hook loading, gateway routing, and exporter output.
+## Supported Commands
 
-If you are instrumenting an application or framework directly, use
-[Instrument Applications](/instrument-applications/about) or
-[Integrate into Frameworks](/integrate-into-frameworks/about) instead.
+The public coding-agent lifecycle is:
 
-## Agent Harness Support
+```bash
+nemo-relay install <claude-code|claude-desktop|codex|hermes|all>
+nemo-relay uninstall <claude-code|claude-desktop|codex|hermes|all>
+nemo-relay doctor <claude-code|claude-desktop|codex|hermes|all>
+```
 
-The NeMo Relay CLI is a supported surface for local coding-agent observability
-and hook-backed security. Optimization remains partial and host-dependent
-because each agent exposes different hooks, provider routes, and execution
-controls.
-
-| Agent | Observability | Security | Optimization | Notes |
-| --- | --- | --- | --- | --- |
-| Claude Code | Yes | Yes | Partial | Pre-tool hook responses are supported. LLM optimization uses gateway-routed traffic; full coverage depends on loaded Claude Code hooks. |
-| Codex | Yes | Yes | Partial | Persistent install verifies all 10 hooks in the supported schema. Each `Stop` finalizes a turn snapshot because the plugin schema does not expose `SessionEnd`. |
-| Hermes Agent | Yes | Yes | Partial | User config installs the shared native MCP gateway lifecycle plus exact trusted hooks. Optimization depends on Hermes shell and API-request hook coverage. |
-
-For minimum agent versions, platform support, and current limitations, refer to
-the [Support Matrix](/reference/support-matrix).
-
-## Guides
-
-Use these guide links to move from CLI setup into agent-specific instructions.
-
-- [Basic Usage](/nemo-relay-cli/basic-usage) explains gateway routes, transparent runs,
-  shared configuration, hook forwarding, and runtime mapping.
-- [Coding Agent Installation](/nemo-relay-cli/plugin-installation) covers
-  persistent Claude Code, Codex, and Hermes Agent setup.
-- [Claude Code](/nemo-relay-cli/claude-code) covers transparent Claude Code
-  runs, Anthropic gateway routing, ATIF verification, and unsupported Claude
-  application modes.
-- [Codex](/nemo-relay-cli/codex) covers transparent Codex CLI runs, local
-  GUI/app caveats, model provider routing, and remote-task limits.
-- [Hermes Agent](/nemo-relay-cli/hermes) covers Hermes MCP lifecycle setup,
-  exact hook trust, provider routing, and session-finalize behavior.
-
-Start with [Basic Usage](/nemo-relay-cli/basic-usage), then use the guide for the coding
-agent that you want to observe.
+`nemo-relay claude-desktop` remains available as a protected deep-link
+launcher after Claude Desktop enrollment. The `run`, `claude`, `codex`,
+`hermes`, `mcp`, and standalone `serve` or default gateway launch paths are no
+longer available.

@@ -43,7 +43,6 @@ pub(super) struct PluginLayout {
     pub(super) marketplace_manifest: PathBuf,
     pub(super) plugin_root: PathBuf,
     pub(super) plugin_manifest: PathBuf,
-    pub(super) mcp_config: PathBuf,
     pub(super) generation_fence: PathBuf,
     pub(super) generation_lock: PathBuf,
     pub(super) hooks_path: PathBuf,
@@ -64,10 +63,9 @@ impl PluginLayout {
             .plugin_manifest_relative()
             .iter()
             .fold(plugin_root.clone(), |path, component| path.join(component));
-        let mcp_config = plugin_root.join(".mcp.json");
         let generation_fence = plugin_root.join(GENERATION_FILE_NAME);
         let generation_lock = install_dir.join(format!(
-            ".nemo-relay-{}-mcp-generation.lock",
+            ".nemo-relay-{}-hook-generation.lock",
             host.install_arg()
         ));
         let hooks_path = plugin_root.join("hooks").join("hooks.json");
@@ -79,7 +77,6 @@ impl PluginLayout {
             marketplace_manifest,
             plugin_root,
             plugin_manifest,
-            mcp_config,
             generation_fence,
             generation_lock,
             hooks_path,

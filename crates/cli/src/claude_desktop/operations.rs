@@ -16,13 +16,28 @@ use super::state::{CertificateState, DesktopState};
 /// Boundary between deterministic lifecycle logic and machine-wide host effects.
 ///
 /// State, settings, certificates, journals, and rollback remain real filesystem operations. Only
-/// operations that depend on the running host, a login service, a trust store, a fixed listener, or
-/// the Claude plugin manager cross this boundary.
+/// operations that depend on the running host, a login service, a trust store, the selected
+/// persisted listener, or the Claude plugin manager cross this boundary.
 pub(super) trait DesktopOperations {
     fn platform(&self) -> Result<Platform, String>;
     fn validate_supported_platform(&self, platform: Platform) -> Result<String, String>;
     fn application_identity(&self, platform: Platform) -> Result<String, String>;
+    fn service_identity(&self, platform: Platform) -> Result<Option<String>, String>;
     fn active_claude_processes(&self, platform: Platform) -> Result<Vec<String>, String>;
+    fn active_agent_processes(
+        &self,
+        platform: Platform,
+        enrolled: &[String],
+    ) -> Result<Vec<String>, String> {
+        if enrolled
+            .iter()
+            .any(|agent| matches!(agent.as_str(), "claude" | "claude-code" | "claude-desktop"))
+        {
+            self.active_claude_processes(platform)
+        } else {
+            Ok(Vec::new())
+        }
+    }
     fn ensure_no_foreign_service(
         &self,
         platform: Platform,
@@ -30,6 +45,12 @@ pub(super) trait DesktopOperations {
     ) -> Result<(), String>;
     fn relay_binary(&self) -> Result<PathBuf, String>;
     fn persistent_gateway_identity(&self) -> Result<(String, String, usize), String>;
+    fn persistent_gateway_identity_at(
+        &self,
+        _user_config_dir: &Path,
+    ) -> Result<(String, String, usize), String> {
+        self.persistent_gateway_identity()
+    }
     fn settings_path(&self) -> Result<PathBuf, String>;
     fn plugin_exists(&self, marketplace_dir: &Path) -> bool;
     fn install_plugin(
@@ -39,8 +60,12 @@ pub(super) trait DesktopOperations {
         skip_doctor: bool,
     ) -> Result<(), String>;
     fn uninstall_plugin(&self, marketplace_dir: &Path) -> Result<(), String>;
-    fn stop_direct_gateway(&self) -> Result<(), String>;
-    fn restart_direct_gateway(&self) -> Result<(), String>;
+    fn marketplace_snapshot(
+        &self,
+        _marketplace_dir: &Path,
+    ) -> Result<Option<crate::installation::marketplace::DurableMarketplaceSnapshot>, String> {
+        Ok(None)
+    }
     fn shutdown_proxy(&self, installed: &DesktopState);
     fn install_trust(
         &self,
@@ -85,8 +110,20 @@ impl DesktopOperations for SystemOperations {
         super::platform::application_identity(platform)
     }
 
+    fn service_identity(&self, platform: Platform) -> Result<Option<String>, String> {
+        super::platform::current_service_identity(platform)
+    }
+
     fn active_claude_processes(&self, platform: Platform) -> Result<Vec<String>, String> {
         super::platform::active_claude_processes(platform)
+    }
+
+    fn active_agent_processes(
+        &self,
+        platform: Platform,
+        enrolled: &[String],
+    ) -> Result<Vec<String>, String> {
+        super::platform::active_agent_processes(platform, enrolled)
     }
 
     fn ensure_no_foreign_service(
@@ -104,6 +141,13 @@ impl DesktopOperations for SystemOperations {
 
     fn persistent_gateway_identity(&self) -> Result<(String, String, usize), String> {
         super::persistent_gateway_identity()
+    }
+
+    fn persistent_gateway_identity_at(
+        &self,
+        user_config_dir: &Path,
+    ) -> Result<(String, String, usize), String> {
+        super::persistent_gateway_identity_at(user_config_dir)
     }
 
     fn settings_path(&self) -> Result<PathBuf, String> {
@@ -150,12 +194,15 @@ impl DesktopOperations for SystemOperations {
         .map_err(|error| error.to_string())
     }
 
-    fn stop_direct_gateway(&self) -> Result<(), String> {
-        crate::bootstrap::state::stop_owned_and_reset(crate::bootstrap::DEFAULT_URL)
-    }
-
-    fn restart_direct_gateway(&self) -> Result<(), String> {
-        super::restart_direct_gateway()
+    fn marketplace_snapshot(
+        &self,
+        marketplace_dir: &Path,
+    ) -> Result<Option<crate::installation::marketplace::DurableMarketplaceSnapshot>, String> {
+        crate::installation::marketplace::capture_marketplace_snapshot(
+            CodingAgent::ClaudeCode,
+            marketplace_dir,
+        )
+        .map(Some)
     }
 
     fn shutdown_proxy(&self, installed: &DesktopState) {
@@ -175,6 +222,7 @@ impl DesktopOperations for SystemOperations {
         platform: Platform,
         certificate: &CertificateState,
     ) -> Result<(), String> {
+        super::certificate::validate_for_removal(certificate)?;
         super::platform::remove_trust(platform, certificate, false)
     }
 
@@ -187,11 +235,13 @@ impl DesktopOperations for SystemOperations {
     }
 
     fn stop_service(&self, installed: &DesktopState) -> Result<(), String> {
-        super::platform::stop_service(installed)
+        super::platform::stop_service(installed)?;
+        super::wait_for_listener_stop(installed)
     }
 
     fn unregister_service(&self, installed: &DesktopState) -> Result<(), String> {
-        super::platform::unregister_service(installed, false)
+        super::platform::unregister_service(installed, false)?;
+        super::wait_for_listener_stop(installed)
     }
 
     fn wait_for_health(&self, installed: &DesktopState) -> Result<(), String> {

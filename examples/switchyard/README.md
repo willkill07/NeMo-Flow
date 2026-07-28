@@ -52,11 +52,11 @@ feature automatically; custom builds must pass `--features switchyard`.
 ### Manual Switchyard Compatibility Smoke Test
 
 `run-real-e2e.sh` is a manual compatibility smoke test. It starts the pinned Switchyard server,
-Relay, and a fake provider, then verifies cold and warm StageRouter decisions, buffered routing,
-SSE routing, and the selected model sequence. It is intended to catch cross-repository service
-contract regressions; the CI-safe Relay process regression test covers the faster local behavior
-checks. The script requires Rust tooling, Python, and `curl`; its temporary logs are removed after
-a successful run.
+Relay's hidden repository-test server, and a fake provider, then verifies cold
+and warm StageRouter decisions, buffered routing, SSE routing, and the selected
+model sequence. The hidden server is not a supported user-facing gateway. The
+script requires Rust tooling, Python, and `curl`; its temporary logs are
+removed after a successful run.
 
 ```bash
 examples/switchyard/run-real-e2e.sh
@@ -68,30 +68,18 @@ A successful run ends with:
 real Switchyard E2E passed: ['provider/weak', 'provider/strong', 'provider/strong']
 ```
 
-### Hermes and Ollama Trajectory
-
-`run-hermes-ollama-smoke.sh` runs a fixed multi-query trajectory through Hermes, Relay, Ollama,
-and Switchyard. It requires Docker, Hermes, and the configured local Ollama models. The script
-produces ATOF, ATIF, and OTEL artifacts and can leave Phoenix running with
-`SWITCHYARD_KEEP_PHOENIX=1`.
-
-```bash
-examples/switchyard/run-hermes-ollama-smoke.sh
-```
-
 ## Configuration Files
 
 The directory includes the following configuration and support files:
 
 - `plugins.toml`: minimal plugin configuration example.
 - `real-e2e-plugins.toml` and `real-e2e-profiles.yaml`: deterministic fake-provider E2E.
-- `hermes-ollama-plugins.toml` and `hermes-ollama-profiles.yaml`: local Ollama trajectory.
 - `fake_upstream.py`: deterministic provider used by the service E2E.
 - `otel-collector.yaml`: local OTEL artifact export configuration.
 
 ## Runtime Model
 
-The scripts launch Switchyard as a separate local process on port `4000`. Relay sends routing
+The test harness launches Switchyard as a separate local process on port `4000`. Relay sends routing
 requests to `/v1/routing/decision` and, for ATOF-backed profiles, sends events to
 `/v1/atof/events`. Relay owns provider credentials, target bindings, dispatch, retries, and
 fallback behavior. Relay executes provider-protocol translation in process through Switchyard's

@@ -202,8 +202,8 @@ impl AgentPayloadExtractor for ClaudeCodePayloadExtractor {
     }
 }
 
-/// Codex transparent runs forward provider tokens directly, so they must not
-/// adopt the Claude installed-mode session header. They also expose a
+/// Codex proxy and hook traffic must not adopt the Claude-specific session
+/// header. Codex also exposes a
 /// Codex-native subagent nickname and send tool arguments under `arguments`.
 impl AgentPayloadExtractor for CodexPayloadExtractor {
     fn session_header_policy(&self) -> SessionHeaderPolicy {
@@ -240,9 +240,8 @@ pub(crate) struct ToolPathSet {
 /// Whether an extractor accepts the Claude installed-mode session header.
 #[derive(Clone, Copy)]
 pub(crate) enum SessionHeaderPolicy {
-    /// Trust only the NeMo Relay session header. Used by harnesses (Codex
-    /// transparent runs) that forward provider tokens directly and must not
-    /// inherit a Claude installed-mode session id.
+    /// Trust only the NeMo Relay session header. Used by Codex proxy and hook
+    /// traffic, which must not inherit a Claude-specific session id.
     RelayOnly,
     /// Trust the NeMo Relay session header and then the Claude installed-mode
     /// `x-claude-code-session-id` header as explicit session evidence.

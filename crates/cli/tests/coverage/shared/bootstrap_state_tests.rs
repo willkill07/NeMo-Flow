@@ -45,6 +45,33 @@ fn recovery_records_preserve_pending_and_ready_attempts() {
 }
 
 #[test]
+fn legacy_gateway_artifact_detects_owned_state_without_parsing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config");
+    let _scope = EnvScope::set(&[
+        ("XDG_CONFIG_HOME", Some(config.as_os_str())),
+        ("HOME", Some(dir.path().as_os_str())),
+        ("USERPROFILE", None),
+    ]);
+    assert!(legacy_gateway_artifact().unwrap().is_none());
+    let state = state_dir().unwrap();
+    create_private_dir(&state).unwrap();
+    let owner = state.join("sidecar-127.0.0.1-47632.owner.json");
+    std::fs::write(&owner, b"malformed but owned path").unwrap();
+    assert_eq!(
+        legacy_gateway_artifact().unwrap().as_deref(),
+        Some(owner.as_path())
+    );
+    std::fs::remove_file(owner).unwrap();
+    let recovery = state.join("gateway-127.0.0.1-47632.recovery.json");
+    std::fs::write(&recovery, b"stale").unwrap();
+    assert_eq!(
+        legacy_gateway_artifact().unwrap().as_deref(),
+        Some(recovery.as_path())
+    );
+}
+
+#[test]
 fn startup_lock_serializes_competing_mcp_processes() {
     let dir = tempfile::tempdir().unwrap();
     let url = "http://127.0.0.1:47632";

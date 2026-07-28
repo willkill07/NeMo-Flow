@@ -30,21 +30,24 @@ use crate::filesystem::{LockAttempt, try_lock_exclusive, try_lock_shared};
 #[cfg(test)]
 use crate::plugins::lifecycle::active_dynamic_plugin_components;
 use crate::plugins::lifecycle::{
-    ActiveDynamicPluginComponent, active_dynamic_plugin_components_for_identity,
+    ActiveDynamicPluginComponent, active_dynamic_plugin_components_for_identity_at,
     dynamic_plugin_runtime_closure_digest, enforce_required_dynamic_plugin_startup,
 };
 use crate::plugins::policy::DynamicPluginHostPolicy;
-use crate::process::RunOverrides;
 use crate::server::GatewayOverrides;
 
+#[cfg(test)]
 pub(crate) const BOOTSTRAP_FINGERPRINT_ENV: &str = "NEMO_RELAY_BOOTSTRAP_FINGERPRINT";
+#[cfg(test)]
 pub(crate) const PLUGIN_IDLE_TIMEOUT_ENV: &str = "NEMO_RELAY_PLUGIN_IDLE_TIMEOUT_SECS";
 pub(crate) const RELAY_PLUGIN_ID: &str = "nemo-relay-plugin@nemo-relay-local";
+#[allow(
+    dead_code,
+    reason = "recognized only while diagnosing source-installed legacy plugins"
+)]
 pub(crate) const RELAY_SOURCE_PLUGIN_ID: &str = "nemo-relay-plugin@nemo-relay";
 pub(crate) const DEFAULT_MAX_HOOK_PAYLOAD_BYTES: usize = 20 * 1024 * 1024;
 pub(crate) const DEFAULT_MAX_PASSTHROUGH_BODY_BYTES: usize = 100 * 1024 * 1024;
-pub(crate) const GATEWAY_URL_ENV: &str = "NEMO_RELAY_GATEWAY_URL";
-pub(crate) const TRANSPARENT_RUN_ENV: &str = "NEMO_RELAY_TRANSPARENT_RUN";
 
 // TOML file shape grouped by user intent. Sections map 1:1 onto fields already present on
 // `GatewayConfig` / `AgentConfigs`; plugin configuration lives in `plugins.toml`.
@@ -140,27 +143,48 @@ pub(crate) fn resolve_logging_config(
     })
 }
 
-/// Resolves the shared plugin MCP gateway from system and user layers only.
+/// Resolves the persistent coding-agent proxy engine from system and user layers only.
 pub(crate) fn resolve_persistent_server_config(
     args: &GatewayOverrides,
 ) -> Result<ResolvedConfig, CliError> {
+    let user_config_dir = user_config_dir().ok_or_else(|| {
+        CliError::Config(
+            "cannot determine the per-user NeMo Relay configuration directory; set HOME or USERPROFILE"
+                .into(),
+        )
+    })?;
+    resolve_persistent_server_config_at(args, &user_config_dir)
+}
+
+pub(crate) fn resolve_persistent_server_config_at(
+    args: &GatewayOverrides,
+    user_config_dir: &Path,
+) -> Result<ResolvedConfig, CliError> {
     if args.config.is_some() || args.plugin_config_path.is_some() || args.ready_file.is_some() {
         return Err(CliError::Config(
-            "nemo-relay mcp uses system and user configuration only; use `nemo-relay run` for explicit or project configuration"
+            "the coding-agent proxy uses system and user configuration only; explicit and project coding-agent configuration is unsupported"
                 .into(),
         ));
     }
-    let mut resolved = load_shared_config_scoped(None, None, true)?;
+    // A login service does not inherit the installer's shell reliably. Persistent proxy identity
+    // and provider routing therefore come exclusively from durable system/user files.
+    validate_persistent_provider_auth_sources_at(user_config_dir)?;
+    let mut resolved =
+        load_shared_config_scoped_with_env_at(None, None, true, false, user_config_dir)?;
     apply_server_overrides(&mut resolved.gateway, args)?;
-    let active_dynamic_plugins = active_dynamic_plugin_components_for_identity(None, &resolved)?;
-    resolved.bootstrap_fingerprint = Some(persistent_bootstrap_fingerprint(
+    validate_persistent_native_upstreams(&resolved.gateway)?;
+    let active_dynamic_plugins =
+        active_dynamic_plugin_components_for_identity_at(&resolved, user_config_dir)?;
+    resolved.bootstrap_fingerprint = Some(persistent_bootstrap_fingerprint_at(
         &resolved,
         &active_dynamic_plugins,
+        user_config_dir,
     )?);
     Ok(resolved)
 }
 
-/// Parent-computed identity and inputs needed to reverify a managed persistent gateway child.
+/// Parent-computed identity and inputs needed to reverify a managed persistent proxy child.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct ManagedBootstrapIdentity {
     expected: String,
@@ -169,6 +193,7 @@ pub(crate) struct ManagedBootstrapIdentity {
     active_dynamic_plugins: Vec<ActiveDynamicPluginComponent>,
 }
 
+#[cfg(test)]
 impl ManagedBootstrapIdentity {
     pub(crate) fn fingerprint(&self) -> &str {
         &self.expected
@@ -181,16 +206,13 @@ impl ManagedBootstrapIdentity {
         let resolved = resolve_persistent_server_config(&self.persistent_args)?;
         let actual = resolved
             .bootstrap_fingerprint
-            .expect("persistent gateway resolution sets a bootstrap fingerprint");
+            .expect("persistent proxy resolution sets a bootstrap fingerprint");
         verify_managed_bootstrap_fingerprint(&self.expected, &actual)
     }
 }
 
-/// Verifies and retains the parent-computed identity for a managed persistent gateway child.
-///
-/// Ordinary daemon launches remain stateless: the internal ready-file contract identifies a child
-/// spawned by the plugin bootstrap path. The child recomputes identity from the configuration and
-/// active lifecycle records it is about to activate before publishing ownership or readiness.
+/// Exercises the retired child-bootstrap identity checks in regression tests.
+#[cfg(test)]
 pub(crate) fn managed_bootstrap_identity(
     args: &GatewayOverrides,
     resolved: &ResolvedConfig,
@@ -219,28 +241,50 @@ pub(crate) fn managed_bootstrap_identity(
     }))
 }
 
+#[cfg(test)]
 fn verify_managed_bootstrap_fingerprint(expected: &str, actual: &str) -> Result<(), CliError> {
     if actual == expected {
         return Ok(());
     }
     Err(CliError::Config(
-        "persistent gateway identity changed during managed bootstrap; retry so the parent can resolve the current configuration"
+        "persistent proxy identity changed during managed bootstrap; retry so the parent can resolve the current configuration"
             .into(),
     ))
 }
 
+#[cfg(test)]
 fn persistent_bootstrap_fingerprint(
     resolved: &ResolvedConfig,
     active_dynamic_plugins: &[ActiveDynamicPluginComponent],
+) -> Result<String, CliError> {
+    let path = bootstrap_hmac_key_path()?;
+    persistent_bootstrap_fingerprint_with_key_path(resolved, active_dynamic_plugins, &path)
+}
+
+fn persistent_bootstrap_fingerprint_at(
+    resolved: &ResolvedConfig,
+    active_dynamic_plugins: &[ActiveDynamicPluginComponent],
+    user_config_dir: &Path,
+) -> Result<String, CliError> {
+    persistent_bootstrap_fingerprint_with_key_path(
+        resolved,
+        active_dynamic_plugins,
+        &user_config_dir
+            .join("bootstrap")
+            .join("fingerprint-hmac.key"),
+    )
+}
+
+fn persistent_bootstrap_fingerprint_with_key_path(
+    resolved: &ResolvedConfig,
+    active_dynamic_plugins: &[ActiveDynamicPluginComponent],
+    key_path: &Path,
 ) -> Result<String, CliError> {
     let dynamic_plugins = active_dynamic_plugins
         .iter()
         .map(dynamic_plugin_bootstrap_identity)
         .collect::<Result<Vec<_>, _>>()?;
     let gateway = &resolved.gateway;
-    let idle_timeout_secs = crate::bootstrap::plugin_idle_timeout()
-        .map_err(CliError::Config)?
-        .as_secs();
     let document = serde_json::json!({
         "bootstrap_protocol": crate::bootstrap::BOOTSTRAP_PROTOCOL_VERSION,
         "relay_version": env!("CARGO_PKG_VERSION"),
@@ -252,29 +296,15 @@ fn persistent_bootstrap_fingerprint(
         "plugin_config": gateway.plugin_config,
         "max_hook_payload_bytes": gateway.max_hook_payload_bytes,
         "max_passthrough_body_bytes": gateway.max_passthrough_body_bytes,
-        "plugin_idle_timeout_secs": idle_timeout_secs,
         "dynamic_plugins": dynamic_plugins,
         "dynamic_plugin_policy": format!("{:?}", resolved.dynamic_plugin_policy),
     });
-    let key = load_or_create_bootstrap_hmac_key()?;
+    let key = load_or_create_bootstrap_hmac_key_at(key_path)?;
     let key = hmac::Key::new(hmac::HMAC_SHA256, &key);
     let mut digest = hmac::Context::with_key(&key);
     digest.update(
-        &serde_json::to_vec(&document).expect("persistent gateway fingerprint serializes to JSON"),
+        &serde_json::to_vec(&document).expect("persistent proxy fingerprint serializes to JSON"),
     );
-    let environment = env::vars_os().filter_map(|(name, _)| name.into_string().ok());
-    for name in crate::mcp_environment::forwarded_names(environment, gateway.plugin_config.as_ref())
-    {
-        if name == PLUGIN_IDLE_TIMEOUT_ENV {
-            continue;
-        }
-        digest.update(&[0]);
-        digest.update(name.as_bytes());
-        digest.update(&[0]);
-        if let Some(value) = env::var_os(&name) {
-            digest.update(value.to_string_lossy().as_bytes());
-        }
-    }
     let tag = digest.sign();
     Ok(format!(
         "hmac-sha256:{}",
@@ -471,26 +501,11 @@ const BOOTSTRAP_HMAC_KEY_BYTES: usize = 32;
 const BOOTSTRAP_HMAC_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const BOOTSTRAP_CHALLENGE_DOMAIN: &[u8] = b"nemo-relay/bootstrap-health/v1\0";
 const BOOTSTRAP_CLIENT_TOKEN_DOMAIN: &[u8] = b"nemo-relay/bootstrap-client/v1\0";
-const TRANSPARENT_GATEWAY_DOMAIN: &[u8] = b"nemo-relay/transparent-gateway/v1\0";
 const PYTHON_ENVIRONMENT_ATTESTATION_DOMAIN: &[u8] =
     b"nemo-relay/python-environment-attestation/v1\0";
 
 /// Private proof installed into supported coding-agent provider configuration.
 pub(crate) const BOOTSTRAP_CLIENT_TOKEN_HEADER: &str = "x-nemo-relay-client-token";
-
-/// Stable health-proof context shared by a transparent wrapper and plugin-owned MCP client.
-pub(crate) fn transparent_gateway_fingerprint(gateway_url: &str) -> String {
-    let mut context = digest::Context::new(&digest::SHA256);
-    context.update(TRANSPARENT_GATEWAY_DOMAIN);
-    context.update(gateway_url.as_bytes());
-    let encoded = context
-        .finish()
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("transparent-sha256:{encoded}")
-}
 
 /// Per-user secret used to authenticate a managed bootstrap listener without exposing key bytes.
 #[derive(Clone)]
@@ -537,9 +552,7 @@ impl BootstrapChallengeKey {
         hmac::verify(&self.0, &message, &tag).is_ok()
     }
 
-    /// Returns a stable, per-user proof that authorizes use of credentials forwarded to a
-    /// managed sidecar. The HMAC key remains in Relay's private bootstrap state; coding-agent
-    /// configuration stores only this domain-separated proof.
+    #[cfg(test)]
     pub(crate) fn client_token(&self) -> String {
         encode_hmac_tag(hmac::sign(&self.0, BOOTSTRAP_CLIENT_TOKEN_DOMAIN))
     }
@@ -869,75 +882,6 @@ pub(crate) fn resolve_plugins_config(
     Ok(resolved)
 }
 
-/// Resolves transparent `run` configuration and switches the gateway to an ephemeral bind address.
-///
-/// Explicit run arguments override inherited top-level server flags, which override shared config.
-/// Session metadata and plugin config are parsed as JSON here so malformed CLI values fail before
-/// the child agent is spawned.
-pub(crate) fn resolve_run_config(
-    command: &RunOverrides,
-    inherited: Option<&GatewayOverrides>,
-) -> Result<ResolvedConfig, CliError> {
-    let config = command
-        .config
-        .as_ref()
-        .or_else(|| inherited.and_then(|args| args.config.as_ref()));
-    let plugin_config_path = command
-        .plugin_config_path
-        .as_ref()
-        .or_else(|| inherited.and_then(|args| args.plugin_config_path.as_ref()));
-    let mut resolved = load_shared_config(config, plugin_config_path)?;
-    if let Some(args) = inherited {
-        apply_server_overrides(&mut resolved.gateway, args)?;
-    }
-    apply_run_overrides(&mut resolved.gateway, command)?;
-    resolved.gateway.bind = "127.0.0.1:0"
-        .parse()
-        .expect("valid transparent bind address");
-    if !command.dry_run {
-        enforce_required_dynamic_plugin_startup(config, &resolved)?;
-    }
-    log::info!(
-        target: "nemo_relay.configuration",
-        event = "configuration_resolved",
-        mode = "run",
-        dynamic_plugin_count = resolved.dynamic_plugins.len();
-        "Runtime configuration resolved"
-    );
-    Ok(resolved)
-}
-
-// Applies subcommand-specific `run` overrides after inherited top-level flags. JSON-bearing fields
-// are parsed here so invalid metadata or plugin config fails before the gateway binds a port.
-fn apply_run_overrides(config: &mut GatewayConfig, command: &RunOverrides) -> Result<(), CliError> {
-    apply_run_url_overrides(config, command);
-    apply_run_json_overrides(config, command)?;
-    Ok(())
-}
-
-// Applies plain string/path run overrides. These fields do not need parsing, so they stay separate
-// from JSON options whose errors should include field context.
-fn apply_run_url_overrides(config: &mut GatewayConfig, command: &RunOverrides) {
-    if let Some(value) = &command.openai_base_url {
-        config.openai_base_url = value.clone();
-    }
-    if let Some(value) = &command.anthropic_base_url {
-        config.anthropic_base_url = value.clone();
-    }
-}
-
-// Parses JSON-bearing run overrides after simple values. Invalid metadata or plugin config fails
-// before transparent run mode binds its ephemeral gateway listener.
-fn apply_run_json_overrides(
-    config: &mut GatewayConfig,
-    command: &RunOverrides,
-) -> Result<(), CliError> {
-    if let Some(value) = &command.session_metadata {
-        config.metadata = Some(parse_json_option("session metadata", value)?);
-    }
-    Ok(())
-}
-
 // Applies direct server flags on top of already-merged configuration. Only present options mutate
 // the config so lower-priority file values survive when a flag was omitted.
 fn apply_server_overrides(
@@ -981,8 +925,50 @@ fn load_shared_config_scoped(
     plugin_config_path: Option<&PathBuf>,
     user_only: bool,
 ) -> Result<ResolvedConfig, CliError> {
+    load_shared_config_scoped_with_env(explicit, plugin_config_path, user_only, true)
+}
+
+fn load_shared_config_scoped_with_env(
+    explicit: Option<&PathBuf>,
+    plugin_config_path: Option<&PathBuf>,
+    user_only: bool,
+    include_environment: bool,
+) -> Result<ResolvedConfig, CliError> {
+    let user_config_dir = user_config_dir();
+    load_shared_config_scoped_with_env_from(
+        explicit,
+        plugin_config_path,
+        user_only,
+        include_environment,
+        user_config_dir.as_deref(),
+    )
+}
+
+fn load_shared_config_scoped_with_env_at(
+    explicit: Option<&PathBuf>,
+    plugin_config_path: Option<&PathBuf>,
+    user_only: bool,
+    include_environment: bool,
+    user_config_dir: &Path,
+) -> Result<ResolvedConfig, CliError> {
+    load_shared_config_scoped_with_env_from(
+        explicit,
+        plugin_config_path,
+        user_only,
+        include_environment,
+        Some(user_config_dir),
+    )
+}
+
+fn load_shared_config_scoped_with_env_from(
+    explicit: Option<&PathBuf>,
+    plugin_config_path: Option<&PathBuf>,
+    user_only: bool,
+    include_environment: bool,
+    user_config_dir: Option<&Path>,
+) -> Result<ResolvedConfig, CliError> {
     let mut merged = toml::Value::Table(toml::map::Map::new());
-    for path in config_paths_scoped(explicit, user_only) {
+    for path in config_paths_scoped_at(explicit, user_only, user_config_dir) {
         let Some(raw) = read_config_file(&path, explicit.is_some(), "configuration")? else {
             continue;
         };
@@ -1009,15 +995,163 @@ fn load_shared_config_scoped(
         }
         merge_gateway_config_toml(&mut merged, parsed);
     }
-    let plugin_toml = load_plugin_toml_config_scoped(explicit, plugin_config_path, user_only)?;
+    let plugin_toml = load_plugin_toml_config_scoped_at(
+        explicit,
+        plugin_config_path,
+        user_only,
+        user_config_dir,
+    )?;
     let mut resolved = ResolvedConfig {
         gateway: GatewayConfig::default(),
         ..ResolvedConfig::default()
     };
     apply_file_config(&mut resolved, merged)?;
     apply_plugin_toml_config(&mut resolved, plugin_toml);
-    apply_env_config(&mut resolved.gateway)?;
+    if include_environment {
+        apply_env_config(&mut resolved.gateway)?;
+    }
     Ok(resolved)
+}
+
+fn validate_persistent_native_upstreams(config: &GatewayConfig) -> Result<(), CliError> {
+    let openai = config.openai_base_url.trim_end_matches('/');
+    let anthropic = config.anthropic_base_url.trim_end_matches('/');
+    if openai != "https://api.openai.com/v1" {
+        return Err(CliError::Config(format!(
+            "the coding-agent proxy requires the native OpenAI upstream \
+             https://api.openai.com/v1; custom upstream {:?} is unsupported",
+            config.openai_base_url
+        )));
+    }
+    if anthropic != "https://api.anthropic.com" {
+        return Err(CliError::Config(format!(
+            "the coding-agent proxy requires the native Anthropic upstream \
+             https://api.anthropic.com; custom upstream {:?} is unsupported",
+            config.anthropic_base_url
+        )));
+    }
+    Ok(())
+}
+
+fn validate_persistent_provider_auth_sources_at(user_config_dir: &Path) -> Result<(), CliError> {
+    let user_path = user_config_dir.join("config.toml");
+    for path in config_paths_scoped_at(None, true, Some(user_config_dir)) {
+        let Some(raw) = read_config_file(&path, false, "configuration")? else {
+            continue;
+        };
+        let parsed = raw.parse::<toml::Table>().map_err(|error| {
+            CliError::Config(format!("invalid TOML in {}: {error}", path.display()))
+        })?;
+        if persistent_config_declares_provider_auth(&parsed) {
+            validate_persistent_provider_auth_source(&path, user_path == path, &user_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn persistent_config_declares_provider_auth(config: &toml::Table) -> bool {
+    config
+        .get("upstream")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|upstream| {
+            upstream.contains_key("openai_auth_header")
+                || upstream.contains_key("anthropic_auth_header")
+        })
+}
+
+fn validate_persistent_provider_auth_source(
+    path: &Path,
+    is_user: bool,
+    user_path: &Path,
+) -> Result<(), CliError> {
+    if !is_user {
+        return Err(CliError::Config(format!(
+            "persistent proxy provider authorization headers must be stored in the protected user \
+             configuration {}; remove them from {}",
+            user_path.display(),
+            path.display()
+        )));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        CliError::Config(format!(
+            "failed to inspect provider-credential configuration {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(CliError::Config(format!(
+            "provider-credential configuration {} must be a non-symlinked regular file",
+            path.display()
+        )));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        CliError::Config(format!(
+            "provider-credential configuration {} has no parent directory",
+            path.display()
+        ))
+    })?;
+    validate_persistent_provider_auth_permissions(path, &metadata, parent)
+}
+
+#[cfg(unix)]
+fn validate_persistent_provider_auth_permissions(
+    path: &Path,
+    metadata: &fs::Metadata,
+    parent: &Path,
+) -> Result<(), CliError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|error| {
+        CliError::Config(format!(
+            "failed to inspect provider-credential directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    // SAFETY: `geteuid` has no preconditions and does not mutate process state.
+    let effective_user = unsafe { libc::geteuid() };
+    let file_private =
+        metadata.uid() == effective_user && metadata.permissions().mode() & 0o077 == 0;
+    let parent_private = !parent_metadata.file_type().is_symlink()
+        && parent_metadata.file_type().is_dir()
+        && parent_metadata.uid() == effective_user
+        && parent_metadata.permissions().mode() & 0o077 == 0;
+    if file_private && parent_private {
+        return Ok(());
+    }
+    Err(CliError::Config(format!(
+        "provider authorization headers require current-user ownership, an owner-only file, and \
+         an owner-only parent directory; protect {} and {} before starting the coding-agent proxy",
+        path.display(),
+        parent.display()
+    )))
+}
+
+#[cfg(windows)]
+fn validate_persistent_provider_auth_permissions(
+    path: &Path,
+    _metadata: &fs::Metadata,
+    parent: &Path,
+) -> Result<(), CliError> {
+    let file_private = crate::filesystem::windows_path_is_private(path).map_err(|error| {
+        CliError::Config(format!(
+            "failed to inspect provider-credential ACL on {}: {error}",
+            path.display()
+        ))
+    })?;
+    let parent_private = crate::filesystem::windows_path_is_private(parent).map_err(|error| {
+        CliError::Config(format!(
+            "failed to inspect provider-credential ACL on {}: {error}",
+            parent.display()
+        ))
+    })?;
+    if file_private && parent_private {
+        return Ok(());
+    }
+    Err(CliError::Config(format!(
+        "provider authorization headers require owner/System-only ACLs on {} and {}",
+        path.display(),
+        parent.display()
+    )))
 }
 
 fn read_config_file(
@@ -1058,6 +1192,15 @@ fn config_paths(explicit: Option<&PathBuf>) -> Vec<PathBuf> {
 }
 
 fn config_paths_scoped(explicit: Option<&PathBuf>, user_only: bool) -> Vec<PathBuf> {
+    let user_config_dir = user_config_dir();
+    config_paths_scoped_at(explicit, user_only, user_config_dir.as_deref())
+}
+
+fn config_paths_scoped_at(
+    explicit: Option<&PathBuf>,
+    user_only: bool,
+    user_config_dir: Option<&Path>,
+) -> Vec<PathBuf> {
     if let Some(path) = explicit {
         return vec![path.clone()];
     }
@@ -1068,8 +1211,8 @@ fn config_paths_scoped(explicit: Option<&PathBuf>, user_only: bool) -> Vec<PathB
     {
         paths.push(project);
     }
-    if let Some(user) = user_config_path() {
-        paths.push(user);
+    if let Some(user) = user_config_dir {
+        paths.push(user.join("config.toml"));
     }
     paths
 }
@@ -1089,6 +1232,21 @@ fn plugin_config_paths_scoped(
     plugin_config_path: Option<&PathBuf>,
     user_only: bool,
 ) -> Vec<PathBuf> {
+    let user_config_dir = user_config_dir();
+    plugin_config_paths_scoped_at(
+        explicit,
+        plugin_config_path,
+        user_only,
+        user_config_dir.as_deref(),
+    )
+}
+
+fn plugin_config_paths_scoped_at(
+    explicit: Option<&PathBuf>,
+    plugin_config_path: Option<&PathBuf>,
+    user_only: bool,
+    user_config_dir: Option<&Path>,
+) -> Vec<PathBuf> {
     if let Some(path) = plugin_config_path {
         return vec![path.clone()];
     }
@@ -1099,9 +1257,12 @@ fn plugin_config_paths_scoped(
             .unwrap_or_default();
     }
     if user_only {
-        return implicit_plugin_config_paths(None, user_config_dir());
+        return implicit_plugin_config_paths(None, user_config_dir.map(Path::to_path_buf));
     }
-    implicit_plugin_config_paths(std::env::current_dir().ok().as_deref(), user_config_dir())
+    implicit_plugin_config_paths(
+        std::env::current_dir().ok().as_deref(),
+        user_config_dir.map(Path::to_path_buf),
+    )
 }
 
 fn user_config_scope() -> bool {
@@ -1162,12 +1323,6 @@ pub(crate) fn global_plugin_config_path() -> PathBuf {
     PathBuf::from("/etc/nemo-relay").join(PLUGINS_TOML)
 }
 
-// Resolves the user config using XDG first and HOME/USERPROFILE second. Returning `None` keeps
-// config loading portable in minimal environments where no home directory is visible.
-fn user_config_path() -> Option<PathBuf> {
-    user_config_dir().map(|dir| dir.join("config.toml"))
-}
-
 /// Resolves the nemo-relay user config DIRECTORY (without trailing filename). Delegates to core's
 /// resolver so the gateway, the editor, and the plugin runtime agree on the location.
 pub(crate) fn user_config_dir() -> Option<PathBuf> {
@@ -1206,7 +1361,7 @@ fn apply_file_gateway_config(
 }
 
 // Applies upstream LLM provider URLs. These are the bases for OpenAI- and Anthropic-shaped
-// gateway routes; transparent `run` mode can still override them per invocation.
+// managed provider routes.
 fn apply_file_upstream_config(
     gateway: &mut GatewayConfig,
     upstream: Option<FileUpstreamConfig>,
@@ -1281,10 +1436,26 @@ fn load_plugin_toml_config_scoped(
     plugin_config_path: Option<&PathBuf>,
     user_only: bool,
 ) -> Result<Option<PluginTomlConfig>, CliError> {
-    load_plugin_toml_config_from_paths(plugin_config_paths_scoped(
+    let user_config_dir = user_config_dir();
+    load_plugin_toml_config_scoped_at(
         explicit,
         plugin_config_path,
         user_only,
+        user_config_dir.as_deref(),
+    )
+}
+
+fn load_plugin_toml_config_scoped_at(
+    explicit: Option<&PathBuf>,
+    plugin_config_path: Option<&PathBuf>,
+    user_only: bool,
+    user_config_dir: Option<&Path>,
+) -> Result<Option<PluginTomlConfig>, CliError> {
+    load_plugin_toml_config_from_paths(plugin_config_paths_scoped_at(
+        explicit,
+        plugin_config_path,
+        user_only,
+        user_config_dir,
     ))
 }
 
@@ -1627,13 +1798,6 @@ fn legacy_observability_sections(value: &toml::Value) -> Vec<&'static str> {
         sections.push("[export.openinference]");
     }
     sections
-}
-
-// Parses JSON-valued CLI options into runtime metadata/config values and labels errors with the
-// user-facing option name so callers can report which structured argument was malformed.
-fn parse_json_option(name: &str, value: &str) -> Result<Value, CliError> {
-    serde_json::from_str::<Value>(value)
-        .map_err(|error| CliError::Config(format!("invalid {name}: {error}")))
 }
 
 /// Reads a non-empty UTF-8 header value as an owned string.

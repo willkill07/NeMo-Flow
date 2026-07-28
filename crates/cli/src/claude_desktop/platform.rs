@@ -5,14 +5,16 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 use crate::installation::marketplace::host::{CommandRunner, RealCommandRunner};
 
 use super::state::{CertificateState, DesktopState};
 
-pub(super) const MACOS_SERVICE_LABEL: &str = "com.nvidia.nemo-relay.claude-desktop";
-pub(super) const WINDOWS_TASK_NAME: &str = "NeMo Relay Claude Desktop";
-pub(super) const LINUX_SERVICE_NAME: &str = "nemo-relay-claude-desktop.service";
-const WINDOWS_PROCESS_QUERY: &str = "$names = @('Claude.exe','claude-code.exe','ClaudeCode.exe'); Get-CimInstance Win32_Process | Where-Object { $_.Name -in $names -or ($_.Name -eq 'node.exe' -and $_.CommandLine -match '(@anthropic-ai[\\\\/]claude-code[\\\\/]|claude-code[\\\\/]cli\\.js)') } | ForEach-Object { if ($_.Name -eq 'node.exe') { 'Claude Code (Node.js)' } else { $_.Name } }";
+pub(super) const MACOS_SERVICE_LABEL: &str = "com.nvidia.nemo-relay.agent-proxy";
+pub(super) const WINDOWS_TASK_PREFIX: &str = "NeMo Relay Agent Proxy";
+pub(super) const LINUX_SERVICE_NAME: &str = "nemo-relay-agent-proxy.service";
+const WINDOWS_PROCESS_QUERY: &str = "$names = @('Claude.exe','claude-code.exe','ClaudeCode.exe','Codex.exe','codex.exe','Hermes.exe','hermes.exe','hermes-agent.exe'); $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; Get-CimInstance Win32_Process | ForEach-Object { $process = $_; $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction SilentlyContinue; if ($owner.Sid -eq $sid -and ($process.Name -in $names -or ($process.Name -eq 'node.exe' -and $process.CommandLine -match '(@anthropic-ai[\\\\/]claude-code[\\\\/]|claude-code[\\\\/]cli\\.js)'))) { if ($process.Name -eq 'node.exe') { 'Claude Code (Node.js)' } else { $process.Name } } }";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Platform {
@@ -28,7 +30,7 @@ impl Platform {
             "windows" => Ok(Self::Windows),
             "linux" => Ok(Self::Linux),
             other => Err(format!(
-                "Claude Desktop wrapping is supported only on macOS, Windows, Ubuntu, and Debian; current platform is {other}"
+                "the coding-agent proxy is supported only on macOS, Windows, and Linux with a systemd user session; current platform is {other}"
             )),
         }
     }
@@ -46,7 +48,9 @@ impl Platform {
             "macos" => Ok(Self::MacOs),
             "windows" => Ok(Self::Windows),
             "linux" => Ok(Self::Linux),
-            other => Err(format!("invalid Claude Desktop platform in state: {other}")),
+            other => Err(format!(
+                "invalid coding-agent proxy platform in state: {other}"
+            )),
         }
     }
 }
@@ -70,6 +74,13 @@ pub(super) fn application_identity(platform: Platform) -> Result<String, String>
     application_identity_with(platform, &RealCommandRunner)
 }
 
+pub(super) fn current_service_identity(platform: Platform) -> Result<Option<String>, String> {
+    match platform {
+        Platform::Windows => current_windows_user_sid().map(Some),
+        Platform::MacOs | Platform::Linux => Ok(None),
+    }
+}
+
 fn application_identity_with(
     platform: Platform,
     runner: &dyn CommandRunner,
@@ -82,16 +93,40 @@ fn application_identity_with(
 }
 
 pub(super) fn active_claude_processes(platform: Platform) -> Result<Vec<String>, String> {
-    active_claude_processes_with(platform, &RealCommandRunner)
+    active_agent_processes_with(
+        platform,
+        &["claude-code".into(), "claude-desktop".into()],
+        &RealCommandRunner,
+    )
 }
 
+#[cfg(test)]
 fn active_claude_processes_with(
     platform: Platform,
     runner: &dyn CommandRunner,
 ) -> Result<Vec<String>, String> {
+    active_agent_processes_with(
+        platform,
+        &["claude-code".into(), "claude-desktop".into()],
+        runner,
+    )
+}
+
+pub(super) fn active_agent_processes(
+    platform: Platform,
+    enrolled: &[String],
+) -> Result<Vec<String>, String> {
+    active_agent_processes_with(platform, enrolled, &RealCommandRunner)
+}
+
+fn active_agent_processes_with(
+    platform: Platform,
+    enrolled: &[String],
+    runner: &dyn CommandRunner,
+) -> Result<Vec<String>, String> {
     match platform {
-        Platform::Windows => active_windows_processes(runner),
-        Platform::MacOs | Platform::Linux => active_unix_processes(runner),
+        Platform::Windows => active_windows_processes(enrolled, runner),
+        Platform::MacOs | Platform::Linux => active_unix_processes(enrolled, runner),
     }
 }
 
@@ -115,6 +150,22 @@ pub(super) fn service_definition_path(
     })
 }
 
+fn installed_service_definition_path(
+    state: &DesktopState,
+    platform: Platform,
+) -> Result<PathBuf, String> {
+    if platform != Platform::Linux {
+        return service_definition_path(platform, &state.install_root);
+    }
+    let xdg_config_home = state.user_config_dir.parent().ok_or_else(|| {
+        "persisted NeMo Relay user configuration directory has no XDG parent".to_string()
+    })?;
+    Ok(xdg_config_home
+        .join("systemd")
+        .join("user")
+        .join(LINUX_SERVICE_NAME))
+}
+
 pub(super) fn ensure_no_foreign_service(
     platform: Platform,
     install_root: &Path,
@@ -130,7 +181,7 @@ fn ensure_no_foreign_service_with(
     let definition = service_definition_path(platform, install_root)?;
     if definition.exists() {
         return Err(format!(
-            "refusing to overwrite unowned Claude Desktop service definition {}; remove it explicitly before installing",
+            "refusing to overwrite unowned coding-agent proxy service definition {}; remove it explicitly before installing",
             definition.display()
         ));
     }
@@ -148,17 +199,32 @@ pub(super) fn render_service_definition(
     relay: &Path,
     state_path: &Path,
     install_root: &Path,
-    windows_principal: Option<&str>,
+    service_identity: Option<&str>,
 ) -> Result<String, String> {
     match platform {
         Platform::MacOs => Ok(render_launch_agent(relay, state_path, install_root)),
         Platform::Windows => Ok(render_scheduled_task(
             relay,
             state_path,
-            windows_principal.unwrap_or("CURRENT_USER"),
+            service_identity.ok_or_else(|| {
+                "Windows service definition requires a persisted user SID".to_string()
+            })?,
         )),
         Platform::Linux => render_systemd_unit(relay, state_path),
     }
+}
+
+fn render_installed_service_definition(
+    state: &DesktopState,
+    platform: Platform,
+) -> Result<String, String> {
+    render_service_definition(
+        platform,
+        &state.relay_binary,
+        &state.state_path(),
+        &state.install_root,
+        state.service_identity.as_deref(),
+    )
 }
 
 pub(super) fn register_service(state: &DesktopState, dry_run: bool) -> Result<(), String> {
@@ -171,15 +237,8 @@ fn register_service_with(
     runner: &dyn CommandRunner,
 ) -> Result<(), String> {
     let platform = Platform::parse(&state.platform)?;
-    let definition_path = service_definition_path(platform, &state.install_root)?;
-    let principal = windows_principal();
-    let definition = render_service_definition(
-        platform,
-        &state.relay_binary,
-        &state.state_path(),
-        &state.install_root,
-        principal.as_deref(),
-    )?;
+    let definition_path = installed_service_definition_path(state, platform)?;
+    let definition = render_installed_service_definition(state, platform)?;
     if dry_run {
         println!("write {}", definition_path.display());
         println!("register {} login service", state.platform);
@@ -198,7 +257,7 @@ fn register_service_with(
                 runner,
                 "launchctl",
                 &["bootstrap", &domain, path_text(&definition_path)?],
-                "register Claude Desktop LaunchAgent",
+                "register coding-agent proxy LaunchAgent",
             )?;
         }
         Platform::Windows => run_checked(
@@ -207,12 +266,12 @@ fn register_service_with(
             &[
                 "/Create",
                 "/TN",
-                WINDOWS_TASK_NAME,
+                &windows_task_name_for_state(state)?,
                 "/XML",
                 path_text(&definition_path)?,
                 "/F",
             ],
-            "register Claude Desktop logon task",
+            "register coding-agent proxy logon task",
         )?,
         Platform::Linux => {
             run_checked(
@@ -225,7 +284,7 @@ fn register_service_with(
                 runner,
                 "systemctl",
                 &["--user", "enable", LINUX_SERVICE_NAME],
-                "enable Claude Desktop systemd user service",
+                "enable coding-agent proxy systemd user service",
             )?;
         }
     }
@@ -246,19 +305,22 @@ fn start_service_with(state: &DesktopState, runner: &dyn CommandRunner) -> Resul
                 "-k",
                 &format!("{}/{}", launchctl_domain(), MACOS_SERVICE_LABEL),
             ],
-            "start Claude Desktop LaunchAgent",
+            "start coding-agent proxy LaunchAgent",
         ),
-        Platform::Windows => run_checked(
-            runner,
-            "schtasks.exe",
-            &["/Run", "/TN", WINDOWS_TASK_NAME],
-            "start Claude Desktop logon task",
-        ),
+        Platform::Windows => {
+            let task_name = windows_task_name_for_state(state)?;
+            run_checked(
+                runner,
+                "schtasks.exe",
+                &["/Run", "/TN", &task_name],
+                "start coding-agent proxy logon task",
+            )
+        }
         Platform::Linux => run_checked(
             runner,
             "systemctl",
             &["--user", "start", LINUX_SERVICE_NAME],
-            "start Claude Desktop systemd user service",
+            "start coding-agent proxy systemd user service",
         ),
     }
 }
@@ -268,28 +330,87 @@ pub(super) fn stop_service(state: &DesktopState) -> Result<(), String> {
 }
 
 fn stop_service_with(state: &DesktopState, runner: &dyn CommandRunner) -> Result<(), String> {
-    match Platform::parse(&state.platform)? {
+    let platform = Platform::parse(&state.platform)?;
+    let definition = installed_service_definition_path(state, platform)?;
+    let definition_exists = definition
+        .try_exists()
+        .map_err(|error| format!("failed to inspect {}: {error}", definition.display()))?;
+    if !definition_exists {
+        if service_registration_status(platform, None, runner).is_ok() {
+            return Err(format!(
+                "refusing to stop the {} login service because its Relay-owned definition is missing",
+                state.platform
+            ));
+        }
+        return Ok(());
+    }
+    ensure_service_definition_owned(state, platform, &definition)?;
+    if !verify_service_is_owned_or_disabled(state, platform, runner)? {
+        return Ok(());
+    }
+    // Recheck both ownership surfaces immediately before the destructive action.
+    ensure_service_definition_owned(state, platform, &definition)?;
+    if !verify_service_is_owned_or_disabled(state, platform, runner)? {
+        return Ok(());
+    }
+    match platform {
         Platform::MacOs => {
-            let definition = service_definition_path(Platform::MacOs, &state.install_root)?;
             let status = run_status(
                 runner,
                 "launchctl",
                 &["bootout", &launchctl_domain(), path_text(&definition)?],
             )?;
             if status != 0 && definition.exists() {
-                return Err("failed to stop Claude Desktop LaunchAgent".into());
+                return Err("failed to stop coding-agent proxy LaunchAgent".into());
             }
             Ok(())
         }
         Platform::Windows => {
-            let _ = run_status(runner, "schtasks.exe", &["/End", "/TN", WINDOWS_TASK_NAME])?;
-            Ok(())
+            let task_name = windows_task_name_for_state(state)?;
+            let output = run_output(runner, "schtasks.exe", &["/End", "/TN", &task_name])?;
+            if output.status == 0 || windows_task_already_stopped(&output.stderr) {
+                Ok(())
+            } else {
+                let details = output.stderr.trim();
+                Err(if details.is_empty() {
+                    format!(
+                        "failed to stop coding-agent proxy logon task (exit {})",
+                        output.status
+                    )
+                } else {
+                    format!("failed to stop coding-agent proxy logon task: {details}")
+                })
+            }
         }
-        Platform::Linux => {
-            let _ = run_status(runner, "systemctl", &["--user", "stop", LINUX_SERVICE_NAME])?;
-            Ok(())
-        }
+        Platform::Linux => run_checked(
+            runner,
+            "systemctl",
+            &["--user", "stop", LINUX_SERVICE_NAME],
+            "stop coding-agent proxy systemd user service",
+        ),
     }
+}
+
+fn verify_service_is_owned_or_disabled(
+    state: &DesktopState,
+    platform: Platform,
+    runner: &dyn CommandRunner,
+) -> Result<bool, String> {
+    match service_registration_status(platform, Some(state), runner) {
+        Ok(()) => Ok(true),
+        Err(error) if service_is_disabled(platform, &error) => Ok(true),
+        Err(error) if service_is_absent(&error) => Ok(false),
+        Err(error) => Err(format!(
+            "refusing to stop a login service that Relay no longer owns: {error}"
+        )),
+    }
+}
+
+fn windows_task_already_stopped(stderr: &str) -> bool {
+    let message = stderr.to_ascii_lowercase();
+    message.contains("task is not currently running")
+        || message.contains("scheduled task is not running")
+        || message.contains("task is not running")
 }
 
 pub(super) fn unregister_service(state: &DesktopState, dry_run: bool) -> Result<(), String> {
@@ -302,41 +423,70 @@ fn unregister_service_with(
     runner: &dyn CommandRunner,
 ) -> Result<(), String> {
     let platform = Platform::parse(&state.platform)?;
-    let definition = service_definition_path(platform, &state.install_root)?;
+    let definition = installed_service_definition_path(state, platform)?;
     if dry_run {
         println!("unregister {} login service", state.platform);
         println!("remove {}", definition.display());
         return Ok(());
     }
-    let registered = service_registration_status(platform, None, runner).is_ok();
+    let definition_exists = definition
+        .try_exists()
+        .map_err(|error| format!("failed to inspect {}: {error}", definition.display()))?;
+    if !definition_exists {
+        if service_registration_status(platform, None, runner).is_ok() {
+            return Err(format!(
+                "refusing to unregister the {} login service because its Relay-owned definition is missing",
+                state.platform
+            ));
+        }
+        return Ok(());
+    }
+    ensure_service_definition_owned(state, platform, &definition)?;
+    let registered = match service_registration_status(platform, Some(state), runner) {
+        Ok(()) => true,
+        Err(error) if service_is_absent(&error) => false,
+        Err(error) if service_is_disabled(platform, &error) => true,
+        Err(error) => {
+            return Err(format!(
+                "refusing to unregister a login service that Relay no longer owns: {error}"
+            ));
+        }
+    };
     if registered {
+        ensure_service_definition_owned(state, platform, &definition)?;
         stop_service_with(state, runner)?;
     }
     match platform {
         Platform::MacOs => {}
         Platform::Windows => {
-            if service_registration_status(Platform::Windows, None, runner).is_ok() {
+            if registered {
+                ensure_service_definition_owned(state, platform, &definition)?;
+                service_registration_status(platform, Some(state), runner)?;
+                let task_name = windows_task_name_for_state(state)?;
                 let status = run_status(
                     runner,
                     "schtasks.exe",
-                    &["/Delete", "/TN", WINDOWS_TASK_NAME, "/F"],
+                    &["/Delete", "/TN", &task_name, "/F"],
                 )?;
                 if status != 0 {
-                    return Err("failed to delete Claude Desktop logon task".into());
+                    return Err("failed to delete coding-agent proxy logon task".into());
                 }
             }
         }
         Platform::Linux => {
             if registered {
+                ensure_service_definition_owned(state, platform, &definition)?;
+                service_registration_status(platform, Some(state), runner)?;
                 run_checked(
                     runner,
                     "systemctl",
                     &["--user", "disable", LINUX_SERVICE_NAME],
-                    "disable Claude Desktop systemd user service",
+                    "disable coding-agent proxy systemd user service",
                 )?;
             }
         }
     }
+    ensure_service_definition_owned(state, platform, &definition)?;
     super::state::remove_file_if_present(&definition)?;
     if platform == Platform::Linux {
         run_checked(
@@ -349,6 +499,14 @@ fn unregister_service_with(
     Ok(())
 }
 
+fn service_is_absent(error: &str) -> bool {
+    error.contains("is not registered")
+}
+
+fn service_is_disabled(platform: Platform, error: &str) -> bool {
+    platform == Platform::Linux && error.contains("is not enabled")
+}
+
 pub(super) fn service_definition_matches(state: &DesktopState) -> Result<String, String> {
     service_definition_matches_with(state, &RealCommandRunner)
 }
@@ -358,28 +516,31 @@ fn service_definition_matches_with(
     runner: &dyn CommandRunner,
 ) -> Result<String, String> {
     let platform = Platform::parse(&state.platform)?;
-    let path = service_definition_path(platform, &state.install_root)?;
-    let actual = std::fs::read_to_string(&path).map_err(|error| {
+    let path = installed_service_definition_path(state, platform)?;
+    ensure_service_definition_owned(state, platform, &path)?;
+    service_registration_status(platform, Some(state), runner)?;
+    Ok(format!("{} is registered", path.display()))
+}
+
+fn ensure_service_definition_owned(
+    state: &DesktopState,
+    platform: Platform,
+    path: &Path,
+) -> Result<(), String> {
+    let actual = std::fs::read_to_string(path).map_err(|error| {
         format!(
             "failed to read service definition {}: {error}",
             path.display()
         )
     })?;
-    let expected = render_service_definition(
-        platform,
-        &state.relay_binary,
-        &state.state_path(),
-        &state.install_root,
-        windows_principal().as_deref(),
-    )?;
+    let expected = render_installed_service_definition(state, platform)?;
     if actual != expected {
         return Err(format!(
             "service definition {} differs from the installed generation",
             path.display()
         ));
     }
-    service_registration_status(platform, Some(state), runner)?;
-    Ok(format!("{} is registered", path.display()))
+    Ok(())
 }
 
 fn service_registration_status(
@@ -387,6 +548,17 @@ fn service_registration_status(
     expected: Option<&DesktopState>,
     runner: &dyn CommandRunner,
 ) -> Result<(), String> {
+    if platform == Platform::Linux {
+        return linux_service_registration_status(expected, runner);
+    }
+    let windows_task_name = if platform == Platform::Windows {
+        Some(match expected {
+            Some(state) => windows_task_name_for_state(state)?,
+            None => windows_task_name(&current_windows_user_sid()?),
+        })
+    } else {
+        None
+    };
     let (program, args, label) = match platform {
         Platform::MacOs => (
             "launchctl",
@@ -394,27 +566,19 @@ fn service_registration_status(
                 "print".to_string(),
                 format!("{}/{}", launchctl_domain(), MACOS_SERVICE_LABEL),
             ],
-            "Claude Desktop LaunchAgent",
+            "coding-agent proxy LaunchAgent",
         ),
         Platform::Windows => (
             "schtasks.exe",
             vec![
                 "/Query".to_string(),
                 "/TN".to_string(),
-                WINDOWS_TASK_NAME.to_string(),
+                windows_task_name.expect("Windows task name was resolved"),
                 "/XML".to_string(),
             ],
-            "Claude Desktop logon task",
+            "coding-agent proxy logon task",
         ),
-        Platform::Linux => (
-            "systemctl",
-            vec![
-                "--user".to_string(),
-                "is-enabled".to_string(),
-                LINUX_SERVICE_NAME.to_string(),
-            ],
-            "Claude Desktop systemd user service",
-        ),
+        Platform::Linux => unreachable!("Linux registration uses its identity-aware adapter"),
     };
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     let output = run_output(runner, program, &args)?;
@@ -427,39 +591,196 @@ fn service_registration_status(
             let state_path = state.state_path().display().to_string();
             if output.stdout.contains(&relay)
                 && output.stdout.contains(&state_path)
-                && output.stdout.contains("claude-desktop-sidecar")
+                && output.stdout.contains("agent-proxy-service")
             {
                 Ok(())
             } else {
-                Err("registered Claude Desktop LaunchAgent has unexpected arguments".into())
+                Err("registered coding-agent proxy LaunchAgent has unexpected arguments".into())
             }
         }
         (Platform::Windows, Some(state)) => {
-            let command = format!(
-                "<Command>{}</Command>",
-                xml_escape(&state.relay_binary.display().to_string())
-            );
-            let state_argument = format!(
-                "--state &quot;{}&quot;",
-                xml_escape(&state.state_path().display().to_string())
-            );
-            if output.stdout.contains("<Enabled>true</Enabled>")
-                && output.stdout.contains(&command)
-                && output.stdout.contains(&state_argument)
-            {
+            let expected = render_installed_service_definition(state, Platform::Windows)?;
+            if windows_task_matches(&output.stdout, &expected) {
                 Ok(())
             } else {
                 Err(
-                    "registered Claude Desktop logon task is disabled or has unexpected arguments"
+                    "registered coding-agent proxy logon task has unexpected triggers, principal, settings, or actions"
                         .into(),
                 )
             }
         }
-        (Platform::Linux, _) if output.stdout.trim() != "enabled" => {
-            Err("Claude Desktop systemd user service is not enabled".into())
-        }
         _ => Ok(()),
     }
+}
+
+fn windows_task_matches(actual: &str, expected: &str) -> bool {
+    let actual = quick_xml::de::from_str::<WindowsTask>(actual);
+    let expected = quick_xml::de::from_str::<WindowsTask>(expected);
+    matches!((actual, expected), (Ok(actual), Ok(expected)) if actual == expected)
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename = "Task", deny_unknown_fields)]
+struct WindowsTask {
+    #[serde(rename = "@version")]
+    version: String,
+    #[serde(rename = "@xmlns")]
+    xmlns: String,
+    #[serde(rename = "Triggers")]
+    triggers: WindowsTaskTriggers,
+    #[serde(rename = "Principals")]
+    principals: WindowsTaskPrincipals,
+    #[serde(rename = "Settings")]
+    settings: WindowsTaskSettings,
+    #[serde(rename = "Actions")]
+    actions: WindowsTaskActions,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WindowsTaskTriggers {
+    #[serde(rename = "LogonTrigger")]
+    logon: WindowsLogonTrigger,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WindowsLogonTrigger {
+    #[serde(rename = "Enabled")]
+    enabled: String,
+    #[serde(rename = "UserId")]
+    user_id: String,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WindowsTaskPrincipals {
+    #[serde(rename = "Principal")]
+    principal: WindowsTaskPrincipal,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WindowsTaskPrincipal {
+    #[serde(rename = "@id")]
+    id: String,
+    #[serde(rename = "UserId")]
+    user_id: String,
+    #[serde(rename = "LogonType")]
+    logon_type: String,
+    #[serde(rename = "RunLevel")]
+    run_level: String,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WindowsTaskSettings {
+    #[serde(rename = "MultipleInstancesPolicy")]
+    multiple_instances_policy: String,
+    #[serde(rename = "DisallowStartIfOnBatteries")]
+    disallow_start_if_on_batteries: String,
+    #[serde(rename = "StopIfGoingOnBatteries")]
+    stop_if_going_on_batteries: String,
+    #[serde(rename = "AllowHardTerminate")]
+    allow_hard_terminate: String,
+    #[serde(rename = "StartWhenAvailable")]
+    start_when_available: String,
+    #[serde(rename = "Enabled")]
+    enabled: String,
+    #[serde(rename = "Hidden")]
+    hidden: String,
+    #[serde(rename = "ExecutionTimeLimit")]
+    execution_time_limit: String,
+    #[serde(rename = "RestartOnFailure")]
+    restart_on_failure: WindowsTaskRestart,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WindowsTaskRestart {
+    #[serde(rename = "Interval")]
+    interval: String,
+    #[serde(rename = "Count")]
+    count: String,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WindowsTaskActions {
+    #[serde(rename = "@Context")]
+    context: String,
+    #[serde(rename = "Exec")]
+    exec: WindowsTaskExec,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WindowsTaskExec {
+    #[serde(rename = "Command")]
+    command: String,
+    #[serde(rename = "Arguments")]
+    arguments: String,
+}
+
+fn linux_service_registration_status(
+    expected: Option<&DesktopState>,
+    runner: &dyn CommandRunner,
+) -> Result<(), String> {
+    let show = run_output(
+        runner,
+        "systemctl",
+        &[
+            "--user",
+            "show",
+            LINUX_SERVICE_NAME,
+            "--property=FragmentPath",
+            "--property=DropInPaths",
+            "--property=NeedDaemonReload",
+            "--property=ExecStart",
+            "--no-pager",
+        ],
+    )?;
+    if show.status != 0 {
+        return Err("coding-agent proxy systemd user service is not registered".into());
+    }
+    if let Some(state) = expected {
+        let definition = installed_service_definition_path(state, Platform::Linux)?;
+        let fragment = property(&show.stdout, "FragmentPath");
+        let drop_ins = property(&show.stdout, "DropInPaths");
+        let reload = property(&show.stdout, "NeedDaemonReload");
+        let exec_start = property(&show.stdout, "ExecStart");
+        if fragment != Some(definition.to_string_lossy().as_ref())
+            || drop_ins != Some("")
+            || reload != Some("no")
+            || !exec_start.is_some_and(|value| {
+                value.contains(&state.relay_binary.display().to_string())
+                    && value.contains(&state.state_path().display().to_string())
+                    && value.contains("agent-proxy-service")
+            })
+        {
+            return Err(
+                "registered coding-agent proxy systemd user service has unexpected live identity"
+                    .into(),
+            );
+        }
+    } else {
+        return Ok(());
+    }
+    let enabled = run_output(
+        runner,
+        "systemctl",
+        &["--user", "is-enabled", LINUX_SERVICE_NAME],
+    )?;
+    if enabled.status != 0 || enabled.stdout.trim() != "enabled" {
+        return Err("coding-agent proxy systemd user service is not enabled".into());
+    }
+    Ok(())
+}
+
+fn property<'a>(output: &'a str, name: &str) -> Option<&'a str> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
 }
 
 pub(super) fn install_trust(
@@ -477,10 +798,20 @@ fn install_trust_with(
     runner: &dyn CommandRunner,
 ) -> Result<(), String> {
     if dry_run {
-        println!(
-            "trust Claude Desktop root certificate {} for the current user",
-            certificate.root_sha256
-        );
+        match platform {
+            Platform::MacOs => println!(
+                "trust coding-agent proxy root certificate {} in the current user's macOS login Keychain",
+                certificate.root_sha256
+            ),
+            Platform::Windows => println!(
+                "trust coding-agent proxy root certificate {} in the Windows CurrentUser Root store",
+                certificate.root_sha256
+            ),
+            Platform::Linux => println!(
+                "configure agent-scoped CA bundles for coding-agent proxy root certificate {} without changing the Linux system trust store",
+                certificate.root_sha256
+            ),
+        }
         return Ok(());
     }
     if trust_entry_present(platform, certificate, runner)? {
@@ -498,7 +829,7 @@ fn install_trust_with(
                 path_text(&macos_login_keychain()?)?,
                 path_text(&certificate.root_pem)?,
             ],
-            "trust Claude Desktop root in the login Keychain",
+            "trust coding-agent proxy root in the login Keychain",
         ),
         Platform::Windows => run_checked(
             runner,
@@ -510,7 +841,7 @@ fn install_trust_with(
                 "Root",
                 path_text(&certificate.root_der)?,
             ],
-            "trust Claude Desktop root in CurrentUser Root",
+            "trust coding-agent proxy root in CurrentUser Root",
         ),
         Platform::Linux => Ok(()),
     }
@@ -531,10 +862,20 @@ fn remove_trust_with(
     runner: &dyn CommandRunner,
 ) -> Result<(), String> {
     if dry_run {
-        println!(
-            "remove Claude Desktop root certificate {} from current-user trust",
-            certificate.root_sha256
-        );
+        match platform {
+            Platform::MacOs => println!(
+                "remove coding-agent proxy root certificate {} from the current user's macOS login Keychain",
+                certificate.root_sha256
+            ),
+            Platform::Windows => println!(
+                "remove coding-agent proxy root certificate {} from the Windows CurrentUser Root store",
+                certificate.root_sha256
+            ),
+            Platform::Linux => println!(
+                "remove agent-scoped CA bundles for coding-agent proxy root certificate {} without changing the Linux system trust store",
+                certificate.root_sha256
+            ),
+        }
         return Ok(());
     }
     if !trust_entry_present(platform, certificate, runner)? {
@@ -600,14 +941,14 @@ fn trust_status_with(
             if trust_entry_present(platform, certificate, runner)? {
                 Ok("login Keychain trust matches the installed root".into())
             } else {
-                Err("installed Claude Desktop root is not trusted in the login Keychain".into())
+                Err("installed coding-agent proxy root is not trusted in the login Keychain".into())
             }
         }
         Platform::Windows => {
             if trust_entry_present(platform, certificate, runner)? {
                 Ok("CurrentUser Root contains the installed root".into())
             } else {
-                Err("installed Claude Desktop root is not in CurrentUser Root".into())
+                Err("installed coding-agent proxy root is not in CurrentUser Root".into())
             }
         }
         Platform::Linux => {
@@ -688,7 +1029,7 @@ fn validated_root_sha1(certificate: &CertificateState) -> Result<&str, String> {
     {
         Ok(thumbprint)
     } else {
-        Err("Claude Desktop state contains an invalid root certificate thumbprint".into())
+        Err("coding-agent proxy state contains an invalid root certificate thumbprint".into())
     }
 }
 
@@ -715,18 +1056,18 @@ fn open_deep_link_with(
 
 fn render_launch_agent(relay: &Path, state: &Path, root: &Path) -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>{}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{}</string>\n    <string>claude-desktop-sidecar</string>\n    <string>--state</string>\n    <string>{}</string>\n  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ProcessType</key><string>Background</string>\n  <key>ThrottleInterval</key><integer>5</integer>\n  <key>Umask</key><integer>63</integer>\n  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict>\n</plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>{}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{}</string>\n    <string>agent-proxy-service</string>\n    <string>--state</string>\n    <string>{}</string>\n  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ProcessType</key><string>Background</string>\n  <key>ThrottleInterval</key><integer>5</integer>\n  <key>Umask</key><integer>63</integer>\n  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict>\n</plist>\n",
         MACOS_SERVICE_LABEL,
         xml_escape(&relay.display().to_string()),
         xml_escape(&state.display().to_string()),
-        xml_escape(&root.join("sidecar.stdout.log").display().to_string()),
-        xml_escape(&root.join("sidecar.stderr.log").display().to_string()),
+        xml_escape(&root.join("proxy.stdout.log").display().to_string()),
+        xml_escape(&root.join("proxy.stderr.log").display().to_string()),
     )
 }
 
 fn render_scheduled_task(relay: &Path, state: &Path, principal: &str) -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{}</UserId></LogonTrigger></Triggers>\n  <Principals><Principal id=\"Author\"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><Enabled>true</Enabled><Hidden>true</Hidden><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT5S</Interval><Count>999</Count></RestartOnFailure></Settings>\n  <Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>claude-desktop-sidecar --state &quot;{}&quot;</Arguments></Exec></Actions>\n</Task>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{}</UserId></LogonTrigger></Triggers>\n  <Principals><Principal id=\"Author\"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><Enabled>true</Enabled><Hidden>true</Hidden><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT5S</Interval><Count>999</Count></RestartOnFailure></Settings>\n  <Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>agent-proxy-service --state &quot;{}&quot;</Arguments></Exec></Actions>\n</Task>\n",
         xml_escape(principal),
         xml_escape(principal),
         xml_escape(&relay.display().to_string()),
@@ -736,7 +1077,7 @@ fn render_scheduled_task(relay: &Path, state: &Path, principal: &str) -> String 
 
 fn render_systemd_unit(relay: &Path, state: &Path) -> Result<String, String> {
     Ok(format!(
-        "[Unit]\nDescription=NeMo Relay protection for Claude Desktop Code\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} claude-desktop-sidecar --state {}\nRestart=on-failure\nRestartSec=5\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=NeMo Relay per-user coding-agent proxy\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} agent-proxy-service --state {}\nRestart=on-failure\nRestartSec=5\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=default.target\n",
         systemd_quote(&relay.display().to_string())?,
         systemd_quote(&state.display().to_string())?,
     ))
@@ -775,7 +1116,7 @@ fn validate_macos_version(runner: &dyn CommandRunner) -> Result<String, String> 
         .ok_or_else(|| "could not determine the macOS version".to_string())?;
     if major < 11 {
         return Err(format!(
-            "Claude Desktop protection requires macOS 11 or newer; found {}",
+            "the coding-agent proxy requires macOS 11 or newer; found {}",
             output.stdout.trim()
         ));
     }
@@ -801,7 +1142,7 @@ fn validate_windows_version(runner: &dyn CommandRunner) -> Result<String, String
         })?;
     if version < 10 {
         return Err(format!(
-            "Claude Desktop protection requires Windows 10 or newer; found {}",
+            "the coding-agent proxy requires Windows 10 or newer; found {}",
             output.stdout.trim()
         ));
     }
@@ -818,22 +1159,15 @@ fn validate_linux_platform(runner: &dyn CommandRunner) -> Result<String, String>
 fn validate_linux_release(raw: &str, systemd_status: i32) -> Result<String, String> {
     let id = os_release_value(raw, "ID").unwrap_or_default();
     let version = os_release_value(raw, "VERSION_ID").unwrap_or_default();
-    let supported = match id.as_str() {
-        "ubuntu" => version_major(&version).is_some_and(|major| major >= 22),
-        "debian" => version_major(&version).is_some_and(|major| major >= 12),
-        _ => false,
-    };
-    if !supported {
-        return Err(format!(
-            "Claude Desktop Linux support currently requires Ubuntu 22.04+ or Debian 12+ with a systemd user session; found {id} {version}"
-        ));
-    }
     if systemd_status != 0 {
-        return Err(
-            "a running systemd user session is required for Claude Desktop protection".into(),
-        );
+        return Err("a running systemd user session is required for the coding-agent proxy".into());
     }
-    Ok(format!("{id} {version} with systemd user session"))
+    let release = match (id.is_empty(), version.is_empty()) {
+        (true, _) => "Linux".into(),
+        (false, true) => id,
+        (false, false) => format!("{id} {version}"),
+    };
+    Ok(format!("{release} with systemd user session"))
 }
 
 fn macos_application_identity(runner: &dyn CommandRunner) -> Result<String, String> {
@@ -932,32 +1266,66 @@ fn linux_application_identity_at(
     Ok(format!("{} ({identity})", executable.display()))
 }
 
-fn active_unix_processes(runner: &dyn CommandRunner) -> Result<Vec<String>, String> {
+fn active_unix_processes(
+    enrolled: &[String],
+    runner: &dyn CommandRunner,
+) -> Result<Vec<String>, String> {
+    let uid = unix_effective_uid();
     let mut active = Vec::new();
-    for name in ["Claude", "Claude Helper", "claude", "claude-desktop"] {
-        let status = run_status(runner, "pgrep", &["-x", name])?;
+    let claude = enrolled
+        .iter()
+        .any(|agent| matches!(agent.as_str(), "claude" | "claude-code" | "claude-desktop"));
+    let codex = enrolled.iter().any(|agent| agent == "codex");
+    let hermes = enrolled.iter().any(|agent| agent == "hermes");
+    let names = [
+        (claude, "Claude"),
+        (claude, "Claude Helper"),
+        (claude, "claude"),
+        (claude, "claude-desktop"),
+        (codex, "Codex"),
+        (codex, "codex"),
+        (hermes, "Hermes"),
+        (hermes, "hermes"),
+        (hermes, "hermes-agent"),
+    ];
+    for (_, name) in names.into_iter().filter(|(enabled, _)| *enabled) {
+        let status = run_status(runner, "pgrep", &["-u", &uid, "-x", name])?;
         if status == 0 {
             active.push(name.to_string());
         }
     }
-    let processes = run_output(runner, "ps", &["-axo", "comm=,args="])?;
-    if processes
-        .stdout
-        .lines()
-        .any(unix_process_line_is_node_claude)
+    let processes = run_output(runner, "ps", &["-U", &uid, "-o", "comm=,args="])?;
+    if claude
+        && processes
+            .stdout
+            .lines()
+            .any(unix_process_line_is_node_claude)
     {
         active.push("Claude Code (Node.js)".into());
     }
-    if processes
-        .stdout
-        .lines()
-        .any(unix_process_line_is_desktop_claude)
+    if claude
+        && processes
+            .stdout
+            .lines()
+            .any(unix_process_line_is_desktop_claude)
     {
         active.push("Claude Desktop helper".into());
     }
     active.sort();
     active.dedup();
     Ok(active)
+}
+
+fn unix_effective_uid() -> String {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` has no preconditions and does not mutate process state.
+        unsafe { libc::geteuid() }.to_string()
+    }
+    #[cfg(not(unix))]
+    {
+        String::new()
+    }
 }
 
 fn unix_process_line_is_node_claude(line: &str) -> bool {
@@ -976,7 +1344,10 @@ fn unix_process_line_is_desktop_claude(line: &str) -> bool {
         || name.starts_with("claude helper")
 }
 
-fn active_windows_processes(runner: &dyn CommandRunner) -> Result<Vec<String>, String> {
+fn active_windows_processes(
+    enrolled: &[String],
+    runner: &dyn CommandRunner,
+) -> Result<Vec<String>, String> {
     let output = run_output(
         runner,
         "powershell.exe",
@@ -997,17 +1368,24 @@ fn active_windows_processes(runner: &dyn CommandRunner) -> Result<Vec<String>, S
         .stdout
         .lines()
         .map(str::trim)
-        .filter(|name| {
-            matches!(
-                *name,
-                "Claude.exe" | "claude-code.exe" | "ClaudeCode.exe" | "Claude Code (Node.js)"
-            )
-        })
+        .filter(|name| windows_process_belongs_to_enrollment(name, enrolled))
         .map(str::to_owned)
         .collect::<Vec<_>>();
     active.sort();
     active.dedup();
     Ok(active)
+}
+
+fn windows_process_belongs_to_enrollment(name: &str, enrolled: &[String]) -> bool {
+    enrolled.iter().any(|agent| match agent.as_str() {
+        "claude" | "claude-code" | "claude-desktop" => matches!(
+            name,
+            "Claude.exe" | "claude-code.exe" | "ClaudeCode.exe" | "Claude Code (Node.js)"
+        ),
+        "codex" => matches!(name, "Codex.exe" | "codex.exe"),
+        "hermes" => matches!(name, "Hermes.exe" | "hermes.exe" | "hermes-agent.exe"),
+        _ => false,
+    })
 }
 
 fn macos_login_keychain() -> Result<PathBuf, String> {
@@ -1034,9 +1412,103 @@ fn launchctl_domain() -> String {
     }
 }
 
-fn windows_principal() -> Option<String> {
-    let user = std::env::var("USERNAME").ok()?;
-    Some(std::env::var("USERDOMAIN").map_or(user.clone(), |domain| format!("{domain}\\{user}")))
+fn windows_task_name_for_state(state: &DesktopState) -> Result<String, String> {
+    let identity = state.service_identity.as_deref().ok_or_else(|| {
+        "Windows coding-agent proxy state is missing its persisted user SID".to_string()
+    })?;
+    Ok(windows_task_name(identity))
+}
+
+fn windows_task_name(identity: &str) -> String {
+    let identity = identity.to_ascii_lowercase();
+    let suffix = ring::digest::digest(&ring::digest::SHA256, identity.as_bytes())
+        .as_ref()
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{WINDOWS_TASK_PREFIX} {suffix}")
+}
+
+#[cfg(windows)]
+fn current_windows_user_sid() -> Result<String, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle and `token` is writable.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(format!(
+            "failed to open the current Windows access token: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let result = (|| {
+        let mut required = 0;
+        // SAFETY: This sizing call intentionally supplies a null output buffer.
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut required) };
+        if required == 0 {
+            return Err(format!(
+                "failed to size the current Windows token user: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let word = std::mem::size_of::<usize>();
+        let mut buffer = vec![0_usize; (required as usize).div_ceil(word)];
+        // SAFETY: The aligned buffer has at least `required` writable bytes.
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                required,
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "failed to read the current Windows token user: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: GetTokenInformation initialized a TOKEN_USER at the aligned buffer address.
+        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        let mut sid_text = std::ptr::null_mut();
+        // SAFETY: The token-owned SID is valid while `buffer` lives and `sid_text` is writable.
+        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_text) } == 0 {
+            return Err(format!(
+                "failed to encode the current Windows user SID: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let length = (0..)
+            .take_while(|index| {
+                // SAFETY: ConvertSidToStringSidW returns a NUL-terminated allocation.
+                unsafe { *sid_text.add(*index) != 0 }
+            })
+            .count();
+        // SAFETY: The allocation contains `length` initialized UTF-16 code units.
+        let identity = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text, length) })
+            .map_err(|error| format!("current Windows user SID is not valid UTF-16: {error}"));
+        // SAFETY: ConvertSidToStringSidW allocated `sid_text` with LocalAlloc.
+        unsafe { LocalFree(sid_text.cast()) };
+        identity
+    })();
+    // SAFETY: `token` is an owned handle returned by OpenProcessToken.
+    unsafe { CloseHandle(token) };
+    result
+}
+
+#[cfg(all(not(windows), test))]
+fn current_windows_user_sid() -> Result<String, String> {
+    Ok("S-1-5-21-1000".into())
+}
+
+#[cfg(all(not(windows), not(test)))]
+fn current_windows_user_sid() -> Result<String, String> {
+    Err("Windows service identity is unavailable on this platform".into())
 }
 
 fn path_text(path: &Path) -> Result<&str, String> {
@@ -1049,10 +1521,6 @@ fn os_release_value(raw: &str, key: &str) -> Option<String> {
         let (candidate, value) = line.split_once('=')?;
         (candidate == key).then(|| value.trim_matches(['"', '\'']).to_string())
     })
-}
-
-fn version_major(value: &str) -> Option<u64> {
-    value.split('.').next()?.parse().ok()
 }
 
 struct ProcessOutput {

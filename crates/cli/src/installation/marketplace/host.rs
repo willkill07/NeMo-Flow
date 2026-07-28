@@ -320,26 +320,6 @@ pub(crate) fn validate_relay_hook_forward(
     }
 }
 
-pub(crate) fn validate_relay_mcp(
-    relay: &Path,
-    options: &PluginInstallOptions,
-    runner: &dyn CommandRunner,
-) -> Result<(), String> {
-    if options.dry_run {
-        return Ok(());
-    }
-    let args = ["mcp".into(), "--help".into()];
-    let status = runner.run_quiet(relay, &args)?;
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "{} failed with exit code {status}; coding-agent plugins require native `nemo-relay mcp` support",
-            format_command(&relay.display().to_string(), &args)
-        ))
-    }
-}
-
 pub(crate) fn require_host_cli(
     host: impl MarketplaceHost,
     options: &PluginInstallOptions,

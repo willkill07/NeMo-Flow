@@ -5,9 +5,12 @@ mod types;
 
 pub(crate) use types::GatewayOverrides;
 
+#[cfg(test)]
 use std::future::Future;
 use std::net::SocketAddr;
+#[cfg(test)]
 use std::path::Path;
+#[cfg(test)]
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,13 +38,15 @@ use nemo_relay_switchyard::{
 use reqwest::Client;
 use serde_json::Value;
 use subtle::ConstantTimeEq;
+#[cfg(any(test, feature = "internal-test-server"))]
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tower::ServiceExt;
 
 use crate::agents::shared::adapters::{claude_code, codex, hermes};
-use crate::configuration::{
-    BOOTSTRAP_CLIENT_TOKEN_HEADER, BootstrapChallengeKey, GatewayConfig, ManagedBootstrapIdentity,
-};
+#[cfg(test)]
+use crate::configuration::ManagedBootstrapIdentity;
+use crate::configuration::{BOOTSTRAP_CLIENT_TOKEN_HEADER, BootstrapChallengeKey, GatewayConfig};
 use crate::error::CliError;
 use crate::gateway;
 use crate::plugins::lifecycle::{ActiveDynamicPluginComponent, DynamicPluginActivationSnapshot};
@@ -57,8 +62,7 @@ pub(crate) struct AppState {
     pub(crate) bootstrap_fingerprint: Option<String>,
     pub(crate) bootstrap_challenge_key: Option<BootstrapChallengeKey>,
     pub(crate) require_provider_client_token: bool,
-    pub(crate) transparent_proxy_credential:
-        Option<crate::provider_auth::TransparentProxyCredential>,
+    pub(crate) allow_environment_provider_auth: bool,
     pub(crate) http: Client,
     pub(crate) sessions: SessionManager,
     pub(crate) last_activity: Arc<Mutex<Instant>>,
@@ -66,6 +70,7 @@ pub(crate) struct AppState {
     pub(crate) instance_id: String,
     pub(crate) bootstrap_tls: Option<Arc<rustls::ServerConfig>>,
     pub(crate) local_address: Option<SocketAddr>,
+    pub(crate) allow_test_loopback_dispatch: bool,
 }
 
 #[derive(Clone)]
@@ -75,85 +80,108 @@ pub(crate) struct BootstrapShutdown {
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct BootstrapServeOptions<'a> {
     fingerprint: Option<String>,
     identity: Option<ManagedBootstrapIdentity>,
     ready_file: Option<&'a Path>,
     shutdown_token: Option<String>,
-    transparent_proxy_credential: Option<crate::provider_auth::TransparentProxyCredential>,
     http_client: Option<Client>,
 }
 
-/// Binds the configured address and activates enabled dynamic plugins before serving.
-pub(crate) async fn serve_with_dynamic(
-    config: GatewayConfig,
-    dynamic_plugins: Vec<ActiveDynamicPluginComponent>,
-    managed_bootstrap: Option<ManagedBootstrapIdentity>,
-    ready_file: Option<&Path>,
-    bootstrap_shutdown_token: Option<String>,
-) -> Result<(), CliError> {
-    let bind = config.bind.to_string();
-    log::info!(
-        target: "nemo_relay.server",
-        event = "server_starting",
-        bind = bind.as_str();
-        "Gateway server is starting"
-    );
-    let listener = bind_listener(config.bind).await?;
-    print_startup_status(listener.local_addr()?, &config);
-    let bootstrap_fingerprint = managed_bootstrap
-        .as_ref()
-        .map(|identity| identity.fingerprint().to_owned());
-    serve_listener_with_dynamic_inner(
-        listener,
-        config,
-        dynamic_plugins,
-        Some(ShutdownMode::ProcessSignal),
-        BootstrapServeOptions {
-            fingerprint: bootstrap_fingerprint,
-            identity: managed_bootstrap,
-            ready_file,
-            shutdown_token: bootstrap_shutdown_token,
-            ..BootstrapServeOptions::default()
-        },
-    )
-    .await
+/// In-process managed-provider transport used by the persistent coding-agent proxy.
+///
+/// The proxy owns the only TCP listener. Requests enter the same Axum handlers as the historical
+/// gateway through Tower dispatch, preserving hooks, sessions, codecs, middleware, and managed
+/// execution without retaining a second loopback transport.
+pub(crate) struct ManagedProviderEngine {
+    app: Router,
+    sessions: SessionManager,
+    plugin_activation: Option<ServerPluginActivation>,
+    instance_id: String,
 }
 
-/// Binds a gateway listener and translates address conflicts into actionable diagnostics.
-pub(crate) async fn bind_listener(bind: SocketAddr) -> Result<TcpListener, CliError> {
-    TcpListener::bind(bind).await.map_err(|err| {
-        // Translate the common bind-failure (port already in use) into an actionable message.
-        // Plain `io error: Address already in use (os error 48)` is unhelpful; the friendly
-        // version names the likely cause and points at the real fixes.
-        if err.kind() == std::io::ErrorKind::AddrInUse {
-            CliError::Launch(format!(
-                "cannot bind {} — port is already in use. Most likely cause: another \
-                 `nemo-relay` daemon is already running. Fix one of:\n  \
-                 • use the managed shutdown command, or identify the owning daemon PID and \
-                 terminate only that process\n  \
-                 • use an ephemeral port: `nemo-relay --bind 127.0.0.1:0`\n  \
-                 • pick a free port: `nemo-relay --bind 127.0.0.1:4041`",
-                bind
-            ))
-        } else {
-            CliError::Io(err)
+impl ManagedProviderEngine {
+    pub(crate) async fn initialize(
+        config: GatewayConfig,
+        dynamic_plugins: Vec<ActiveDynamicPluginComponent>,
+        http_client: Client,
+    ) -> Result<Self, CliError> {
+        let plugin_activation =
+            initialize_plugin_host(config.plugin_config.clone(), dynamic_plugins).await?;
+        // The persistent proxy authenticates the enrollment before dispatch. Bootstrap client
+        // proof is therefore neither present nor required at this inner managed-provider layer.
+        // Its background service must never consume a shell-inherited provider key, but protected
+        // user configuration remains an eligible durable fallback.
+        let require_provider_client_token = false;
+        let allow_environment_provider_auth = false;
+        let state = AppState::new_with_bootstrap_and_http(
+            config,
+            None,
+            None,
+            require_provider_client_token,
+            allow_environment_provider_auth,
+            None,
+            Some(http_client),
+        );
+        Ok(Self {
+            app: router_with_state(state.clone()),
+            sessions: state.sessions,
+            plugin_activation,
+            instance_id: state.instance_id,
+        })
+    }
+
+    pub(crate) fn dispatcher(&self) -> ManagedProviderDispatcher {
+        ManagedProviderDispatcher {
+            app: self.app.clone(),
         }
-    })
+    }
+
+    pub(crate) async fn shutdown(self) -> Result<(), CliError> {
+        self.sessions.close_all("agent_proxy_shutdown").await?;
+        nemo_relay::api::runtime::flush_subscribers()?;
+        if let Some(activation) = self.plugin_activation {
+            activation.clear()?;
+        }
+        log::info!(
+            target: "nemo_relay.server",
+            event = "agent_proxy_engine_stopped",
+            instance_id = self.instance_id.as_str();
+            "Managed provider engine stopped"
+        );
+        Ok(())
+    }
 }
 
-pub(crate) fn print_startup_status(bind: SocketAddr, config: &GatewayConfig) {
-    let use_color = std::io::IsTerminal::is_terminal(&std::io::stderr())
-        && std::env::var_os("NO_COLOR").is_none();
-    eprint!("{}", render_startup_status(bind, config, use_color));
+#[derive(Clone)]
+pub(crate) struct ManagedProviderDispatcher {
+    app: Router,
 }
 
+impl ManagedProviderDispatcher {
+    pub(crate) async fn dispatch(&self, request: Request<Body>) -> Response {
+        match self.app.clone().oneshot(request).await {
+            Ok(response) => response,
+            Err(error) => match error {},
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(config: GatewayConfig) -> Self {
+        Self {
+            app: router(config),
+        }
+    }
+}
+
+#[cfg(test)]
 fn render_startup_status(bind: SocketAddr, config: &GatewayConfig, color: bool) -> String {
     let mut lines = vec![
         "NeMo Relay".to_string(),
         format!("  Gateway        http://{bind}"),
     ];
-    let destinations = crate::process::launcher::exporter_destinations(config);
+    let destinations = crate::process::status::exporter_destinations(config);
     if destinations.is_empty() {
         lines.push("  Exporters      not configured".into());
     } else {
@@ -170,7 +198,7 @@ fn render_startup_status(bind: SocketAddr, config: &GatewayConfig, color: bool) 
         }
     }
 
-    crate::process::launcher::render_status_frame(&lines, color)
+    crate::process::status::render_status_frame(&lines, color)
 }
 
 /// Serves the gateway router on a caller-owned listener with optional graceful shutdown.
@@ -184,26 +212,6 @@ pub(crate) async fn serve_listener(
     shutdown: Option<oneshot::Receiver<()>>,
 ) -> Result<(), CliError> {
     serve_listener_with_dynamic(listener, config, Vec::new(), shutdown).await
-}
-
-#[cfg(test)]
-pub(crate) async fn serve_listener_with_bootstrap(
-    listener: TcpListener,
-    config: GatewayConfig,
-    bootstrap_fingerprint: String,
-    shutdown: Option<oneshot::Receiver<()>>,
-) -> Result<(), CliError> {
-    serve_listener_with_dynamic_inner(
-        listener,
-        config,
-        Vec::new(),
-        shutdown.map(ShutdownMode::Receiver),
-        BootstrapServeOptions {
-            fingerprint: Some(bootstrap_fingerprint),
-            ..BootstrapServeOptions::default()
-        },
-    )
-    .await
 }
 
 /// Serves the gateway router and activates enabled dynamic plugin components.
@@ -224,64 +232,15 @@ pub(crate) async fn serve_listener_with_dynamic(
     .await
 }
 
-/// Serves a wrapper-owned dynamic gateway with authenticated health while keeping foreground
-/// provider-auth semantics. Plugin-owned MCP clients use the proof to borrow only this instance.
-pub(crate) async fn serve_transparent_listener_with_dynamic(
-    listener: TcpListener,
-    config: GatewayConfig,
-    dynamic_plugins: Vec<ActiveDynamicPluginComponent>,
-    bootstrap_fingerprint: String,
-    transparent_proxy_credential: crate::provider_auth::TransparentProxyCredential,
-    shutdown: Option<oneshot::Receiver<()>>,
-) -> Result<(), CliError> {
-    serve_listener_with_dynamic_inner(
-        listener,
-        config,
-        dynamic_plugins,
-        shutdown.map(ShutdownMode::Receiver),
-        BootstrapServeOptions {
-            fingerprint: Some(bootstrap_fingerprint),
-            transparent_proxy_credential: Some(transparent_proxy_credential),
-            ..BootstrapServeOptions::default()
-        },
-    )
-    .await
-}
-
-/// Serves the persistent Claude Desktop gateway on a caller-owned listener.
-///
-/// The Desktop sidecar supplies an HTTP client with the preserved corporate-proxy policy and the
-/// persistent configuration fingerprint used by installed MCP clients. Unlike an MCP-launched
-/// gateway, this server is lifecycle-bound to the login service and therefore has no idle timer.
-pub(crate) async fn serve_claude_desktop_listener_with_dynamic(
-    listener: TcpListener,
-    config: GatewayConfig,
-    dynamic_plugins: Vec<ActiveDynamicPluginComponent>,
-    bootstrap_fingerprint: String,
-    http_client: Client,
-    shutdown: oneshot::Receiver<()>,
-) -> Result<(), CliError> {
-    serve_listener_with_dynamic_inner(
-        listener,
-        config,
-        dynamic_plugins,
-        Some(ShutdownMode::Receiver(shutdown)),
-        BootstrapServeOptions {
-            fingerprint: Some(bootstrap_fingerprint),
-            http_client: Some(http_client),
-            ..BootstrapServeOptions::default()
-        },
-    )
-    .await
-}
-
+#[cfg(test)]
 type ShutdownFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+#[cfg(test)]
 enum ShutdownMode {
     Receiver(oneshot::Receiver<()>),
-    ProcessSignal,
 }
 
+#[cfg(test)]
 async fn serve_listener_with_dynamic_inner(
     listener: TcpListener,
     config: GatewayConfig,
@@ -294,7 +253,6 @@ async fn serve_listener_with_dynamic_inner(
         identity: managed_bootstrap,
         ready_file,
         shutdown_token: bootstrap_shutdown_token,
-        transparent_proxy_credential,
         http_client,
     } = bootstrap;
     let bootstrap_challenge_key = bootstrap_fingerprint
@@ -319,8 +277,8 @@ async fn serve_listener_with_dynamic_inner(
         bootstrap_fingerprint,
         bootstrap_challenge_key,
         require_provider_client_token,
+        true,
         bootstrap_shutdown,
-        transparent_proxy_credential,
         http_client,
     );
     state.bootstrap_tls = bootstrap_tls;
@@ -349,18 +307,17 @@ async fn serve_listener_with_dynamic_inner(
         instance_id = instance_id.as_str();
         "Gateway server is listening"
     );
-    let idle_shutdown: Option<ShutdownFuture> =
-        if matches!(&shutdown_mode, None | Some(ShutdownMode::ProcessSignal)) {
-            plugin_idle_timeout()?.map(|timeout| {
-                Box::pin(idle_shutdown_future(
-                    last_activity,
-                    sessions.clone(),
-                    timeout,
-                )) as ShutdownFuture
-            })
-        } else {
-            None
-        };
+    let idle_shutdown: Option<ShutdownFuture> = if shutdown_mode.is_none() {
+        plugin_idle_timeout()?.map(|timeout| {
+            Box::pin(idle_shutdown_future(
+                last_activity,
+                sessions.clone(),
+                timeout,
+            )) as ShutdownFuture
+        })
+    } else {
+        None
+    };
     let shutdown = server_shutdown_future(shutdown_mode, idle_shutdown);
     let shutdown = combine_shutdown_futures(shutdown, bootstrap_shutdown_rx);
     log::info!(
@@ -380,6 +337,7 @@ async fn serve_listener_with_dynamic_inner(
     finish_server_shutdown(serve_result, &sessions, plugin_activation, &instance_id).await
 }
 
+#[cfg(test)]
 fn server_shutdown_future(
     shutdown_mode: Option<ShutdownMode>,
     idle_shutdown: Option<ShutdownFuture>,
@@ -388,20 +346,11 @@ fn server_shutdown_future(
         Some(ShutdownMode::Receiver(receiver)) => Some(Box::pin(async move {
             let _ = receiver.await;
         })),
-        Some(ShutdownMode::ProcessSignal) => Some(Box::pin(async move {
-            if let Some(idle) = idle_shutdown {
-                tokio::select! {
-                    _ = shutdown_signal() => {}
-                    _ = idle => {}
-                }
-            } else {
-                shutdown_signal().await;
-            }
-        })),
         None => idle_shutdown,
     }
 }
 
+#[cfg(test)]
 fn combine_shutdown_futures(
     shutdown: Option<ShutdownFuture>,
     bootstrap_shutdown_rx: Option<oneshot::Receiver<()>>,
@@ -420,6 +369,7 @@ fn combine_shutdown_futures(
     }
 }
 
+#[cfg(test)]
 async fn finish_server_shutdown(
     serve_result: std::io::Result<()>,
     sessions: &SessionManager,
@@ -513,6 +463,38 @@ async fn finish_server_shutdown(
     Ok(())
 }
 
+/// Starts the legacy-shaped router only for the feature-gated repository integration-test binary.
+#[cfg(feature = "internal-test-server")]
+pub(crate) async fn serve_internal_test_harness(
+    config: GatewayConfig,
+    dynamic_plugins: Vec<ActiveDynamicPluginComponent>,
+) -> Result<(), CliError> {
+    let listener = TcpListener::bind(config.bind).await?;
+    let plugin_activation =
+        initialize_plugin_host(config.plugin_config.clone(), dynamic_plugins).await?;
+    let mut state =
+        AppState::new_with_bootstrap_and_http(config, None, None, false, true, None, None);
+    // This capability is set only by the dedicated feature-gated test binary. Building the public
+    // `nemo-relay` binary with the same feature does not weaken its native-origin policy.
+    state.allow_test_loopback_dispatch = true;
+    let sessions = state.sessions.clone();
+    let app = router_with_state(state);
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+    let close_result = sessions.close_all("internal_test_server_shutdown").await;
+    let flush_result = nemo_relay::api::runtime::flush_subscribers().map_err(CliError::from);
+    let clear_result = plugin_activation
+        .map(ServerPluginActivation::clear)
+        .unwrap_or(Ok(()));
+    serve_result?;
+    close_result?;
+    flush_result?;
+    clear_result?;
+    Ok(())
+}
+
+#[cfg(feature = "internal-test-server")]
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -534,11 +516,6 @@ async fn shutdown_signal() {
             _ = ctrl_shutdown.recv() => {}
         }
     }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }
 
 /// Builds the gateway HTTP router and shared state.
@@ -553,7 +530,7 @@ pub(crate) fn router(config: GatewayConfig) -> Router {
 impl AppState {
     #[cfg(test)]
     pub(crate) fn new(config: GatewayConfig) -> Self {
-        Self::new_with_bootstrap(config, None, None, false, None, None)
+        Self::new_with_bootstrap(config, None, None, false, None)
     }
 
     #[cfg(test)]
@@ -563,15 +540,14 @@ impl AppState {
         bootstrap_challenge_key: Option<BootstrapChallengeKey>,
         require_provider_client_token: bool,
         bootstrap_shutdown: Option<BootstrapShutdown>,
-        transparent_proxy_credential: Option<crate::provider_auth::TransparentProxyCredential>,
     ) -> Self {
         Self::new_with_bootstrap_and_http(
             config,
             bootstrap_fingerprint,
             bootstrap_challenge_key,
             require_provider_client_token,
+            true,
             bootstrap_shutdown,
-            transparent_proxy_credential,
             None,
         )
     }
@@ -581,8 +557,8 @@ impl AppState {
         bootstrap_fingerprint: Option<String>,
         bootstrap_challenge_key: Option<BootstrapChallengeKey>,
         require_provider_client_token: bool,
+        allow_environment_provider_auth: bool,
         bootstrap_shutdown: Option<BootstrapShutdown>,
-        transparent_proxy_credential: Option<crate::provider_auth::TransparentProxyCredential>,
         http_client: Option<Client>,
     ) -> Self {
         let sessions = SessionManager::new(config.clone());
@@ -600,7 +576,7 @@ impl AppState {
             bootstrap_fingerprint,
             bootstrap_challenge_key,
             require_provider_client_token,
-            transparent_proxy_credential,
+            allow_environment_provider_auth,
             http,
             sessions,
             last_activity: Arc::new(Mutex::new(Instant::now())),
@@ -608,6 +584,7 @@ impl AppState {
             instance_id: uuid::Uuid::now_v7().to_string(),
             bootstrap_tls: None,
             local_address: None,
+            allow_test_loopback_dispatch: false,
         }
     }
 
@@ -617,30 +594,18 @@ impl AppState {
         }
     }
 
-    /// Authenticate an invocation-owned transparent client before interceptors can rewrite its
-    /// route. Foreground gateways retain their existing provider-credential behavior; managed
-    /// sidecars still require their stable client proof before ambient provider credentials may be
-    /// used.
+    pub(crate) const fn allows_test_loopback_dispatch(&self) -> bool {
+        self.allow_test_loopback_dispatch
+    }
+
+    /// Record provider-credential provenance after the outer proxy has authenticated the enrolled
+    /// client. Managed bootstrap listeners still require their stable client proof before ambient
+    /// provider credentials may be used.
     pub(crate) fn authorize_provider_request(
         &self,
         headers: &mut HeaderMap,
     ) -> Result<crate::provider_auth::ProviderRequestAuthorization, CliError> {
-        if let Some(proxy) = &self.transparent_proxy_credential {
-            let source_credential = proxy.consume(headers).inspect_err(|error| {
-                log::warn!(
-                    target: "nemo_relay.gateway",
-                    event = "request_rejected",
-                    reason = "transparent_proxy_authentication",
-                    error_kind = error.log_kind();
-                    "Gateway request was rejected during transparent proxy authentication"
-                );
-            })?;
-            return Ok(crate::provider_auth::ProviderRequestAuthorization {
-                source_credential,
-                allow_environment_provider_auth: true,
-            });
-        }
-        let allow_environment_provider_auth = if !self.require_provider_client_token {
+        let allow_fallback_provider_auth = if !self.require_provider_client_token {
             true
         } else {
             self.bootstrap_challenge_key
@@ -656,12 +621,14 @@ impl AppState {
         Ok(crate::provider_auth::ProviderRequestAuthorization {
             source_credential:
                 crate::provider_auth::SourceCredentialDisposition::from_provider_headers(headers),
-            allow_environment_provider_auth,
+            allow_configured_provider_auth: allow_fallback_provider_auth,
+            allow_environment_provider_auth: allow_fallback_provider_auth
+                && self.allow_environment_provider_auth,
         })
     }
 }
 
-fn router_with_state(state: AppState) -> Router {
+pub(crate) fn router_with_state(state: AppState) -> Router {
     let max_hook_payload_bytes = state.config.max_hook_payload_bytes;
     Router::new()
         .route("/healthz", get(healthz))
@@ -670,10 +637,16 @@ fn router_with_state(state: AppState) -> Router {
         .route("/hooks/codex", post(codex_hook))
         .route("/hooks/claude-code", post(claude_code_hook))
         .route("/hooks/hermes", post(hermes_hook))
-        .route("/responses", post(gateway::passthrough))
+        .route(
+            "/responses",
+            get(gateway::websocket::upgrade).post(gateway::passthrough),
+        )
         .route("/chat/completions", post(gateway::passthrough))
         .route("/models", get(gateway::models))
-        .route("/v1/responses", post(gateway::passthrough))
+        .route(
+            "/v1/responses",
+            get(gateway::websocket::upgrade).post(gateway::passthrough),
+        )
         .route("/v1/chat/completions", post(gateway::passthrough))
         .route("/v1/messages", post(gateway::passthrough))
         .route("/v1/messages/count_tokens", post(gateway::passthrough))
@@ -747,6 +720,7 @@ async fn bootstrap_tls_tunnel(
         .expect("bootstrap TLS upgrade response is valid")
 }
 
+#[cfg(test)]
 fn bootstrap_shutdown_channel(
     token: Option<String>,
 ) -> (Option<BootstrapShutdown>, Option<oneshot::Receiver<()>>) {
@@ -841,6 +815,7 @@ async fn healthz(State(state): State<AppState>, headers: HeaderMap) -> Response 
         .into_response()
 }
 
+#[cfg(test)]
 fn write_ready_file(path: &Path, bind: SocketAddr, instance_id: &str) -> Result<(), CliError> {
     let bytes = serde_json::to_vec(&serde_json::json!({
         "address": bind,
@@ -872,6 +847,7 @@ fn write_ready_file(path: &Path, bind: SocketAddr, instance_id: &str) -> Result<
     })
 }
 
+#[cfg(test)]
 fn plugin_idle_timeout() -> Result<Option<Duration>, CliError> {
     let Some(raw) = std::env::var("NEMO_RELAY_PLUGIN_IDLE_TIMEOUT_SECS").ok() else {
         return Ok(None);
@@ -889,6 +865,7 @@ fn plugin_idle_timeout() -> Result<Option<Duration>, CliError> {
     Ok(Some(Duration::from_secs(seconds)))
 }
 
+#[cfg(test)]
 async fn idle_shutdown_future(
     last_activity: Arc<Mutex<Instant>>,
     sessions: SessionManager,
@@ -905,6 +882,7 @@ async fn idle_shutdown_future(
     }
 }
 
+#[cfg(test)]
 async fn idle_shutdown_ready<F>(
     last_activity: &Arc<Mutex<Instant>>,
     timeout: Duration,
@@ -1239,7 +1217,7 @@ async fn claude_code_hook(
 }
 
 // Handles Hermes hook payloads from persistent shell integration. The adapter returns a minimal
-// body because hook-forward owns the fail-open/fail-closed behavior for Hermes command execution.
+// body because the installed fail-closed hook-forward command owns Hermes command execution.
 async fn hermes_hook(
     State(state): State<AppState>,
     headers: HeaderMap,

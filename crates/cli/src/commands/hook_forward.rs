@@ -22,19 +22,6 @@ pub(crate) struct HookForwardCommand {
     /// Expected identity of the installer-owned generation marker.
     #[arg(long, hide = true)]
     pub(crate) generation_token: Option<String>,
-    /// Forward to an existing compatible gateway without an install-generation fence.
-    ///
-    /// Intended for source plugins and custom automation. This mode verifies the gateway but
-    /// never launches or recovers Relay.
-    #[arg(long, conflicts_with_all = ["generation_file", "generation_token"])]
-    pub(crate) forward_only: bool,
-    /// Mark a hook as owned by a process-private `nemo-relay run` gateway.
-    #[arg(
-        long,
-        hide = true,
-        conflicts_with_all = ["generation_file", "generation_token", "forward_only"]
-    )]
-    pub(crate) transparent_run: bool,
     /// Configuration profile recorded with the forwarded session metadata.
     #[arg(long)]
     pub(crate) profile: Option<String>,
@@ -56,8 +43,6 @@ impl HookForwardCommand {
             gateway_url: self.gateway_url,
             generation_file: self.generation_file,
             generation_token: self.generation_token,
-            forward_only: self.forward_only,
-            transparent_run: self.transparent_run,
             profile: self.profile,
             session_metadata: self.session_metadata,
             gateway_mode: self.gateway_mode.map(Into::into),

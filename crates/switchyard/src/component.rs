@@ -54,6 +54,8 @@ const SWITCHYARD_HEALTH_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const INTERNAL_DISPATCH_URL_HEADER: &str = "x-nemo-relay-internal-dispatch-url";
 const INTERNAL_DISPATCH_ROUTE_HEADER: &str = "x-nemo-relay-internal-dispatch-route";
 const INTERNAL_RETRY_AWARE_HEADER: &str = "x-nemo-relay-internal-retry-aware";
+const INTERNAL_PROVIDER_CREDENTIAL_HEADERS: &str =
+    nemo_relay::api::llm::PROVIDER_CREDENTIAL_HEADER_NAMES_HEADER;
 const ROUTING_MARK_SCHEMA: &str = "switchyard.routing_mark";
 const ROUTING_CONTRIBUTION_SCHEMA: &str = "nvidia.switchyard.routing_optimization";
 
@@ -489,6 +491,7 @@ struct SwitchyardRuntime {
     config: SwitchyardConfig,
     client: reqwest::Client,
     target_headers: BTreeMap<String, Map<String, Json>>,
+    target_private_headers: BTreeMap<String, Vec<String>>,
     translation: switchyard_translation::TranslationEngine,
 }
 
@@ -536,10 +539,21 @@ impl SwitchyardRuntime {
                 Ok((id.clone(), headers))
             })
             .collect::<Result<_, String>>()?;
+        let target_private_headers = config
+            .targets
+            .iter()
+            .map(|(id, target)| {
+                (
+                    id.clone(),
+                    target.header_env.keys().cloned().collect::<Vec<_>>(),
+                )
+            })
+            .collect();
         Ok(Self {
             config,
             client,
             target_headers,
+            target_private_headers,
             translation: translation_engine(),
         })
     }
@@ -1158,6 +1172,16 @@ impl SwitchyardRuntime {
         object.insert("model".into(), Json::String(binding.model.clone()));
         if let Some(headers) = self.target_headers.get(&decision.route.backend_id) {
             routed.headers.extend(headers.clone());
+        }
+        if let Some(headers) = self
+            .target_private_headers
+            .get(&decision.route.backend_id)
+            .filter(|headers| !headers.is_empty())
+        {
+            routed.headers.insert(
+                INTERNAL_PROVIDER_CREDENTIAL_HEADERS.into(),
+                Json::Array(headers.iter().cloned().map(Json::String).collect()),
+            );
         }
         routed.headers.insert(
             INTERNAL_DISPATCH_ROUTE_HEADER.into(),

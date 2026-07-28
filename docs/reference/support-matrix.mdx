@@ -48,17 +48,23 @@ sandbox. Refer to [gRPC Worker Plugin
 Concepts](/build-plugins/dynamic-plugins/grpc-worker/about) for manifests,
 lifecycle, and trust requirements.
 
-## Coding Agents Supported by the CLI
+## Coding-Agent Proxy Preview
 
-The CLI supports local coding-agent sessions where agent hooks and provider
-traffic can reach the local Relay gateway. It rejects prerelease, malformed,
-and older CLI versions during installation, diagnostics, and transparent runs.
+The CLI preview implements local coding-agent sessions where agent hooks and
+provider traffic can reach the enrolled user's persistent Relay proxy. The proxy uses a
+discovered per-user loopback endpoint, so several OS users can enroll on one
+machine. Remote/cloud execution that bypasses the local machine is outside
+coverage. Linux enrollment supports distributions with a running systemd user
+session; it does not require a machine-wide service or a fixed port.
+Independent endpoints avoid ordinary collisions but do not isolate mutually
+untrusted local OS accounts; use separate machines or an OS isolation boundary
+for hostile tenants.
 
-| Agent | Minimum version | Supported CLI capabilities | Current limitations |
-| --- | --- | --- | --- |
-| Claude Code | 2.1.121 | Persistent install, transparent run, lifecycle hooks, local gateway routing, and pre-tool security | Claude Chat, Cowork, and web traffic are outside the local coding-agent integration. Optimization requires gateway-routed LLM traffic and available hooks. |
-| Codex CLI | 0.143.0 | Persistent install, transparent run, 10 supported plugin hooks, local gateway routing, and pre-tool security | Cloud or remote tasks that bypass the local machine have partial or no LLM capture. The plugin hook schema has no `SessionEnd`; Relay finalizes the cumulative session snapshot at `Stop`. Encrypted Codex multi-agent v2 payloads cannot be decrypted or reliably linked. |
-| Hermes Agent | 0.18.2 | Persistent MCP integration, transparent run, lifecycle hooks, local gateway routing, and pre-tool security | Optimization depends on Hermes shell and API-request hook coverage. Hook-observed and gateway-observed LLM spans can both be present when both paths are enabled. |
+| Agent | Status | Minimum version | Implemented CLI capabilities | Current limitations |
+| --- | --- | --- | --- | --- |
+| Claude Code | Preview | 2.1.121 | Persistent enrollment, fail-closed lifecycle hooks, managed native Anthropic HTTP/SSE, and pre-tool security | Live OAuth/application qualification remains required. Claude Chat, Cowork, web, and cloud traffic are outside the local integration. |
+| Codex CLI/local app | Preview | 0.143.0 | Persistent enrollment, trusted hooks, managed Responses HTTP/SSE and WebSockets, and pre-tool security | On Linux, every Codex launch environment must select Relay's stable bundle. Use the installer-printed `CODEX_CA_CERTIFICATE` setting; when that variable is unset, Relay also accepts an existing `SSL_CERT_FILE` bundle that contains the active Relay root. Doctor fails closed when neither selector is valid. Corporate-proxy WebSocket, measured concurrency/backpressure, and live OAuth/application qualification remain required. Remote tasks that bypass the local machine have no provider capture. The hook schema does not expose `SessionEnd`; Relay finalizes the cumulative turn snapshot at `Stop`. |
+| Hermes Agent | Preview | 0.18.2 | Persistent enrollment for local CLI, gateway, cron, API-server, ACP, and desktop-backed modes; managed native providers; trusted hooks | Live provider/application qualification remains required. Unknown public providers reached with `CONNECT` on port 443 tunnel with hook-only/degraded observability and cannot receive request or execution interceptors; other ports are rejected. Remote backends are outside coverage. |
 
 For installation, diagnostics, and host-specific behavior, refer to [Coding Agent
 Installation](/nemo-relay-cli/plugin-installation), [Claude
@@ -71,14 +77,14 @@ Claude Desktop uses the same public commands on each platform, with a native
 per-user service and trust adapter. A platform is not marked supported until
 its integrated live-application proof demonstrates subscription OAuth, a Relay
 request rewrite, a blocking `PreToolUse` guardrail, fail-closed behavior with
-the sidecar stopped, protection from the original icon and bare terminal CLI,
+the proxy service stopped, protection from the original icon and bare terminal CLI,
 and exact uninstall restoration.
 
 | Platform | Implemented adapter | Release support status | Scope and limitations |
 | --- | --- | --- | --- |
-| macOS 11+ | LaunchAgent, login Keychain trust, `claude://code` | Pending integrated live-app release gate | Code tab and terminal Claude Code only. Intel macOS also requires a locally built Relay CLI because no prebuilt asset is published. |
-| Windows 10+ | Hidden least-privilege logon Scheduled Task, CurrentUser Root, `claude://code` | Pending integrated live-app release gate | Code tab and terminal Claude Code only. Windows CI remains non-blocking until release policy changes. |
-| Ubuntu 22.04+ and Debian 12+ | systemd user service, composed Claude-scoped CA bundle, `claude://code` | Pending integrated live-app release gate | Anthropic package plus a systemd user session required. Generic distributions and non-systemd autostart are deferred. |
+| macOS 11+ | LaunchAgent, login Keychain trust and non-exportable signing key, `claude://code` | Pending integrated live-app release gate | Code tab and terminal Claude Code only. Intel macOS also requires a locally built Relay CLI because no prebuilt asset is published. |
+| Windows 10+ | SID-derived hidden least-privilege logon Scheduled Task with trigger/principal identity verification, CurrentUser Root and non-exportable CNG signing key, `claude://code` | Pending integrated live-app release gate | Code tab and terminal Claude Code only. Windows CI remains non-blocking until release policy changes. |
+| Linux with a systemd user session; Ubuntu 22.04+ and Debian 12+ are qualification targets | systemd user service, composed Claude-scoped CA bundle, owner-only PKCS#8 signing key, `claude://code` | Pending integrated live-app release gate | The installer accepts other distributions and versions when the Anthropic package and systemd user session are available; those environments are not release-qualified. Non-systemd autostart is deferred. |
 
 Refer to [Claude Desktop](/nemo-relay-cli/claude-desktop) for install,
 diagnostic, corporate-proxy, and rollback behavior.
